@@ -1,0 +1,32 @@
+/* Shared design tokens. --deep avoids clashing with sprites.css --ground. */
+
+:root {
+  /* Dark mat so cream art reads on cream paper. */
+  --deep: #35201b;
+
+  /* Nose accent: fill/dark-ground only (weak contrast on --paper). */
+  --nose: #f18973;
+
+  --ink: #4c2923;
+  --paper: #f5ecdd;
+  --field: #fffaf2;
+  --sand: #ead9c7;
+  --brown: #9b532d;
+  --muted: #70473d;
+  --tan: #c9824a;
+
+  /* Shared derived shades. */
+  --ink-soft: #663b31; /* intro paragraphs */
+  --ink-hover: #6b3a31; /* primary button hover */
+  --placeholder: #765047;
+  --red-deep: #9b2f2d; /* error border */
+  --red-tint: #f6d7cf; /* error background */
+
+  /* Success and failure. */
+  --green: #4f7a3a;
+  --red: #b8402f;
+}
+
+* {
+  box-sizing: border-box;
+}

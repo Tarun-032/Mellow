@@ -1,0 +1,57 @@
+# Mellow sidecar deps.
+#
+# HARD RULE: nothing here may pull in torch. faster-whisper uses CTranslate2 and
+# kokoro-onnx uses ONNX Runtime precisely to avoid it. Adding torch takes the
+# shipped sidecar from ~300MB to 2GB+. Check with: pip list | findstr /i torch
+
+fastapi==0.141.1
+starlette==1.6.0  # security floor for FastAPI's HTTP layer
+uvicorn[standard]==0.41.0
+httpx==0.28.1
+
+# step 3 — voice in
+sounddevice==0.5.2
+numpy==2.3.4
+faster-whisper==1.2.0
+requests==2.33.0  # faster-whisper 1.2.0 imports it but doesn't declare it
+
+# step 5 — voice out.
+# Deps are espeakng-loader / numpy / onnxruntime / phonemizer-fork — no torch.
+# espeakng-loader bundles the espeak-ng binaries so users install nothing.
+kokoro-onnx==0.5.0
+
+# step 6 — screen
+# mss
+# step 13 — screen Q&A. mss grabs the monitor; Pillow shrinks a ~2MB PNG to a
+# ~300KB JPEG before upload (and is the only reason it's a runtime dep — the
+# sprite pipeline being build-only is a separate rule, still true).
+mss==10.0.0
+Pillow==12.3.0
+
+# step 8 — parakeet STT. Pure ONNX Runtime (no NeMo, no torch); numpy,
+# onnxruntime and huggingface-hub were already here for kokoro and whisper.
+onnx-asr[cpu,hub]==0.12.0
+
+# step 14b - where is the thing they asked about.
+#
+# The model used to answer that with a coordinate and was wrong by hundreds of
+# pixels. These answer it exactly instead, and none pulls torch.
+#
+# uiautomation reads the accessibility tree for native apps and browser chrome;
+# it and comtypes are pure Python over ctypes. winsdk reaches Windows' own OCR
+# engine, which is what sees inside a web page - Chrome exposes no page content
+# to UI Automation unless a real screen reader is running.
+#
+# rapidocr was tried here first, because it is what clicky-windows uses, and
+# dropped after measuring: 5-15s per screen against 0.2-0.5s, whole-line boxes
+# against per-word ones, and ~70MB of opencv and friends against 12MB. See
+# mellowd/point.py.
+uiautomation==2.0.29
+comtypes==1.4.16
+
+# Step 15a, one app's volume without touching anything else's. pycaw is pure
+# Python over the comtypes above; psutil is what maps an audio session back to
+# the process that owns it. Neither pulls torch - the HARD RULE still holds.
+pycaw==20251023
+psutil==7.2.2
+winsdk==1.0.0b10

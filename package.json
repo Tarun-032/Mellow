@@ -1,0 +1,40 @@
+{
+  "name": "mellow",
+  "private": true,
+  "version": "1.0.0",
+  "description": "A pixel-art Windows desktop companion that listens, speaks, helps, and keeps you company.",
+  "author": "Tarun-032",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Tarun-032/Mellow.git"
+  },
+  "homepage": "https://github.com/Tarun-032/Mellow#readme",
+  "bugs": {
+    "url": "https://github.com/Tarun-032/Mellow/issues"
+  },
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build && node scripts/verify-dist.mjs",
+    "sidecar:build": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-sidecar.ps1",
+    "sidecar:verify": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/verify-sidecar.ps1",
+    "release:windows": "npm run sidecar:build && npm run sidecar:verify && tauri build --bundles nsis && powershell -NoProfile -ExecutionPolicy Bypass -File scripts/publish-installer.ps1",
+    "preview": "vite preview",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2",
+    "@tauri-apps/plugin-opener": "^2",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2",
+    "@types/react": "^19.1.8",
+    "@types/react-dom": "^19.1.6",
+    "@vitejs/plugin-react": "^4.6.0",
+    "typescript": "~5.8.3",
+    "vite": "^7.0.4"
+  }
+}

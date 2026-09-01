@@ -1,0 +1,1165 @@
+@font-face {
+  font-family: "Pixelify Sans";
+  src: url("./pixelify-sans.woff2") format("woff2");
+  font-weight: 400 600;
+  font-display: block;
+}
+
+/* Locked palette (matches sprites.py); only what the box needs. */
+:root {
+  --ink: #4c2923;
+  --paper: #f5ecdd;
+  /* Brown (palette colour three). */
+  --brown: #9b532d;
+  /* Timer focus/break colours (art lock does not cover CSS). */
+  --red: #b8402f;
+  --green: #4f7a3a;
+  /* Panel body font (Pixelify stays on titles). */
+  --panel-font: "Segoe UI", system-ui, sans-serif;
+  /* Tabular monospace for clocks. */
+  --panel-digits: Consolas, "Cascadia Mono", ui-monospace, monospace;
+  /* One art pixel (must include unit for calc lengths). */
+  --px: 3px;
+  --cell-px: calc(64 * var(--px)); /* 192px */
+}
+
+/* Transparent window; only pet and bubble paint. */
+html,
+body,
+#root {
+  margin: 0;
+  width: 100%;
+  height: 100%;
+  background: transparent;
+  overflow: hidden;
+  user-select: none;
+  cursor: default;
+}
+
+/* Click-through overlay; pet-body opts back into pointers. */
+.stage {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+}
+
+.pet-root,
+.pet-body,
+.pet-art,
+.pet-sprite {
+  width: var(--cell-px);
+  height: var(--cell-px);
+}
+
+.pet-root {
+  position: absolute;
+  top: 0;
+  left: 0;
+  pointer-events: none;
+  will-change: transform;
+}
+
+.pet-body {
+  pointer-events: auto;
+  touch-action: none;
+  cursor: grab;
+  transform-origin: 50% calc(var(--ground) * var(--px));
+  will-change: transform, translate;
+}
+
+.pet-body:active {
+  cursor: grabbing;
+}
+
+.pet-art {
+  --frames: 1;
+  --frame-time: 1s;
+  --frame-play: paused;
+  --motion: idle-life;
+  --motion-time: 3.2s;
+  --motion-count: infinite;
+  --motion-ease: cubic-bezier(0.45, 0, 0.55, 1);
+  position: relative;
+  transform-origin: 50% calc(var(--ground) * var(--px));
+  animation-name: var(--motion);
+  animation-duration: var(--motion-time);
+  animation-timing-function: var(--motion-ease);
+  animation-iteration-count: var(--motion-count);
+  animation-fill-mode: both;
+}
+
+.pet-sprite {
+  background-image: url("./sprites.png");
+  background-size: calc(var(--cell-count) * var(--cell-px)) var(--cell-px);
+  background-position: calc(var(--cell) * var(--cell-px) * -1) 0;
+  image-rendering: pixelated;
+  animation-name: sprite-frames;
+  animation-duration: var(--frame-time);
+  animation-timing-function: steps(var(--frames), end);
+  animation-iteration-count: infinite;
+  animation-play-state: var(--frame-play);
+}
+
+/* Pose cells from generated sprites.css. */
+.pet--idle {
+  --cell: var(--cell-idle);
+  --frames: var(--frames-idle);
+  --frame-time: var(--frame-time-idle);
+  --frame-play: var(--frame-play-idle);
+  --motion: idle-life;
+  --motion-time: 3.2s;
+}
+.pet--ear {
+  --cell: var(--cell-listening);
+  --frames: var(--frames-listening);
+  --frame-time: var(--frame-time-listening);
+  --frame-play: var(--frame-play-listening);
+  --motion: idle-life;
+  --motion-time: 3.2s;
+}
+.pet--listening {
+  --cell: var(--cell-listening);
+  --frames: var(--frames-listening);
+  --frame-time: var(--frame-time-listening);
+  --frame-play: var(--frame-play-listening);
+  --motion: listening-life;
+  --motion-time: 1.2s;
+}
+.pet--thinking {
+  --cell: var(--cell-thinking);
+  --frames: var(--frames-thinking);
+  --frame-time: var(--frame-time-thinking);
+  --frame-play: var(--frame-play-thinking);
+  --motion: thinking-life;
+  --motion-time: 1.7s;
+}
+.pet--talking {
+  --cell: var(--cell-talking, var(--cell-idle));
+  --frames: var(--frames-talking, var(--frames-idle));
+  --frame-time: var(--frame-time-talking, var(--frame-time-idle));
+  --frame-play: var(--frame-play-talking, var(--frame-play-idle));
+  --motion: talking-life;
+  --motion-time: 0.42s;
+}
+.pet--yawn {
+  --cell: var(--cell-yawn);
+  --frames: var(--frames-yawn);
+  --frame-time: var(--frame-time-yawn);
+  --frame-play: var(--frame-play-yawn);
+  --motion: yawn-life;
+  --motion-time: 3.2s;
+  --motion-count: 1;
+  --motion-ease: cubic-bezier(0.22, 1, 0.36, 1);
+}
+.pet--sleeping {
+  --cell: var(--cell-sleeping);
+  --frames: var(--frames-sleeping);
+  --frame-time: var(--frame-time-sleeping);
+  --frame-play: var(--frame-play-sleeping);
+  --motion: sleeping-life;
+  --motion-time: 3.8s;
+}
+.pet--angry {
+  --cell: var(--cell-angry);
+  --frames: var(--frames-angry);
+  --frame-time: var(--frame-time-angry);
+  --frame-play: var(--frame-play-angry);
+  --motion: angry-life;
+  --motion-time: 0.24s;
+  --motion-ease: steps(2, end);
+}
+.pet--petting {
+  --cell: var(--cell-petting);
+  --frames: var(--frames-petting);
+  --frame-time: var(--frame-time-petting);
+  --frame-play: var(--frame-play-petting);
+  --motion: petting-life;
+  --motion-time: 0.72s;
+}
+.pet--hunt {
+  --cell: var(--cell-hunt);
+  --frames: var(--frames-hunt);
+  --frame-time: var(--frame-time-hunt);
+  --frame-play: var(--frame-play-hunt);
+  --motion: hunt-life;
+  --motion-time: 0.48s;
+}
+
+/* Offline: dim when sidecar is down. */
+.pet--offline {
+  filter: grayscale(1) brightness(0.75);
+}
+
+/* Mic warmup spinner (clears when PortAudio starts). */
+.mic-warmup {
+  position: absolute;
+  left: 50%;
+  top: calc(2 * var(--px));
+  width: calc(10 * var(--px));
+  height: calc(10 * var(--px));
+  pointer-events: none;
+  z-index: 3;
+  animation: mic-warmup-spin 0.9s linear infinite;
+}
+
+.mic-warmup i {
+  position: absolute;
+  left: calc(4.5 * var(--px));
+  top: 0;
+  width: calc(1.5 * var(--px));
+  height: calc(1.5 * var(--px));
+  border-radius: 50%;
+  background: var(--brown);
+  transform-origin: calc(0.75 * var(--px)) calc(5 * var(--px));
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--paper) 72%, transparent);
+}
+
+.mic-warmup i:nth-child(1) { transform: rotate(0deg); opacity: 1; }
+.mic-warmup i:nth-child(2) { transform: rotate(45deg); opacity: 0.88; }
+.mic-warmup i:nth-child(3) { transform: rotate(90deg); opacity: 0.76; }
+.mic-warmup i:nth-child(4) { transform: rotate(135deg); opacity: 0.64; }
+.mic-warmup i:nth-child(5) { transform: rotate(180deg); opacity: 0.52; }
+.mic-warmup i:nth-child(6) { transform: rotate(225deg); opacity: 0.4; }
+.mic-warmup i:nth-child(7) { transform: rotate(270deg); opacity: 0.28; }
+.mic-warmup i:nth-child(8) { transform: rotate(315deg); opacity: 0.18; }
+
+@keyframes mic-warmup-spin {
+  from { transform: translateX(-50%) rotate(0deg); }
+  to { transform: translateX(-50%) rotate(360deg); }
+}
+
+@keyframes idle-life {
+  0%,
+  100% {
+    transform: scale(1);
+  }
+  50% {
+    transform: translateY(-1px) scaleY(1.018);
+  }
+}
+
+@keyframes listening-life {
+  0%,
+  100% {
+    transform: rotate(-0.7deg) scaleY(1);
+  }
+  50% {
+    transform: translateY(-2px) rotate(0.7deg) scaleY(1.025);
+  }
+}
+
+@keyframes thinking-life {
+  0%,
+  100% {
+    transform: rotate(-1.2deg);
+  }
+  50% {
+    transform: translateY(-1px) rotate(1.2deg);
+  }
+}
+
+@keyframes talking-life {
+  0%,
+  100% {
+    transform: scaleY(0.985);
+  }
+  50% {
+    transform: translateY(-2px) scaleY(1.025);
+  }
+}
+
+@keyframes yawn-life {
+  0% {
+    transform: scale(0.98, 0.94);
+  }
+  18% {
+    transform: translateY(2px) scale(1.04, 0.9);
+  }
+  45%,
+  72% {
+    transform: translateY(-5px) scale(0.96, 1.1);
+  }
+  100% {
+    transform: scale(1);
+  }
+}
+
+@keyframes sleeping-life {
+  0%,
+  100% {
+    transform: scale(1);
+  }
+  50% {
+    transform: scale(1.018, 1.035);
+  }
+}
+
+@keyframes angry-life {
+  0%,
+  100% {
+    transform: translateX(-2px) rotate(-1deg);
+  }
+  50% {
+    transform: translateX(2px) rotate(1deg);
+  }
+}
+
+@keyframes petting-life {
+  0%,
+  100% {
+    transform: rotate(-1.2deg) scaleY(1);
+  }
+  50% {
+    transform: translateY(-1px) rotate(1.2deg) scaleY(1.018);
+  }
+}
+
+@keyframes hunt-life {
+  0%,
+  100% {
+    transform: scale(1);
+  }
+  50% {
+    transform: scale(1.018, 0.985);
+  }
+}
+
+@keyframes sprite-frames {
+  from {
+    background-position-x: calc(var(--cell) * var(--cell-px) * -1);
+  }
+  to {
+    background-position-x: calc(
+      (var(--cell) + var(--frames)) * var(--cell-px) * -1
+    );
+  }
+}
+
+/* Eye overlays; gaze moves these pixels, not the root. */
+.pet-eyes,
+.pet-mouth {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  image-rendering: pixelated;
+}
+
+.pet-eyes {
+  --gaze-x: 0px;
+  --gaze-y: 0px;
+  display: none;
+}
+
+.pet-eye {
+  position: absolute;
+  display: block;
+}
+
+.pet-eyes--idle,
+.pet-eyes--ear,
+.pet-eyes--listening,
+.pet-eyes--talking,
+.pet-eyes--angry,
+.pet-eyes--hunt {
+  display: block;
+}
+
+.pet-eyes--idle .pet-eye,
+.pet-eyes--ear .pet-eye,
+.pet-eyes--listening .pet-eye,
+.pet-eyes--talking .pet-eye,
+.pet-eyes--angry .pet-eye {
+  top: calc(28 * var(--px));
+  /* angry keeps the 6x6 patch and the anchors, and repaints what's inside it */
+  width: calc(6 * var(--px));
+  height: calc(6 * var(--px));
+}
+
+.pet-eyes--idle .pet-eye--left,
+.pet-eyes--ear .pet-eye--left,
+.pet-eyes--listening .pet-eye--left,
+.pet-eyes--talking .pet-eye--left,
+.pet-eyes--angry .pet-eye--left {
+  left: calc(18 * var(--px));
+  background: #f5ecdd;
+}
+
+.pet-eyes--idle .pet-eye--right,
+.pet-eyes--ear .pet-eye--right,
+.pet-eyes--listening .pet-eye--right,
+.pet-eyes--talking .pet-eye--right,
+.pet-eyes--angry .pet-eye--right {
+  left: calc(32 * var(--px));
+  background: #c9824a;
+}
+
+.pet-eyes--idle .pet-eye::before,
+.pet-eyes--ear .pet-eye::before,
+.pet-eyes--listening .pet-eye::before,
+.pet-eyes--talking .pet-eye::before {
+  content: "";
+  position: absolute;
+  left: var(--px);
+  top: var(--px);
+  width: calc(4 * var(--px));
+  height: calc(4 * var(--px));
+  background: #4c2923;
+  animation: eye-blink 4.8s steps(1, end) infinite;
+}
+
+.pet-eyes--idle .pet-eye::after,
+.pet-eyes--ear .pet-eye::after,
+.pet-eyes--listening .pet-eye::after,
+.pet-eyes--talking .pet-eye::after {
+  content: "";
+  position: absolute;
+  left: calc(2 * var(--px));
+  top: calc(2 * var(--px));
+  width: var(--px);
+  height: var(--px);
+  background: #f5ecdd;
+  translate: var(--gaze-x) var(--gaze-y);
+  animation: eye-blink 4.8s steps(1, end) infinite;
+}
+
+/* Angry brows drawn here (sprite downscale loses them). */
+.pet-eyes--angry .pet-eye::before {
+  content: "";
+  position: absolute;
+  left: var(--px);
+  top: calc(3 * var(--px));
+  width: calc(4 * var(--px));
+  height: calc(3 * var(--px));
+  background: #4c2923;
+}
+
+.pet-eyes--angry .pet-eye::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  width: calc(2 * var(--px));
+  height: var(--px);
+  background: #4c2923;
+}
+
+.pet-eyes--angry .pet-eye--left::after {
+  left: var(--px);
+  box-shadow: calc(2 * var(--px)) var(--px) #4c2923;
+}
+
+.pet-eyes--angry .pet-eye--right::after {
+  left: calc(3 * var(--px));
+  box-shadow: calc(-2 * var(--px)) var(--px) #4c2923;
+}
+
+/* Angry skips blink/gaze — a stare. */
+
+/* Hunt: opaque dark eyes + moving cream pupils. */
+.pet-eyes--hunt {
+  animation: none;
+}
+
+.pet-eyes--hunt .pet-eye::before,
+.pet-eyes--hunt .pet-eye::after {
+  content: "";
+  position: absolute;
+  display: block;
+}
+
+.pet-eyes--hunt .pet-eye::before {
+  inset: 0;
+  background: #4c2923;
+}
+
+.pet-eyes--hunt .pet-eye--left {
+  left: calc(19 * var(--px));
+  top: calc(48 * var(--px));
+  width: calc(4 * var(--px));
+  height: calc(4 * var(--px));
+}
+
+.pet-eyes--hunt .pet-eye--right {
+  left: calc(33 * var(--px));
+  top: calc(47 * var(--px));
+  width: calc(5 * var(--px));
+  height: calc(5 * var(--px));
+}
+
+.pet-eyes--hunt .pet-eye::after {
+  left: calc(2 * var(--px));
+  top: var(--px);
+  width: var(--px);
+  height: var(--px);
+  background: #f5ecdd;
+  translate: var(--gaze-x) var(--gaze-y);
+  animation: none;
+}
+
+@keyframes eye-blink {
+  0%,
+  45%,
+  49%,
+  100% {
+    clip-path: inset(0);
+  }
+  46%,
+  48% {
+    clip-path: inset(45% 0);
+  }
+}
+
+/* Talking mouth flap until dedicated art exists. */
+.pet-mouth {
+  display: none;
+}
+
+.pet-mouth--talking {
+  display: block;
+  inset: calc(35 * var(--px)) auto auto calc(25 * var(--px));
+  width: calc(5 * var(--px));
+  height: calc(3 * var(--px));
+  /* Paper cover over baked idle mouth before flap. */
+  background: #f5ecdd;
+}
+
+.pet-mouth--talking::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: #4c2923;
+  border-bottom: var(--px) solid #f18973;
+  box-sizing: border-box;
+  transform-origin: top;
+  animation: mouth-flap 0.24s steps(2, end) infinite;
+}
+
+@keyframes mouth-flap {
+  50% {
+    transform: scaleY(0.35);
+  }
+}
+
+/* Particles mount with the reaction and leave with it. */
+.particles {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 2;
+}
+
+.particles i {
+  position: absolute;
+  display: block;
+  font-style: normal;
+}
+
+.particles--hearts i {
+  --drift: 0px;
+  --rise: -60px;
+  left: 94px;
+  top: 48px;
+  width: var(--px);
+  height: var(--px);
+  background: #f18973;
+  box-shadow:
+    -6px -6px #f18973,
+    -3px -6px #f18973,
+    3px -6px #f18973,
+    6px -6px #f18973,
+    -6px -3px #f18973,
+    -3px -3px #f18973,
+    0 -3px #f18973,
+    3px -3px #f18973,
+    6px -3px #f18973,
+    -3px 0 #f18973,
+    3px 0 #f18973,
+    0 3px #f18973;
+  animation: heart-flight 0.85s steps(7, end) both;
+}
+
+.particles--hearts i:nth-child(1) {
+  --drift: -42px;
+  --rise: -54px;
+  --heart-delay: 0ms;
+  animation-delay: var(--heart-delay);
+}
+.particles--hearts i:nth-child(2) {
+  --drift: -21px;
+  --rise: -72px;
+  --heart-delay: 70ms;
+  animation-delay: var(--heart-delay);
+}
+.particles--hearts i:nth-child(3) {
+  --drift: 4px;
+  --rise: -82px;
+  --heart-delay: 130ms;
+  animation-delay: var(--heart-delay);
+}
+.particles--hearts i:nth-child(4) {
+  --drift: 27px;
+  --rise: -68px;
+  --heart-delay: 190ms;
+  animation-delay: var(--heart-delay);
+}
+.particles--hearts i:nth-child(5) {
+  --drift: 45px;
+  --rise: -50px;
+  --heart-delay: 245ms;
+  animation-delay: var(--heart-delay);
+}
+
+@keyframes heart-flight {
+  0% {
+    transform: translate(0) scale(0.7);
+    opacity: 0;
+  }
+  18% {
+    opacity: 1;
+  }
+  100% {
+    transform: translate(var(--drift), var(--rise)) scale(1.05);
+    opacity: 0;
+  }
+}
+
+.particles--steam i {
+  left: 82px;
+  top: 48px;
+  width: calc(2 * var(--px));
+  height: calc(3 * var(--px));
+  background: #f18973;
+  animation: steam-rise 0.72s steps(5, end) both;
+}
+.particles--steam i:nth-child(2) {
+  left: 103px;
+  top: 40px;
+  animation-delay: 90ms;
+}
+.particles--steam i:nth-child(3) {
+  left: 124px;
+  animation-delay: 180ms;
+}
+
+@keyframes steam-rise {
+  to {
+    transform: translateY(-30px);
+    opacity: 0;
+  }
+}
+
+.particles--sleep i {
+  left: 118px;
+  top: 70px;
+  color: #4c2923;
+  font: 600 18px/1 "Pixelify Sans", monospace;
+  animation: sleep-z 3.6s steps(6, end) infinite;
+}
+.particles--sleep i:nth-child(2) {
+  left: 135px;
+  top: 53px;
+  animation-delay: -2.4s;
+}
+.particles--sleep i:nth-child(3) {
+  left: 151px;
+  top: 34px;
+  animation-delay: -1.2s;
+}
+
+@keyframes sleep-z {
+  0%,
+  35% {
+    transform: translate(0);
+    opacity: 0;
+  }
+  45% {
+    opacity: 1;
+  }
+  100% {
+    transform: translate(12px, -18px);
+    opacity: 0;
+  }
+}
+
+/* 9-slice dialogue bubble; tail lives in the bottom-right corner slice. */
+.bubble {
+  position: absolute;
+  right: 91px;
+  bottom: calc(var(--cell-px) - 34px);
+  /* Right-anchored: grows left; tail stays fixed to the dog. */
+  /* Local box-sizing (pet.css has no global reset). */
+  box-sizing: border-box;
+  min-width: 132px;
+  /* max-content so parent width doesn't cap the bubble. */
+  width: max-content;
+  /* Landscape cap; min includes border. */
+  max-width: 420px;
+  border-style: solid;
+  border-width: calc(5 * var(--px)) calc(8 * var(--px)) calc(7 * var(--px))
+    calc(6 * var(--px));
+  border-image-source: url("./bubble.png");
+  border-image-slice: 5 8 7 6 fill;
+  border-image-repeat: stretch;
+  image-rendering: pixelated;
+  /* Paper fill closes hairline seams; padding-box keeps chamfers. */
+  background-color: #f5ecdd;
+  background-clip: padding-box;
+  /* Anchor: 91px to head centre, 34px bottom inset. */
+}
+
+/* --- Legacy point explanation anchor (pre-monitor guide window) --- */
+.bone {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: calc(var(--bone-w) * var(--px));
+  height: calc(var(--bone-h) * var(--px));
+  pointer-events: none;
+}
+
+/* Bone bubble anchors; side from half-screen, not measured width. */
+.bubble--bone {
+  right: auto;
+  bottom: auto;
+}
+.bubble--bone.is-right { left: calc(var(--bone-w) * var(--px)); }
+.bubble--bone.is-left { right: calc(var(--bone-w) * var(--px)); }
+.bubble--bone.is-below { top: calc(var(--bone-h) * var(--px)); }
+.bubble--bone.is-above { bottom: calc(var(--bone-h) * var(--px)); }
+
+/* Mirror bubble so baked tail aims at the bone. */
+.bubble--bone.is-right.is-above { transform: scaleX(-1); }
+.bubble--bone.is-left.is-below { transform: scaleY(-1); }
+.bubble--bone.is-right.is-below { transform: scale(-1, -1); }
+.bubble--bone.is-right.is-above .bubble__text { transform: scaleX(-1); }
+.bubble--bone.is-left.is-below .bubble__text { transform: scaleY(-1); }
+.bubble--bone.is-right.is-below .bubble__text { transform: scale(-1, -1); }
+
+.bubble__text {
+  font: 400 13px/1.45 "Pixelify Sans", ui-monospace, monospace;
+  color: var(--ink);
+  image-rendering: auto;
+  /* Eight-line cap (1.45 × 8 = 11.6em). */
+  max-height: 11.6em;
+  /* Bottom-up scroll; pointer-events for wheel while overflowing. */
+  pointer-events: auto;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--ink) transparent;
+  display: flex;
+  flex-direction: column-reverse;
+  overflow-wrap: break-word;
+}
+
+/* Thinking dots. */
+/* Errors: colour + italic (not just colour). */
+.bubble__text--error {
+  color: var(--brown);
+  font-style: italic;
+}
+
+.bubble__dots {
+  display: flex;
+  gap: var(--px);
+  padding: calc(2 * var(--px)) 0;
+}
+.bubble__dots i {
+  width: calc(2 * var(--px));
+  height: calc(2 * var(--px));
+  background: var(--ink);
+  animation: blink 1.2s steps(1, end) infinite;
+}
+.bubble__dots i:nth-child(2) {
+  animation-delay: 0.2s;
+}
+.bubble__dots i:nth-child(3) {
+  animation-delay: 0.4s;
+}
+
+@keyframes blink {
+  0%,
+  60% {
+    opacity: 1;
+  }
+  30% {
+    opacity: 0.15;
+  }
+}
+
+/* ── Alert motion (listening cell + hops) ── */
+/* Peek: dedicated art, still (`--motion: none`). */
+.pet--peek {
+  --cell: var(--cell-peek);
+  --frames: var(--frames-peek);
+  --frame-time: var(--frame-time-peek);
+  --frame-play: var(--frame-play-peek);
+  --motion: none;
+}
+
+/* Mirror peek art for the left edge (on .pet-art, not JS-owned body). */
+.pet-root[data-quiet="left"] .pet-art {
+  transform: scaleX(-1);
+}
+
+/* Quiet waiting dot (on pet-root, not body). */
+.quiet-dot {
+  position: absolute;
+  top: calc(20 * var(--px));
+  width: calc(4 * var(--px));
+  height: calc(4 * var(--px));
+  border-radius: 50%;
+  background: var(--red);
+  /* The same paper ring the badge uses, so it reads against his cream coat. */
+  box-shadow: 0 0 0 var(--px) var(--paper);
+  z-index: 1;
+}
+
+/* Left-edge quiet: dot on the visible (right) end. */
+.pet-root[data-quiet="left"] .quiet-dot {
+  left: calc(50 * var(--px));
+}
+
+.pet-root[data-quiet="right"] .quiet-dot {
+  left: calc(10 * var(--px));
+}
+
+.pet--alert {
+  --cell: var(--cell-listening);
+  --frames: var(--frames-listening);
+  --frame-time: var(--frame-time-listening);
+  --frame-play: var(--frame-play-listening);
+  --motion: alert-life;
+  --motion-time: 1.5s;
+  --motion-ease: cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+@keyframes alert-life {
+  0% {
+    transform: translateY(0) scale(1, 1) rotate(0deg);
+  }
+  6% {
+    transform: translateY(2px) scale(1.06, 0.9) rotate(0deg);
+  }
+  16% {
+    transform: translateY(-10px) scale(0.95, 1.08) rotate(-3deg);
+  }
+  26% {
+    transform: translateY(0) scale(1.05, 0.94) rotate(0deg);
+  }
+  34% {
+    transform: translateY(-8px) scale(0.96, 1.06) rotate(3deg);
+  }
+  44% {
+    transform: translateY(0) scale(1.04, 0.96) rotate(0deg);
+  }
+  56%,
+  100% {
+    transform: translateY(0) scale(1, 1) rotate(0deg);
+  }
+}
+
+/* ── Pomodoro badge over the dog while the panel is closed ── */
+.badge {
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+  bottom: calc(var(--cell-px) - 30px);
+  padding: var(--px) calc(2 * var(--px));
+  border: var(--px) solid var(--ink);
+  font: 700 14px/1.2 var(--panel-digits);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+  /* Read-only: the panel is where you press things. */
+  pointer-events: none;
+}
+
+.badge--focus {
+  background: var(--red);
+  color: var(--paper);
+}
+
+.badge--break {
+  background: var(--green);
+  color: var(--paper);
+}
+
+/* ── Panels (same head-centre anchor as the bubble) ── */
+.panel-anchor {
+  position: absolute;
+  right: 91px;
+  bottom: calc(var(--cell-px) - 34px);
+  width: calc(112 * var(--px)); /* 336px */
+  /* DOM + native hit-test both required (see inBox). */
+  pointer-events: auto;
+}
+
+.panel {
+  /* Local box-sizing (no global reset here). */
+  box-sizing: border-box;
+  width: 100%;
+  border-style: solid;
+  border-width: calc(5 * var(--px)) calc(8 * var(--px)) calc(7 * var(--px))
+    calc(6 * var(--px));
+  border-image-source: url("./bubble.png");
+  border-image-slice: 5 8 7 6 fill;
+  border-image-repeat: stretch;
+  image-rendering: pixelated;
+  /* Paper fill for hairline seams; padding-box for chamfers. */
+  background-color: #f5ecdd;
+  background-clip: padding-box;
+  font: 400 14px/1.45 var(--panel-font);
+  color: var(--ink);
+}
+
+.panel > * + * {
+  margin-top: calc(2 * var(--px));
+}
+
+.panel__bar {
+  display: flex;
+  align-items: center;
+  gap: calc(2 * var(--px));
+  border-bottom: var(--px) solid var(--ink);
+  padding-bottom: calc(2 * var(--px));
+}
+
+.panel__title {
+  flex: 1;
+  /* Pixelify for the short title only. */
+  font: 600 16px/1 "Pixelify Sans", ui-monospace, monospace;
+}
+
+.panel__actions {
+  display: flex;
+  gap: calc(2 * var(--px));
+}
+
+.panel__btn {
+  font: 600 13px/1 var(--panel-font);
+  color: var(--paper);
+  background: var(--ink);
+  border: none;
+  padding: calc(2 * var(--px)) calc(3 * var(--px));
+  cursor: pointer;
+}
+
+.panel__btn:hover:not(:disabled) {
+  background: var(--brown);
+}
+
+.panel__btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+/* Ghost = outline (shape, not colour) for unchosen pair half. */
+.panel__btn--ghost {
+  background: var(--paper);
+  color: var(--ink);
+  box-shadow: inset 0 0 0 var(--px) var(--ink);
+}
+
+.panel__btn--ghost:hover:not(:disabled) {
+  background: var(--paper);
+  color: var(--brown);
+  box-shadow: inset 0 0 0 var(--px) var(--brown);
+}
+
+.panel__btn--wide {
+  flex: 1;
+  padding-block: calc(3 * var(--px));
+}
+
+.panel__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  /* Cap height; scroll instead of growing off-screen. */
+  max-height: calc(38 * var(--px));
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--ink) transparent;
+}
+
+.panel__row {
+  display: flex;
+  align-items: center;
+  gap: calc(2 * var(--px));
+}
+
+.panel__row + .panel__row {
+  margin-top: calc(2 * var(--px));
+}
+
+.panel__row--buttons {
+  gap: calc(3 * var(--px));
+}
+
+.panel__time {
+  font: 600 14px/1.2 var(--panel-digits);
+  font-variant-numeric: tabular-nums;
+}
+
+.panel__what {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.panel__when {
+  color: var(--brown);
+  font-size: 12px;
+}
+
+.panel__form {
+  border-top: var(--px) solid var(--ink);
+  padding-top: calc(2 * var(--px));
+}
+
+.panel__input {
+  box-sizing: border-box;
+  flex: 1;
+  /* Allow flex shrink below content size. */
+  min-width: 0;
+  font: 400 14px/1.2 var(--panel-font);
+  color: var(--ink);
+  background: var(--paper);
+  border: var(--px) solid var(--ink);
+  padding: calc(2 * var(--px));
+  /* Antialiased text input. */
+  image-rendering: auto;
+}
+
+.panel__input::placeholder {
+  color: var(--brown);
+  opacity: 0.75;
+}
+
+.panel__input:focus {
+  outline: var(--px) solid var(--brown);
+  outline-offset: 0;
+}
+
+.panel__input--time {
+  flex: 0 0 auto;
+  font-family: var(--panel-digits);
+  font-variant-numeric: tabular-nums;
+}
+
+.panel__hint {
+  margin: 0;
+  color: var(--brown);
+  font-size: 13px;
+}
+
+.panel__hint--error {
+  font-style: italic;
+}
+
+/* Phase label above the digits. */
+.panel__clock {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding-top: calc(2 * var(--px));
+}
+
+.panel__phase {
+  font: 700 13px/1 var(--panel-font);
+  /* Letter-spacing for a label. */
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+.panel__count {
+  font: 700 40px/1.15 var(--panel-digits);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Phase colour on the whole clock via the wrapper. */
+.panel__clock--focus .panel__phase,
+.panel__clock--focus .panel__count {
+  color: var(--red);
+}
+
+.panel__clock--break .panel__phase,
+.panel__clock--break .panel__count {
+  color: var(--green);
+}
+
+/* Idle/paused clock colour. */
+.panel__clock--idle .panel__phase,
+.panel__clock--idle .panel__count {
+  color: var(--brown);
+}
+
+.panel__round {
+  margin: 0;
+  text-align: center;
+  color: var(--brown);
+  font-size: 13px;
+}
+
+/* Duration settings; only at rest (keeps panel height stable). */
+.panel__settings {
+  padding-top: calc(2 * var(--px));
+}
+
+.panel__opt {
+  flex: 1;
+  color: var(--brown);
+}
+
+/* Fixed number width so steppers don't jog. */
+.panel__num {
+  min-width: calc(9 * var(--px));
+  text-align: center;
+  font: 700 15px/1 var(--panel-digits);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Equal-width −/+ steppers. */
+.panel__btn--step {
+  min-width: calc(7 * var(--px));
+  padding-inline: 0;
+  font-size: 15px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pet-sprite,
+  .pet-art,
+  .pet-eyes,
+  .pet-mouth,
+  .particles i,
+  .bubble__dots i,
+  .mic-warmup {
+    animation: none !important;
+  }
+
+  /* Hide ambience particles; hearts keep a short fallback. */
+  .particles--steam,
+  .particles--sleep {
+    display: none;
+  }
+
+  .particles--hearts i {
+    animation: heart-flight-reduced 0.72s steps(5, end) both !important;
+    animation-delay: var(--heart-delay) !important;
+  }
+}
+
+@keyframes heart-flight-reduced {
+  0% {
+    opacity: 0;
+    transform: translateY(0) scale(0.75);
+  }
+  20%,
+  65% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+    transform: translateY(-16px) scale(0.9);
+  }
+}

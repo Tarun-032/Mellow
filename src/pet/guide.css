@@ -1,0 +1,34 @@
+:root {
+  color-scheme: dark;
+}
+
+html,
+body,
+#root,
+.guide {
+  width: 36px;
+  height: 36px;
+  margin: 0;
+  overflow: hidden;
+  background: transparent !important;
+}
+
+body,
+.guide {
+  pointer-events: none;
+  user-select: none;
+}
+
+.guide {
+  position: relative;
+}
+
+.guide__bone {
+  position: absolute;
+  left: 6px;
+  top: 6px;
+  width: 24px;
+  height: 24px;
+  background: url("./bone.png") 0 0 / 100% 100% no-repeat;
+  image-rendering: pixelated;
+}

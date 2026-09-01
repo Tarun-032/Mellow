@@ -1,0 +1,911 @@
+@import "./../ui/tokens.css";
+
+@font-face {
+  font-family: "Pixelify Sans";
+  src: url("../pet/pixelify-sans.woff2") format("woff2");
+  font-display: swap;
+}
+
+:root {
+  color: var(--ink);
+  background: var(--paper);
+  font-family: "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
+  font-synthesis: none;
+  color-scheme: light;
+}
+
+html,
+body,
+#root {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  overflow: hidden;
+  background:
+    radial-gradient(circle at 50% 8%, rgba(255, 250, 242, 0.92), transparent 42%),
+    radial-gradient(circle at 50% 100%, rgba(201, 130, 74, 0.06), transparent 46%),
+    var(--paper);
+  accent-color: var(--brown);
+}
+
+::selection {
+  color: var(--ink);
+  background: rgba(241, 137, 115, 0.34);
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+/* One centered column on full-bleed paper; soft halo behind the dog. */
+.wizard {
+  --wizard-line: rgba(155, 83, 45, 0.28);
+  --wizard-line-soft: rgba(155, 83, 45, 0.16);
+  --wizard-surface: rgba(255, 250, 242, 0.78);
+  --wizard-surface-hover: rgba(234, 217, 199, 0.72);
+
+  display: grid;
+  grid-template-rows: auto 1fr;
+  width: 980px;
+  height: 700px;
+  margin: auto;
+  padding: 20px 40px 26px;
+  background: transparent;
+}
+
+/* --- Top row --- */
+
+.wizard-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 30px;
+}
+
+/* Quiet back link (not a primary button). */
+.wizard-back {
+  padding: 6px 9px 6px 0;
+  border: 0;
+  color: var(--muted);
+  background: none;
+  font-size: 14.5px;
+  font-weight: 560;
+  cursor: pointer;
+  transition:
+    color 180ms cubic-bezier(0.22, 1, 0.36, 1),
+    transform 180ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.wizard-back:hover {
+  color: var(--ink);
+  transform: translateX(-2px);
+}
+
+.wizard-dots {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  min-height: 24px;
+  padding: 0 5px;
+}
+
+.wizard-dots i {
+  width: 8px;
+  height: 8px;
+  border: 1px solid rgba(76, 41, 35, 0.48);
+  border-radius: 50%;
+  transition:
+    transform 240ms cubic-bezier(0.22, 1, 0.36, 1),
+    background-color 240ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.wizard-dots i.is-done {
+  background: var(--ink);
+}
+
+/* Current dot: --nose fill; ink ring for the edge. */
+.wizard-dots i.is-now {
+  background: var(--nose);
+  box-shadow: 0 0 0 3px rgba(241, 137, 115, 0.16);
+  transform: scale(1.08);
+}
+
+/* --- The column --- */
+
+.wizard-col {
+  display: grid;
+  grid-template-rows: auto auto 1fr auto;
+  justify-items: center;
+  min-height: 0;
+  padding-top: 2px;
+}
+
+/* Bookend: avoid 1fr stranding the button at the bottom. */
+/* Bookend rows auto-size and centre as a stack. */
+.wizard--bookend .wizard-col {
+  grid-template-rows: repeat(4, auto);
+  align-content: center;
+  gap: 2px;
+}
+
+.wizard--bookend .wizard-go {
+  align-self: auto;
+  padding-top: 28px;
+}
+
+/* Bookend content stays centred with the heading. */
+.wizard--bookend .wizard-swap {
+  justify-items: center;
+  text-align: center;
+}
+
+/* --- The mat --- */
+
+/* Soft halo so cream fur reads without a dark tile. */
+.wizard-mat {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 152px;
+  height: 142px;
+  border-radius: 50%;
+  background: radial-gradient(
+    ellipse at center,
+    rgba(234, 217, 199, 0.78) 0%,
+    rgba(234, 217, 199, 0.36) 48%,
+    transparent 72%
+  );
+}
+
+.wizard-mat::after {
+  position: absolute;
+  right: 25%;
+  bottom: 10px;
+  left: 25%;
+  height: 5px;
+  border-radius: 50%;
+  content: "";
+  background: rgba(155, 83, 45, 0.14);
+}
+
+/* Still sprite via sprites.css cells (do not import pet.css here). */
+.wizard-dog {
+  position: relative;
+  z-index: 1;
+  width: 128px;
+  height: 128px;
+  background-image: url("../pet/sprites.png");
+  background-size: calc(var(--cell-count) * 128px) 128px;
+  background-position: calc(var(--cell) * -128px) 0;
+  filter:
+    drop-shadow(0 -1px 0 var(--tan))
+    drop-shadow(1px 0 0 var(--tan))
+    drop-shadow(0 1px 0 var(--tan))
+    drop-shadow(-1px 0 0 var(--tan));
+  image-rendering: pixelated;
+}
+
+/* Bookends: bigger dog. */
+.wizard--bookend .wizard-mat {
+  width: 252px;
+  height: 240px;
+}
+
+.wizard--bookend .wizard-dog {
+  width: 224px;
+  height: 224px;
+  background-size: calc(var(--cell-count) * 224px) 224px;
+  background-position: calc(var(--cell) * -224px) 0;
+  filter:
+    drop-shadow(0 -1px 0 var(--tan))
+    drop-shadow(1px 0 0 var(--tan))
+    drop-shadow(0 1px 0 var(--tan))
+    drop-shadow(-1px 0 0 var(--tan));
+  animation: wizard-bob 2.8s cubic-bezier(0.45, 0, 0.55, 1) infinite;
+}
+
+/* One art pixel at 4x, so he breathes on the grid instead of between it. */
+@keyframes wizard-bob {
+  50% {
+    transform: translateY(-4px);
+  }
+}
+
+.wizard-step--idle {
+  --cell: var(--cell-idle);
+}
+.wizard-step--thinking {
+  --cell: var(--cell-thinking);
+}
+.wizard-step--listening {
+  --cell: var(--cell-listening);
+}
+.wizard-step--yawn {
+  --cell: var(--cell-yawn);
+}
+.wizard-step--sleeping {
+  --cell: var(--cell-sleeping);
+}
+.wizard-step--petting {
+  --cell: var(--cell-petting);
+}
+
+/* --- Heading --- */
+
+.wizard-head {
+  padding: 8px 0 16px;
+  text-align: center;
+}
+
+.wizard h1 {
+  margin: 0;
+  font-family: "Segoe UI Variable Display", "Segoe UI Variable", "Segoe UI", sans-serif;
+  font-size: 38px;
+  font-weight: 720;
+  line-height: 1.1;
+  letter-spacing: -0.03em;
+  text-wrap: balance;
+}
+
+.wizard--bookend h1 {
+  font-size: 48px;
+}
+
+.wizard-sub {
+  max-width: 46ch;
+  margin: 8px auto 0;
+  color: var(--muted);
+  font-size: 16px;
+  line-height: 1.45;
+  text-wrap: pretty;
+}
+
+/* --- Content (no silent scroll; overflow is a backstop) --- */
+.wizard-swap {
+  display: grid;
+  align-content: start;
+  gap: 12px;
+  width: 100%;
+  max-width: 560px;
+  min-height: 0;
+  overflow-y: auto;
+  text-align: left;
+  padding: 2px 4px 8px;
+  scrollbar-color: rgba(155, 83, 45, 0.28) transparent;
+  scrollbar-width: thin;
+  animation: wizard-in 260ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+.wizard-swap::-webkit-scrollbar {
+  width: 7px;
+}
+
+.wizard-swap::-webkit-scrollbar-thumb {
+  border: 2px solid transparent;
+  border-radius: 999px;
+  background: rgba(155, 83, 45, 0.28);
+  background-clip: padding-box;
+}
+
+/* The engine screen puts three choices in a row, so it needs the wider column. */
+.wizard-swap--wide {
+  max-width: 680px;
+}
+
+/* Form screens: two labels abreast; other children span. */
+.wizard-swap--form {
+  grid-template-columns: 1fr 1fr;
+  gap: 10px 16px;
+  max-width: 640px;
+}
+
+.wizard-swap--form > :not(label) {
+  grid-column: 1 / -1;
+}
+
+/* Local setup: plain column, not a panel. */
+.wizard-swap--local {
+  grid-template-columns: 1fr;
+  gap: 12px;
+  max-width: 640px;
+}
+
+.wizard-swap--local > label {
+  width: 100%;
+  max-width: 440px;
+}
+
+.local-setup-note {
+  padding: 0 0 14px;
+  border-bottom: 1px solid var(--wizard-line-soft);
+}
+
+.local-setup-note h2 {
+  margin: 0;
+  color: var(--ink);
+  font-size: 16px;
+  font-weight: 700;
+  line-height: 1.35;
+}
+
+.local-setup-note ol {
+  display: grid;
+  gap: 7px;
+  margin: 8px 0 0;
+  padding-left: 22px;
+  color: var(--muted);
+  font-size: 13.5px;
+  line-height: 1.5;
+}
+
+.local-setup-note li {
+  padding-left: 3px;
+}
+
+.local-setup-note li::marker {
+  color: var(--brown);
+  font-weight: 700;
+}
+
+.local-setup-note strong {
+  color: var(--ink);
+  font-weight: 650;
+}
+
+.inline-link {
+  display: inline;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  color: var(--brown);
+  background: transparent;
+  font: inherit;
+  font-weight: 650;
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
+  cursor: pointer;
+}
+
+.inline-link:hover {
+  color: var(--ink);
+}
+
+/* Don't stretch buttons to full grid column width. */
+.wizard-swap > .button {
+  justify-self: start;
+}
+
+/* --- Welcome capability marks --- */
+.can {
+  display: flex;
+  gap: 14px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.can li {
+  display: grid;
+  gap: 6px;
+  justify-items: center;
+  align-content: center;
+  width: 120px;
+  min-height: 90px;
+  padding: 11px 9px;
+  border: 1px solid var(--wizard-line-soft);
+  border-radius: 14px;
+  background: var(--wizard-surface);
+  box-shadow:
+    0 12px 28px rgba(76, 41, 35, 0.045),
+    inset 0 1px 0 rgba(255, 255, 255, 0.58);
+}
+
+.can-label {
+  color: var(--ink);
+  font-size: 13.5px;
+  font-weight: 650;
+}
+
+.can svg {
+  order: -1;
+  width: 31px;
+  height: 31px;
+  fill: none;
+  stroke: var(--brown);
+  stroke-width: 1.65;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+/* --- Primary action (alone; secondaries stay in content) --- */
+.wizard-go {
+  align-self: end;
+  padding-top: 16px;
+}
+
+.wizard-go .button {
+  min-width: 240px;
+  min-height: 50px;
+}
+
+@keyframes wizard-in {
+  from {
+    opacity: 0;
+    transform: translateY(9px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .wizard-swap,
+  .wizard--bookend .wizard-dog {
+    animation: none;
+  }
+}
+
+/* --- Controls (Settings palette, softer corners) --- */
+
+.wizard label {
+  display: grid;
+  gap: 6px;
+  color: var(--ink);
+  font-size: 13.5px;
+  font-weight: 620;
+}
+
+.wizard input,
+.wizard select {
+  width: 100%;
+  min-height: 43px;
+  padding: 10px 12px;
+  border: 1px solid var(--wizard-line);
+  border-radius: 10px;
+  color: var(--ink);
+  background: rgba(255, 250, 242, 0.92);
+  outline: none;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.62);
+  transition:
+    border-color 180ms cubic-bezier(0.22, 1, 0.36, 1),
+    box-shadow 180ms cubic-bezier(0.22, 1, 0.36, 1),
+    background-color 180ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.wizard input:hover,
+.wizard select:hover {
+  border-color: rgba(155, 83, 45, 0.46);
+  background: var(--field);
+}
+
+.wizard input::placeholder {
+  color: var(--placeholder);
+  opacity: 1;
+}
+
+.wizard input:focus-visible,
+.wizard select:focus-visible,
+.wizard button:focus-visible {
+  /* Focus ring is ink (nose/tan fail 3:1 on paper). */
+  outline: 3px solid var(--ink);
+  outline-offset: 2px;
+}
+
+.wizard .field-note {
+  margin: -5px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.wizard .motion-note {
+  max-width: 560px;
+  margin-top: 8px;
+}
+
+.wizard .motion-note strong {
+  color: var(--ink);
+  font-weight: 600;
+}
+
+.wizard .field-label {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+}
+
+.wizard .optional {
+  color: var(--muted);
+  font-weight: 500;
+  text-transform: lowercase;
+}
+
+.wizard code {
+  padding: 1px 5px;
+  border-radius: 4px;
+  color: var(--ink);
+  background: var(--sand);
+  font: 13px Consolas, monospace;
+}
+
+.button {
+  min-height: 42px;
+  padding: 9px 17px;
+  border: 1px solid var(--wizard-line);
+  border-radius: 10px;
+  font-size: 14px;
+  font-weight: 680;
+  white-space: nowrap;
+  cursor: pointer;
+  transition:
+    color 180ms cubic-bezier(0.22, 1, 0.36, 1),
+    background-color 180ms cubic-bezier(0.22, 1, 0.36, 1),
+    border-color 180ms cubic-bezier(0.22, 1, 0.36, 1),
+    box-shadow 180ms cubic-bezier(0.22, 1, 0.36, 1),
+    transform 180ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.button:disabled {
+  cursor: wait;
+  opacity: 0.5;
+}
+
+.button--secondary {
+  color: var(--ink);
+  background: rgba(255, 250, 242, 0.78);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.62);
+}
+
+.button--secondary:hover:not(:disabled) {
+  border-color: rgba(155, 83, 45, 0.46);
+  background: var(--wizard-surface-hover);
+  transform: translateY(-1px);
+}
+
+.button--secondary:active:not(:disabled) {
+  transform: translateY(1px) scale(0.99);
+}
+
+.button--primary {
+  border-color: var(--deep);
+  color: var(--paper);
+  background: var(--deep);
+  box-shadow:
+    0 10px 24px rgba(76, 41, 35, 0.16),
+    inset 0 1px 0 rgba(255, 250, 242, 0.11);
+}
+
+.button--primary:hover:not(:disabled) {
+  background: var(--ink-hover);
+  box-shadow:
+    0 13px 30px rgba(76, 41, 35, 0.2),
+    inset 0 1px 0 rgba(255, 250, 242, 0.13);
+  transform: translateY(-2px);
+}
+
+.button--primary:active:not(:disabled) {
+  background: var(--ink);
+  box-shadow:
+    0 5px 14px rgba(76, 41, 35, 0.14),
+    inset 0 1px 0 rgba(255, 250, 242, 0.09);
+  transform: translateY(1px) scale(0.99);
+}
+
+.notice {
+  margin: 10px 0 0;
+  padding: 11px 13px;
+  border: 1px solid var(--wizard-line);
+  border-radius: 10px;
+  color: var(--ink);
+  background: rgba(234, 217, 199, 0.58);
+  font-size: 13px;
+  line-height: 1.45;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.48);
+}
+
+.notice--error {
+  border-color: var(--red-deep);
+  background: var(--red-tint);
+}
+
+.notice--ok {
+  border-color: var(--green);
+}
+
+.notice-status {
+  display: inline-flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.notice-status svg {
+  flex: 0 0 auto;
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: var(--green);
+  stroke-width: 1.7;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+/* --- Choice cards --- */
+
+.choices {
+  display: grid;
+  gap: 12px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.choice {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 3px 11px;
+  align-items: center;
+  padding: 14px 16px;
+  border: 1px solid var(--wizard-line);
+  border-radius: 14px;
+  background: var(--wizard-surface);
+  box-shadow:
+    0 12px 28px rgba(76, 41, 35, 0.045),
+    inset 0 1px 0 rgba(255, 255, 255, 0.58);
+  cursor: pointer;
+  transition:
+    border-color 220ms cubic-bezier(0.22, 1, 0.36, 1),
+    background-color 220ms cubic-bezier(0.22, 1, 0.36, 1),
+    box-shadow 220ms cubic-bezier(0.22, 1, 0.36, 1),
+    transform 220ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.choice:hover {
+  border-color: rgba(155, 83, 45, 0.5);
+  background: var(--field);
+  box-shadow:
+    0 16px 34px rgba(76, 41, 35, 0.07),
+    inset 0 1px 0 rgba(255, 255, 255, 0.68);
+  transform: translateY(-2px);
+}
+
+.choice:has(input:checked) {
+  border-color: var(--brown);
+  background: rgba(234, 217, 199, 0.72);
+  box-shadow:
+    0 15px 34px rgba(76, 41, 35, 0.075),
+    inset 0 1px 0 rgba(255, 255, 255, 0.5),
+    inset 0 0 0 1px rgba(155, 83, 45, 0.08);
+}
+
+.choice input[type="radio"] {
+  grid-row: span 2;
+  width: 16px;
+  height: 16px;
+  min-height: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  box-shadow: none;
+  accent-color: var(--brown);
+}
+
+.choice:has(input:focus-visible) {
+  outline: 3px solid var(--ink);
+  outline-offset: 2px;
+}
+
+.choice-label {
+  font-size: 15.5px;
+  font-weight: 680;
+}
+
+.choice-hint {
+  grid-column: 2;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 1.4;
+}
+
+/* Pet-only sits apart under a rule. */
+.choices--apart {
+  position: relative;
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--wizard-line-soft);
+}
+
+/* Engine screen: three choices across. */
+.choices--row {
+  grid-template-columns: repeat(3, 1fr);
+  align-items: stretch;
+}
+
+.choices--row .choice {
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-rows: auto 1fr;
+  align-content: start;
+  gap: 7px 10px;
+  min-height: 142px;
+  padding: 16px;
+}
+
+.choices--row .choice input[type="radio"] {
+  grid-row: 1;
+  grid-column: 2;
+  align-self: start;
+  justify-self: end;
+  margin-top: 1px;
+}
+
+.choices--row .choice-label {
+  grid-row: 1;
+  grid-column: 1;
+}
+
+.choices--row .choice-hint {
+  grid-row: 2;
+  grid-column: 1 / -1;
+  align-self: start;
+}
+
+/* --- Progress --- */
+
+.progress {
+  display: grid;
+  gap: 9px;
+  margin: 0 0 12px;
+  padding: 16px 18px;
+  border: 1px solid var(--wizard-line-soft);
+  border-radius: 14px;
+  background: var(--wizard-surface);
+  box-shadow:
+    0 12px 28px rgba(76, 41, 35, 0.045),
+    inset 0 1px 0 rgba(255, 255, 255, 0.58);
+}
+
+.progress-head {
+  display: flex;
+  justify-content: space-between;
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+/* Progress: sand recess, ink fill (not --nose). */
+.progress-track {
+  height: 9px;
+  border: 1px solid var(--wizard-line);
+  border-radius: 999px;
+  background: rgba(234, 217, 199, 0.76);
+  overflow: hidden;
+}
+
+.progress-fill {
+  width: 100%;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--brown);
+  transform: scaleX(var(--progress-scale, 0));
+  transform-origin: left center;
+  transition: transform 400ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .progress-fill {
+    transition: none;
+  }
+}
+
+.progress-num {
+  color: var(--muted);
+  font: 13px Consolas, monospace;
+}
+
+.download-voice-test {
+  display: grid;
+  gap: 10px;
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--wizard-line-soft);
+}
+
+.download-voice-test .history-bar,
+.download-voice-test .field-note,
+.download-voice-test .notice {
+  margin: 0;
+}
+
+/* --- Keycaps --- */
+
+.keycaps {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 10px 0 20px;
+}
+
+.keycap {
+  min-width: 56px;
+  padding: 11px 14px;
+  border: 1px solid var(--wizard-line);
+  border-radius: 10px;
+  color: var(--ink);
+  background: var(--wizard-surface);
+  font: 600 15px Consolas, monospace;
+  text-align: center;
+  box-shadow:
+    0 5px 0 rgba(155, 83, 45, 0.13),
+    0 12px 22px rgba(76, 41, 35, 0.05),
+    inset 0 1px 0 rgba(255, 255, 255, 0.6);
+}
+
+.keycaps-plus {
+  color: var(--muted);
+  font-weight: 600;
+}
+
+/* --- Pet-only lists --- */
+
+.wizard-plain {
+  margin: 0;
+  padding: 15px 18px 15px 34px;
+  border: 1px solid var(--wizard-line-soft);
+  border-radius: 14px;
+  color: var(--muted);
+  background: var(--wizard-surface);
+  font-size: 13.5px;
+  line-height: 1.7;
+  box-shadow:
+    0 12px 28px rgba(76, 41, 35, 0.045),
+    inset 0 1px 0 rgba(255, 255, 255, 0.58);
+}
+
+.wizard-plain b {
+  display: block;
+  margin-bottom: 5px;
+  color: var(--ink);
+  font-size: 14px;
+}
+
+.wizard-cols {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+  margin-top: 2px;
+}
+
+.history-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .wizard-back,
+  .wizard-dots i,
+  .wizard input,
+  .wizard select,
+  .button,
+  .choice {
+    transition: none;
+  }
+
+  .wizard-back:hover,
+  .button:hover,
+  .button:active,
+  .choice:hover {
+    transform: none;
+  }
+}

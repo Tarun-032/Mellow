@@ -1,0 +1,24 @@
+[package]
+name = "mellow"
+version = "1.0.0"
+description = "A pixel-art Windows desktop companion that listens, speaks, helps, and keeps you company."
+authors = ["Tarun-032"]
+license = "Apache-2.0"
+repository = "https://github.com/Tarun-032/Mellow"
+homepage = "https://github.com/Tarun-032/Mellow"
+edition = "2021"
+
+[lib]
+# Avoids a Windows name collision with the binary target.
+name = "mellow_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri-plugin-global-shortcut = "2.3.2"

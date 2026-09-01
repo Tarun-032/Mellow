@@ -1,0 +1,11 @@
+# Keep text files consistent across platforms.
+* text=auto eol=lf
+
+# Never normalize binary assets.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.bmp binary
+*.ico binary
+*.icns binary
+*.woff2 binary
