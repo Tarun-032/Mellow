@@ -128,6 +128,8 @@ export function useSocket() {
       sock.onclose = () => {
         setConnected(false);
         setMicrophone("off");
+        // A disconnected sidecar cannot own a live pointing guide.
+        setPoint(null);
         if (!disposed) timer = setTimeout(connect, 1000);
       };
     };

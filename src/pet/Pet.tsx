@@ -9,13 +9,10 @@ import { bonePlacement, usePetMotion, type Reaction } from "./usePetMotion";
 import "./sprites.css"; // generated: --cell-<state> indices into sprites.png
 import "./pet.css";
 
-// ponytail: hardcoded until the shell reads config.json.
-const HOTKEY = "CommandOrControl+Shift+Space";
-
 const YAWN_AFTER = 60_000;
 // Reading time after the turn ends (not while still speaking).
 const DISMISS_AFTER = 20_000;
-// Bone dismiss; longer than GUIDE_TIMEOUT so they don't race.
+// Reading time for a pointed reply when no audio was played.
 const POINT_DISMISS = 10_000;
 // Yawn sequence length before sleep.
 const YAWN_LENGTH = 3_200;
@@ -90,9 +87,9 @@ export default function Pet() {
   const [waiting, setWaiting] = useState<string[]>([]);
   const timer = usePomodoro(setFired);
   const alert = fired || reminder;
-  // Hold: panel/alert/focus awake; break sleep; else nap (quiet closes mic below).
+  // Hold awake through sidecar work; break sleep; otherwise use the nap clock.
   const holdMode: Hold =
-    panel !== null || alert !== ""
+    panel !== null || alert !== "" || state !== "idle"
       ? "awake"
       : !timer.running
         ? null
@@ -190,6 +187,8 @@ export default function Pet() {
   const [landed, setLanded] = useState(false);
   // Remember a pointing turn after the bone clears.
   const pointed = useRef(false);
+  // Audio completion, not elapsed time, dismisses spoken pointing turns.
+  const spokeWhilePointing = useRef(false);
   const guideRevision = useRef(0);
   const dialogueRevision = useRef(0);
 
@@ -247,8 +246,13 @@ export default function Pet() {
 
   // Reset pointed flag when a new turn starts.
   useEffect(() => {
-    if (state === "listening" || state === "thinking") pointed.current = false;
-  }, [state]);
+    if (state === "listening" || state === "thinking") {
+      pointed.current = false;
+      spokeWhilePointing.current = false;
+    } else if (state === "talking" && pointed.current) {
+      spokeWhilePointing.current = true;
+    }
+  }, [state, point]);
 
   // Queue firings while quiet (both channels, not combined alert).
   useEffect(() => {
@@ -344,11 +348,18 @@ export default function Pet() {
 
   // Auto-clear finished idle exchanges (own timer, not naps).
   useEffect(() => {
-    // Skip while pointing or alerting.
+    // `idle` arrives only after queued speech has actually finished playing.
     if (state !== "idle" || !said || alert) return;
+    if (pointed.current && spokeWhilePointing.current) {
+      pointed.current = false;
+      spokeWhilePointing.current = false;
+      clear();
+      return;
+    }
     const reading = setTimeout(
       () => {
         pointed.current = false;
+        spokeWhilePointing.current = false;
         clear();
       },
       pointing || pointed.current ? POINT_DISMISS : DISMISS_AFTER,
@@ -441,7 +452,6 @@ export default function Pet() {
             className="mic-warmup"
             role="status"
             aria-label="Getting the microphone ready"
-            title="Getting the microphone ready…"
           >
             {Array.from({ length: 8 }, (_, dot) => <i key={dot} />)}
           </div>
@@ -470,7 +480,11 @@ export default function Pet() {
           (state === "thinking" || state === "looking" || said) && (
           <div className="bubble">
             {(state === "thinking" || state === "looking") && !said ? (
-              <div className="bubble__dots" title={state === "looking" ? "Looking at your screen…" : undefined}>
+              <div
+                className="bubble__dots"
+                role="status"
+                aria-label={state === "looking" ? "Looking at your screen" : "Thinking"}
+              >
                 <i />
                 <i />
                 <i />
@@ -517,12 +531,13 @@ export default function Pet() {
           <div className={`pet-art pet--${shown}`}>
             <div
               className={`pet-sprite${connected ? "" : " pet--offline"}`}
-              title={
+              role="img"
+              aria-label={
                 !connected
-                  ? "mellowd not running"
+                  ? "Mellow is offline"
                   : microphone === "warming"
-                    ? "Getting the microphone ready…"
-                    : `hold ${HOTKEY} to talk`
+                    ? "Mellow is getting the microphone ready"
+                    : "Mellow"
               }
             />
             <div

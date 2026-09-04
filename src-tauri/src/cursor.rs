@@ -27,8 +27,6 @@ const EDGE_MARGIN: f64 = 8.0;
 const EDGE_HYSTERESIS: f64 = 24.0;
 const RETURN_CANCEL_DISTANCE: f64 = 24.0;
 const REDUCED_RETURN_RETARGET_DISTANCE: f64 = 4.0;
-// Native fail-safe if the frontend never clears a point (frontend uses 10s).
-const DWELL_TIMEOUT: Duration = Duration::from_secs(12);
 const DIALOGUE_WIDTH: f64 = 420.0;
 const DIALOGUE_HEIGHT: f64 = 220.0;
 // Gap so the explanation clears the bone sprite.
@@ -105,11 +103,7 @@ struct Flight {
 enum Phase {
     Following,
     Flying(Flight),
-    Dwelling {
-        revision: u64,
-        at: Point,
-        started: Instant,
-    },
+    Dwelling { at: Point },
 }
 
 #[derive(Debug)]
@@ -525,11 +519,7 @@ pub fn guide_set_target(
     if guide.position.distance(destination) <= 2.0 * target_screen.scale {
         guide.position = destination;
         guide.velocity = Point::default();
-        guide.phase = Phase::Dwelling {
-            revision,
-            at: destination,
-            started: Instant::now(),
-        };
+        guide.phase = Phase::Dwelling { at: destination };
         drop(guide);
         hide_dialogue(&app);
         let _ = app.emit(GUIDE_ARRIVED, GuideArrived { revision });
@@ -765,8 +755,6 @@ fn tick(app: &AppHandle, state: &GuideState) {
         dt
     };
     let mut arrival = None;
-    let mut dialogue_expired = false;
-
     let (position, ready, quiet, width, height) = {
         let mut motion = state
             .motion
@@ -796,36 +784,11 @@ fn tick(app: &AppHandle, state: &GuideState) {
                     motion.velocity.y = vy;
                 }
             }
-            Phase::Dwelling {
-                revision,
-                at,
-                started,
-            } => {
-                if started.elapsed() >= DWELL_TIMEOUT {
-                    if motion.reduced_motion {
-                        let destination = follow_destination(cursor, cursor_screen, &mut motion);
-                        begin_flight(
-                            &mut motion,
-                            destination,
-                            FlightKind::Return,
-                            revision,
-                            cursor,
-                            &all_screens,
-                            cursor_screen.scale,
-                        );
-                    } else {
-                        motion.phase = Phase::Following;
-                    }
-                    dialogue_expired = true;
-                } else {
-                    motion.position = at;
-                    motion.velocity = Point::default();
-                    motion.phase = Phase::Dwelling {
-                        revision,
-                        at,
-                        started,
-                    };
-                }
+            Phase::Dwelling { at } => {
+                // The frontend clears this at actual speech completion.
+                motion.position = at;
+                motion.velocity = Point::default();
+                motion.phase = Phase::Dwelling { at };
             }
             Phase::Flying(flight) => {
                 let return_retarget_distance = if motion.reduced_motion {
@@ -886,11 +849,7 @@ fn tick(app: &AppHandle, state: &GuideState) {
                         motion.position = end;
                         motion.velocity = Point::default();
                         if kind == FlightKind::Target {
-                            motion.phase = Phase::Dwelling {
-                                revision,
-                                at: end,
-                                started: Instant::now(),
-                            };
+                            motion.phase = Phase::Dwelling { at: end };
                             arrival = Some(revision);
                         } else {
                             motion.phase = Phase::Following;
@@ -910,9 +869,6 @@ fn tick(app: &AppHandle, state: &GuideState) {
         )
     };
 
-    if dialogue_expired {
-        hide_dialogue(app);
-    }
     if let Some(revision) = arrival {
         let _ = app.emit(GUIDE_ARRIVED, GuideArrived { revision });
     }
