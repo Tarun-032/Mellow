@@ -21,9 +21,7 @@ You choose how much intelligence Mellow has and where it runs. Use local models,
 
 ## Mellow Demo
 
-<p align="center">
-  <a href="media/demo/Mellow-Demo.mp4"><strong>&#9654; Watch Mellow Demo</strong></a>
-</p>
+https://github.com/user-attachments/assets/8cb9e786-4c55-4077-bd6f-3200aedc5f61
 
 ## Mellow in action
 
