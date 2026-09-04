@@ -19,20 +19,40 @@ Mellow is an open-source desktop companion with a real personality and a useful 
 
 You choose how much intelligence Mellow has and where it runs. Use local models, connect an OpenAI-compatible provider, use an existing Claude Code or Codex subscription, or disable AI entirely and keep only the pet.
 
-## Demo
+## Mellow in action
 
-> A full walkthrough and short feature clips will be added with the first public release.
-
-<!--
-Video slot:
-[![Watch the Mellow demo](media/demo-thumbnail.png)](YOUR_VIDEO_URL)
-
-Screenshot slots:
-<p align="center">
-  <img src="media/onboarding.png" width="48%" alt="Mellow onboarding" />
-  <img src="media/desktop.png" width="48%" alt="Mellow on the desktop" />
-</p>
--->
+<table>
+  <tr>
+    <th width="33.33%">Cursor tracking</th>
+    <th width="33.33%">Petting</th>
+    <th width="33.33%">Hunt mode</th>
+  </tr>
+  <tr>
+    <td><img src="media/features/cursor-tracking.gif" width="100%" alt="Mellow following the cursor with his eyes" /></td>
+    <td><img src="media/features/petting.gif" width="100%" alt="Mellow reacting happily while being petted" /></td>
+    <td><img src="media/features/hunt.gif" width="100%" alt="Mellow chasing the cursor in hunt mode" /></td>
+  </tr>
+  <tr>
+    <td align="center"><sub>His eyes follow your cursor around the desktop.</sub></td>
+    <td align="center"><sub>Give him a pet and watch the hearts appear.</sub></td>
+    <td align="center"><sub>Move quickly and Mellow gives chase.</sub></td>
+  </tr>
+  <tr>
+    <th>Shake reaction</th>
+    <th>Pomodoro timer</th>
+    <th>Reminders</th>
+  </tr>
+  <tr>
+    <td><img src="media/features/angry.gif" width="100%" alt="Mellow reacting angrily after being shaken" /></td>
+    <td><img src="media/features/pomodoro.gif" width="100%" alt="Mellow running a Pomodoro focus timer" /></td>
+    <td><img src="media/features/reminder.gif" width="100%" alt="Mellow displaying a drink water reminder" /></td>
+  </tr>
+  <tr>
+    <td align="center"><sub>Shake him around and he lets you know.</sub></td>
+    <td align="center"><sub>Stay focused with work and break sessions.</sub></td>
+    <td align="center"><sub>Set reminders and Mellow gets your attention.</sub></td>
+  </tr>
+</table>
 
 ## What Mellow can do
 
