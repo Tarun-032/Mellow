@@ -19,6 +19,12 @@ Mellow is an open-source desktop companion with a real personality and a useful 
 
 You choose how much intelligence Mellow has and where it runs. Use local models, connect an OpenAI-compatible provider, use an existing Claude Code or Codex subscription, or disable AI entirely and keep only the pet.
 
+## Mellow Demo
+
+<p align="center">
+  <a href="media/demo/Mellow-Demo.mp4"><strong>&#9654; Watch Mellow Demo</strong></a>
+</p>
+
 ## Mellow in action
 
 <table>
