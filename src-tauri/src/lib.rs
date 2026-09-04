@@ -13,6 +13,49 @@ use tauri::{
 #[cfg(desktop)]
 use tauri_plugin_global_shortcut::{Code, Modifiers, Shortcut, ShortcutState};
 
+/// Put an overlay back in Windows' topmost band without activating it.
+#[cfg(all(desktop, windows))]
+pub(crate) fn restore_topmost(window: &tauri::WebviewWindow) {
+    const HWND_TOPMOST: isize = -1;
+    const SWP_NOSIZE: u32 = 0x0001;
+    const SWP_NOMOVE: u32 = 0x0002;
+    const SWP_NOACTIVATE: u32 = 0x0010;
+    const SWP_NOOWNERZORDER: u32 = 0x0200;
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn SetWindowPos(
+            hwnd: isize,
+            insert_after: isize,
+            x: i32,
+            y: i32,
+            width: i32,
+            height: i32,
+            flags: u32,
+        ) -> i32;
+    }
+
+    if let Ok(hwnd) = window.hwnd() {
+        // Safe: this keeps an HWND we own topmost and SWP_NOACTIVATE preserves focus.
+        unsafe {
+            let _ = SetWindowPos(
+                hwnd.0 as isize,
+                HWND_TOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+            );
+        }
+    }
+}
+
+#[cfg(all(desktop, not(windows)))]
+pub(crate) fn restore_topmost(window: &tauri::WebviewWindow) {
+    let _ = window.set_always_on_top(true);
+}
+
 /// Push-to-talk key state: true on press, false on release.
 #[cfg(desktop)]
 const PTT: &str = "ptt";
@@ -151,6 +194,7 @@ fn move_pet_to_cursor_monitor(app: tauri::AppHandle) -> Result<Option<PetMonitor
     window
         .set_size(PhysicalSize::new(size.width, size.height))
         .map_err(|error| error.to_string())?;
+    restore_topmost(&window);
     Ok(Some(PetMonitor {
         left: position.x,
         top: position.y,
@@ -266,11 +310,12 @@ fn show_pet(app: &tauri::AppHandle) {
         return;
     }
     if let Some(win) = app.get_webview_window("pet") {
-        // Reassert topmost/non-focusable/click-through after Windows drops them.
+        // Restore the overlay contract without taking focus from the current app.
         let _ = win.set_always_on_top(true);
         let _ = win.set_focusable(false);
         let _ = win.set_ignore_cursor_events(true);
         let _ = win.show();
+        restore_topmost(&win);
     }
 }
 
@@ -322,6 +367,7 @@ fn complete_onboarding(app: tauri::AppHandle) -> Result<(), String> {
     pet.set_ignore_cursor_events(true)
         .map_err(|error| error.to_string())?;
     pet.show().map_err(|error| error.to_string())?;
+    restore_topmost(&pet);
     app.emit(PET_WAKE, ()).map_err(|error| error.to_string())?;
 
     if let Some(welcome) = app.get_webview_window("welcome") {
@@ -387,6 +433,7 @@ fn popup_pet_menu(handle: &tauri::AppHandle, speak: bool, quiet: bool) {
                 let _ = win.set_focus();
                 let _ = win.popup_menu(&menu);
                 let _ = win.set_focusable(false);
+                restore_topmost(&win);
             }
             Err(error) => eprintln!("could not build the pet menu: {error}"),
         }
@@ -556,6 +603,8 @@ pub fn run() {
                             let _ = win.set_focusable(wants);
                             if wants {
                                 let _ = win.set_focus();
+                            } else {
+                                restore_topmost(&win);
                             }
                         }
                     });

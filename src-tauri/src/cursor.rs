@@ -14,12 +14,13 @@ use tauri::{
     AppHandle, Emitter, LogicalSize, Manager, PhysicalPosition, PhysicalSize, State,
 };
 
-use crate::PetMonitor;
+use crate::{restore_topmost, PetMonitor};
 
 const CURSOR: &str = "cursor";
 const GUIDE_ARRIVED: &str = "guide-arrived";
 const INTERVAL: Duration = Duration::from_millis(16);
 const MONITOR_REFRESH: Duration = Duration::from_secs(2);
+const TOPMOST_REFRESH: Duration = Duration::from_secs(1);
 
 const FOLLOW_OFFSET_X: f64 = 42.0;
 const FOLLOW_OFFSET_Y: f64 = 34.0;
@@ -160,6 +161,7 @@ struct GuideRuntime {
     last_cursor: (f64, f64),
     last_window_position: (i32, i32),
     last_scale: f64,
+    topmost_refreshed: Instant,
 }
 
 impl Default for GuideRuntime {
@@ -171,6 +173,7 @@ impl Default for GuideRuntime {
             last_cursor: (f64::NAN, f64::NAN),
             last_window_position: (i32::MIN, i32::MIN),
             last_scale: f64::NAN,
+            topmost_refreshed: Instant::now(),
         }
     }
 }
@@ -483,6 +486,9 @@ pub fn guide_ready(
         window
             .set_always_on_top(true)
             .map_err(|error| error.to_string())?;
+        if window.is_visible().unwrap_or(false) {
+            restore_topmost(&window);
+        }
     }
     if first_ready {
         hide_dialogue(&app);
@@ -647,6 +653,7 @@ pub fn guide_set_dialogue(
         .set_always_on_top(true)
         .map_err(|error| error.to_string())?;
     window.show().map_err(|error| error.to_string())?;
+    restore_topmost(&window);
     Ok(())
 }
 
@@ -688,6 +695,29 @@ fn tick(app: &AppHandle, state: &GuideState) {
     let Some(guide_window) = app.get_webview_window("guide") else {
         return;
     };
+
+    let refresh_topmost = {
+        let mut runtime = state
+            .runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if runtime.topmost_refreshed.elapsed() >= TOPMOST_REFRESH {
+            runtime.topmost_refreshed = Instant::now();
+            true
+        } else {
+            false
+        }
+    };
+    if refresh_topmost {
+        for label in ["pet", "guide", "guide-bubble"] {
+            if let Some(window) = app.get_webview_window(label) {
+                if window.is_visible().unwrap_or(false) {
+                    restore_topmost(&window);
+                }
+            }
+        }
+    }
+
     let Ok(cursor_position) = app.cursor_position() else {
         return;
     };
@@ -923,10 +953,10 @@ fn tick(app: &AppHandle, state: &GuideState) {
         }
     }
 
-    // Position before show; reassert topmost (Windows may drop z-order while hidden).
+    // Showing a hidden window can put it below the currently active application.
     if !currently_visible {
-        let _ = guide_window.set_always_on_top(true);
         let _ = guide_window.show();
+        restore_topmost(&guide_window);
     }
 }
 
