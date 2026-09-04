@@ -23,6 +23,16 @@ You choose how much intelligence Mellow has and where it runs. Use local models,
 
 https://github.com/user-attachments/assets/8cb9e786-4c55-4077-bd6f-3200aedc5f61
 
+## What Mellow can do
+
+- **Talk naturally.** Hold `Ctrl` + `Shift` + `Space`, speak, and hear Mellow answer out loud.
+- **See when invited.** Mellow can inspect the active screen for questions such as “what is this?” without continuously recording it.
+- **Point things out.** Ask where a control is and Mellow's bone pointer moves to the relevant place on screen.
+- **Help around the desktop.** Open apps, folders, and websites, play media, or adjust one application's volume.
+- **Keep you on track.** Set reminders and run configurable Pomodoro focus sessions directly from the pet.
+- **Feel alive.** Pet, drag, wake, and watch Mellow react through idle, listening, thinking, talking, sleeping, peeking, and stretching animations.
+- **Work without AI.** Pet-only mode keeps the companion, reminders, and focus tools without downloading models or contacting an AI service.
+
 ## Mellow in action
 
 <table>
@@ -70,15 +80,7 @@ https://github.com/user-attachments/assets/8cb9e786-4c55-4077-bd6f-3200aedc5f61
   </tr>
 </table>
 
-## What Mellow can do
 
-- **Talk naturally.** Hold `Ctrl` + `Shift` + `Space`, speak, and hear Mellow answer out loud.
-- **See when invited.** Mellow can inspect the active screen for questions such as “what is this?” without continuously recording it.
-- **Point things out.** Ask where a control is and Mellow's bone pointer moves to the relevant place on screen.
-- **Help around the desktop.** Open apps, folders, and websites, play media, or adjust one application's volume.
-- **Keep you on track.** Set reminders and run configurable Pomodoro focus sessions directly from the pet.
-- **Feel alive.** Pet, drag, wake, and watch Mellow react through idle, listening, thinking, talking, sleeping, peeking, and stretching animations.
-- **Work without AI.** Pet-only mode keeps the companion, reminders, and focus tools without downloading models or contacting an AI service.
 
 ## Choose your setup
 
