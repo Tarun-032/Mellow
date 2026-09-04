@@ -54,6 +54,18 @@ You choose how much intelligence Mellow has and where it runs. Use local models,
   </tr>
 </table>
 
+<table width="33.33%" align="center">
+  <tr>
+    <th>Peek mode</th>
+  </tr>
+  <tr>
+    <td><img src="media/features/peek.gif" width="100%" alt="Mellow hiding at the edge of the screen and peeking back in" /></td>
+  </tr>
+  <tr>
+    <td align="center"><sub>Need some space? Mellow tucks himself against the screen edge.</sub></td>
+  </tr>
+</table>
+
 ## What Mellow can do
 
 - **Talk naturally.** Hold `Ctrl` + `Shift` + `Space`, speak, and hear Mellow answer out loud.
