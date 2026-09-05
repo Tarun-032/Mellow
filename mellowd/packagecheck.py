@@ -17,6 +17,7 @@ def run() -> None:
     import onnx_asr
     import onnxruntime
     import sounddevice
+    import pyaudiowpatch
     import uiautomation
     from PIL import Image
     from pycaw.pycaw import AudioUtilities
@@ -27,6 +28,9 @@ def run() -> None:
 
     checks: dict[str, object] = {}
     checks["portaudio"] = sounddevice.get_portaudio_version()[1]
+    checks["meeting_portaudio"] = pyaudiowpatch.get_portaudio_version_text()
+    from mellowd.meetings import router
+    checks["meeting_routes"] = len(router.routes)
 
     espeak_library = Path(espeakng_loader.get_library_path())
     espeak_data = Path(espeakng_loader.get_data_path())

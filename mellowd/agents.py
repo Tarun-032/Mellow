@@ -884,6 +884,23 @@ async def chat(
         yield chunk
 
 
+async def complete_text(prompt: str, cfg: dict, system: str) -> str:
+    """An isolated notes call, never a normal pet conversation."""
+    section = cfg["llm"]
+    # Codex ignores the separate system argument, so include these rules in stdin too.
+    turn = _prepare(section["provider"], section, system, system + "\n\n" + prompt)
+    if section["provider"] == "codex":
+        flags = ["features.shell_tool=false", "features.unified_exec=false",
+                 "features.apply_patch_freeform=false", "features.js_repl=false",
+                 "features.multi_agent=false", "features.apps=false", "features.plugins=false",
+                 "tools.view_image=false", 'web_search="disabled"']
+        for argv in (turn.argv, turn.fallback_argv):
+            if argv is not None:
+                at = argv.index("--")
+                argv[at:at] = [arg for flag in flags for arg in ("--config", flag)]
+    return "".join([part async for part in _stream(section["provider"], turn)]).strip()
+
+
 async def complete_vision(
     prompt: str, cfg: dict, image: bytes, schema: dict | None = None
 ) -> str:

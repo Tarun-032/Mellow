@@ -120,6 +120,7 @@ POSES: dict[str, Pose] = {
     # Own crop: different silhouettes from the upright set.
     "petting": Pose("Mellow petting.png", "petting", 46, 60),
     "hunt": Pose("Mellow hunt.png", "hunt", 34, 60),
+    "writing": Pose(("mellow transcribe notetaking.png",) * 2, "writing", 46, 60, fps=2),
     # Edge sliver (from peek_art.py); CSS mirrors for the other side.
     "peek": Pose("Mellow peek.png", "peek", 46, 60, edge=True),
 }
@@ -446,6 +447,18 @@ def hit_mask(cells: list[np.ndarray]) -> list[str]:
     return ["".join("1" if pixel else "0" for pixel in row) for row in opaque]
 
 
+def writing_stroke(cell: np.ndarray) -> np.ndarray:
+    """Move the supplied pencil/paw one art pixel; keep the head and notebook fixed."""
+    result = cell.copy()
+    patch = cell[39:51, 14:24].copy()
+    result[39:51, 14:24] = 0
+    for row, left in enumerate((20, 20, 19, 19, 17, 17, 16, 16, 17, 17, 16, 16), 39):
+        result[row, left:24] = (*PALETTE["cream"], 255)
+    target = result[39:51, 13:23]
+    target[patch[:, :, 3] > 0] = patch[patch[:, :, 3] > 0]
+    return result
+
+
 def build(art: Path = ART, out_png: Path = OUT_PNG, write: bool = True):
     frames = render(POSES, art)
     if not frames:
@@ -458,6 +471,9 @@ def build(art: Path = ART, out_png: Path = OUT_PNG, write: bool = True):
         clean_dark_specks(n, cream_legs(n, repaint(n, c)))
         for (n, _), c in zip(keys, snapped)
     ]
+    for index, (name, frame) in enumerate(keys):
+        if name == "writing" and frame == 1:
+            flat[index] = writing_stroke(flat[index])
 
     cells: dict[str, list[np.ndarray]] = {}
     for (n, _), c in zip(keys, flat):

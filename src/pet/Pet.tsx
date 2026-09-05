@@ -2,6 +2,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { emit, emitTo, listen } from "@tauri-apps/api/event";
 import { PomodoroPanel, ReminderPanel } from "./Panels";
+import { MeetingPanel } from "../meetings/MeetingPanel";
+import { clock as meetingClock, useMeeting, viewMeeting } from "../meetings/useMeeting";
 import { GUIDE_DIALOGUE_KEY, type GuideDialogue } from "./guideDialogue";
 import { PHASE_LABEL, mmss, usePomodoro } from "./usePomodoro";
 import { useSocket } from "./useSocket";
@@ -22,8 +24,16 @@ const PARTICLES = [0, 1, 2, 3, 4];
 // Cap on unanswered alert attention.
 const ALERT_CAP = 120_000;
 
+/** Badge wording per meeting state; the panel spells things out at length. */
+const MEETING_LABEL: Record<string, string> = {
+  starting: "Getting ready",
+  recording: "Notes",
+  paused: "Paused",
+  finalizing: "Saving notes",
+};
+
 /** Which panel is hovering over Mellow, if any. */
-type Panel = "pomodoro" | "reminders" | null;
+type Panel = "pomodoro" | "reminders" | "meeting" | null;
 
 /** Nap clock for the mic; pose may be overruled by a pomodoro. */
 type Nap = "awake" | "yawn" | "sleeping";
@@ -79,6 +89,16 @@ export default function Pet() {
     clear,
     dismissReminder,
   } = useSocket();
+  const meeting = useMeeting();
+  const meetingActive = Boolean(meeting.status?.active);
+  const completedMeetingId = meeting.status?.status === "complete" ? meeting.status.id : null;
+  const [dismissedMeetingId, setDismissedMeetingId] = useState<string | null>(null);
+  const meetingSaved = Boolean(completedMeetingId && completedMeetingId !== dismissedMeetingId);
+  useEffect(() => {
+    if (!completedMeetingId || completedMeetingId === dismissedMeetingId) return;
+    const timeout = window.setTimeout(() => setDismissedMeetingId(completedMeetingId), 15_000);
+    return () => window.clearTimeout(timeout);
+  }, [completedMeetingId, dismissedMeetingId]);
   const [nap, setNap] = useState<Nap>("awake");
   const [panel, setPanel] = useState<Panel>(null);
   // Local pomodoro fire (separate from sidecar reminders).
@@ -87,9 +107,10 @@ export default function Pet() {
   const [waiting, setWaiting] = useState<string[]>([]);
   const timer = usePomodoro(setFired);
   const alert = fired || reminder;
+  useEffect(() => { if (meetingActive && alert) setPanel("meeting"); }, [meetingActive, alert]);
   // Hold awake through sidecar work; break sleep; otherwise use the nap clock.
   const holdMode: Hold =
-    panel !== null || alert !== "" || state !== "idle"
+    meetingActive || panel !== null || alert !== "" || state !== "idle"
       ? "awake"
       : !timer.running
         ? null
@@ -167,7 +188,7 @@ export default function Pet() {
   // Native menu opens panels (pet window is click-through).
   useEffect(() => {
     const stop = listen<string>("open-panel", ({ payload }) => {
-      setPanel(payload === "reminders" ? "reminders" : "pomodoro");
+      setPanel(payload === "meeting" ? "meeting" : payload === "reminders" ? "reminders" : "pomodoro");
     });
     return () => {
       stop.then((off) => off()).catch(() => {});
@@ -175,12 +196,39 @@ export default function Pet() {
   }, []);
 
   const motion = usePetMotion(
-    state === "idle" && pose === "awake" && !alert,
+    !meetingActive && state === "idle" && pose === "awake" && !alert,
     wake,
     pose === "sleeping",
   );
   // Quiet edge from the motion hook.
   const { quiet, setQuiet, toggleQuiet } = motion;
+  // Hand off to the settings window: drop the panel and stop eating clicks
+  // first, or the new window opens under a full-screen overlay that has them.
+  const viewMeetings = useCallback(
+    (id: string | null) => {
+      setDismissedMeetingId(id);
+      setPanel(null);
+      motion.releaseOverlay();
+      void viewMeeting(id);
+    },
+    [motion],
+  );
+
+  // Settings can also be opened from the tray with a panel still up; the shell
+  // drops click-through for us, so mirror it or the pet never re-arms.
+  useEffect(() => {
+    const stop = listen("pet-released", () => {
+      setPanel(null);
+      motion.releaseOverlay();
+    });
+    return () => {
+      stop.then((off) => off()).catch(() => {});
+    };
+  }, [motion]);
+  useEffect(() => {
+    if (meetingActive || panel === "meeting") setQuiet(null);
+    if (meetingActive) { held.current = false; clear(); }
+  }, [meetingActive, panel, setQuiet, clear]);
   // Pointing: words ride the bone; skip if quiet or asleep.
   const pointing = point !== null && !quiet && pose === "awake";
   // Wait for native bone arrival before showing dialogue.
@@ -276,6 +324,7 @@ export default function Pet() {
   // React to the Rust-registered PTT hotkey.
   useEffect(() => {
     const stop = listen<boolean>("ptt", ({ payload: down }) => {
+      if (meetingActive) return;
       // Ignore PTT while mic is warming (and matching releases).
       if (down && microphone === "warming") return;
       if (!down && !held.current) return;
@@ -296,10 +345,10 @@ export default function Pet() {
     return () => {
       stop.then((off) => off()).catch(() => {});
     };
-  }, [send, wake, clear, setQuiet, microphone]);
+  }, [send, wake, clear, setQuiet, microphone, meetingActive]);
 
   // Mic open while awake and not quiet.
-  const listening = nap !== "sleeping" && !quiet;
+  const listening = !meetingActive && nap !== "sleeping" && !quiet;
   useEffect(() => {
     if (connected) send({ type: "awake", value: listening });
   }, [connected, listening, send]);
@@ -311,17 +360,17 @@ export default function Pet() {
       event.preventDefault();
       wake();
       // Pass speak/quiet so Rust can label menu items.
-      emit("pet-menu", { speak, quiet: quiet !== null }).catch(() => {});
+      emit("pet-menu", { speak, quiet: quiet !== null, meeting: meetingActive }).catch(() => {});
     },
-    [speak, wake, quiet],
+    [speak, wake, quiet, meetingActive],
   );
 
   useEffect(() => {
-    const stop = listen("pet-quiet", () => toggleQuiet());
+    const stop = listen("pet-quiet", () => { if (!meetingActive) toggleQuiet(); });
     return () => {
       stop.then((off) => off()).catch(() => {});
     };
-  }, [toggleQuiet]);
+  }, [toggleQuiet, meetingActive]);
 
   useEffect(() => {
     const stop = listen("toggle-speak", () => {
@@ -368,7 +417,7 @@ export default function Pet() {
     // `point` restarts the clock per walkthrough step.
   }, [state, said, alert, pointing, point, clear]);
 
-  const shown =
+  const shown = meetingActive ? "writing" :
     motion.earTwitch &&
     state === "idle" &&
     pose === "awake" &&
@@ -443,11 +492,12 @@ export default function Pet() {
       )}
       <div
         className="pet-root"
-        data-reaction={motion.reaction ?? "none"}
+        data-reaction={meetingActive ? "none" : motion.reaction ?? "none"}
+        data-meeting={meeting.status?.status}
         data-quiet={quiet ?? undefined}
         ref={motion.rootRef}
       >
-        {connected && microphone === "warming" && !quiet && pose === "awake" && (
+        {!meetingActive && connected && microphone === "warming" && !quiet && pose === "awake" && (
           <div
             className="mic-warmup"
             role="status"
@@ -458,7 +508,50 @@ export default function Pet() {
         )}
         {/* Waiting marker while quiet (not a count). */}
         {quiet && waiting.length > 0 && <i className="quiet-dot" />}
-        {!panel && !quiet && (timer.running || timer.paused) && (
+        {!panel && (meetingActive || meetingSaved) && (
+          <div className="badge badge--meeting" data-state={meeting.status?.status} ref={motion.panelRef}>
+            <button
+              type="button"
+              className="badge__label"
+              onClick={() => meetingSaved ? viewMeetings(meeting.status?.id ?? null) : setPanel("meeting")}
+              title={meetingSaved ? "View notes in Settings" : "Open meeting controls"}
+            >
+              {meetingSaved ? "View notes" : `${MEETING_LABEL[meeting.status?.status ?? ""] ?? "Notes"} ${meetingClock(meeting.status?.duration || 0)}`}
+            </button>
+            {(meeting.status?.status === "recording" || meeting.status?.status === "paused") && (
+              <>
+                <button
+                  type="button"
+                  className="badge__icon"
+                  onClick={() => void meeting.control(meeting.status?.status === "paused" ? "resume" : "pause")}
+                  aria-label={meeting.status?.status === "paused" ? "Resume recording" : "Pause recording"}
+                  title={meeting.status?.status === "paused" ? "Resume" : "Pause"}
+                >
+                  <svg viewBox="0 0 10 10" aria-hidden="true">
+                    {meeting.status?.status === "paused" ? (
+                      <polygon points="2,1 9,5 2,9" />
+                    ) : (
+                      <>
+                        <rect x="2" y="1" width="2.5" height="8" />
+                        <rect x="5.5" y="1" width="2.5" height="8" />
+                      </>
+                    )}
+                  </svg>
+                </button>
+                <button
+                  type="button"
+                  className="badge__icon"
+                  onClick={() => void meeting.control("stop")}
+                  aria-label="Stop the meeting and save the transcript"
+                  title="Stop & save"
+                >
+                  ×
+                </button>
+              </>
+            )}
+          </div>
+        )}
+        {!panel && !quiet && !meetingActive && !meetingSaved && (timer.running || timer.paused) && (
           <div
             className={`badge badge--${timer.phase}`}
           >
@@ -467,7 +560,9 @@ export default function Pet() {
         )}
         {panel && (
           <div className="panel-anchor" ref={motion.panelRef}>
-            {panel === "pomodoro" ? (
+            {panel === "meeting" ? (
+              <MeetingPanel status={meeting.status} connectionError={meeting.error} refresh={meeting.refresh} alert={alert} onDismissAlert={dismiss} onClose={() => setPanel(null)} onView={viewMeetings} />
+            ) : panel === "pomodoro" ? (
               <PomodoroPanel timer={timer} onClose={() => setPanel(null)} />
             ) : (
               <ReminderPanel onClose={() => setPanel(null)} />
@@ -499,7 +594,7 @@ export default function Pet() {
             )}
           </div>
         )}
-        {motion.reaction === "pet" && (
+        {!meetingActive && motion.reaction === "pet" && (
           <div
             className="particles particles--hearts"
             key={`hearts-${motion.petBurst}`}
@@ -508,7 +603,7 @@ export default function Pet() {
             {PARTICLES.map((particle) => <i key={particle} />)}
           </div>
         )}
-        {motion.reaction === "angry" && (
+        {!meetingActive && motion.reaction === "angry" && (
           <div className="particles particles--steam" aria-hidden="true">
             {PARTICLES.slice(0, 3).map((particle) => <i key={particle} />)}
           </div>

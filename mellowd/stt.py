@@ -165,7 +165,15 @@ def _load_parakeet(progress=None):
     raise RuntimeError("could not load parakeet")
 
 
+_inference_lock = threading.RLock()
+
+
 def load(cfg: dict | None = None, progress=None):
+    with _inference_lock:
+        return _load(cfg, progress)
+
+
+def _load(cfg: dict | None = None, progress=None):
     """Load the on-device model once and keep warm."""
     global _model, _model_key, _backend
     cfg = cfg or config.load()
@@ -527,6 +535,11 @@ class Recorder:
 
 
 def transcribe(audio: np.ndarray, cfg: dict | None = None) -> str:
+    with _inference_lock:
+        return _transcribe(audio, cfg)
+
+
+def _transcribe(audio: np.ndarray, cfg: dict | None = None) -> str:
     if audio.size < SAMPLE_RATE * MIN_SECONDS:
         return ""
     # Replaces vad_filter, which was clipping the first word off utterances.

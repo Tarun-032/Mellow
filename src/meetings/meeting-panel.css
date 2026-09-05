@@ -1,0 +1,20 @@
+.meeting-panel { max-height: min(520px, 65vh); overflow-y: auto; scrollbar-color: var(--brown) var(--paper); }
+.meeting-panel label { display: block; font-size: 12px; }
+.meeting-panel .panel__input { display: block; box-sizing: border-box; width: 100%; margin-top: 4px; }
+.meeting-panel .panel__row { margin-top: 10px; }
+.meeting-panel .meeting-panel__consent { display: flex; align-items: flex-start; gap: 8px; margin: 10px 0; }
+.meeting-panel input[type="checkbox"] { accent-color: var(--brown); }
+.meeting-panel__status { display: flex; justify-content: space-between; gap: 8px; padding-block: 6px; }
+.meeting-panel__status time { font-variant-numeric: tabular-nums; }
+.meeting-panel__levels { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.meeting-panel__levels meter { display: block; width: 100%; height: 12px; accent-color: var(--brown); }
+.meeting-panel :focus-visible { outline: 2px solid var(--brown); outline-offset: 2px; }
+/* Outrank the read-only timer badge regardless of stylesheet load order. */
+.badge.badge--meeting { display: flex; align-items: stretch; bottom: calc(var(--cell-px) + 3 * var(--px)); padding: 0; overflow: hidden; pointer-events: auto; z-index: 5; background: var(--paper); color: var(--ink); }
+.badge--meeting button { appearance: none; background: none; border: 0; margin: 0; color: inherit; font: inherit; cursor: pointer; }
+.badge__label { padding: calc(1.5 * var(--px)) calc(3 * var(--px)); letter-spacing: 0.02em; }
+/* Outspecify the button reset above, or the segment dividers never draw. */
+.badge--meeting .badge__icon { display: grid; place-items: center; width: calc(9 * var(--px)); border-left: var(--px) solid var(--ink); font-size: 14px; line-height: 1; }
+.badge--meeting .badge__icon svg { width: calc(3 * var(--px)); height: calc(3 * var(--px)); fill: currentColor; }
+.badge--meeting button:hover { background: var(--ink); color: var(--paper); }
+.badge--meeting :focus-visible { outline: var(--px) solid var(--ink); outline-offset: calc(-2 * var(--px)); }

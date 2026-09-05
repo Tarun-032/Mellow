@@ -621,12 +621,18 @@ export function usePetMotion(
     [setQuiet],
   );
 
+  // Hand input back to whatever is under the overlay. The `cursor` stream only
+  // fires on physical movement, so a hand-off to another window has to say so
+  // itself rather than wait for the next mouse move.
+  const releaseOverlay = useCallback(() => setHitTest.current(false), []);
+
   return {
     rootRef,
     bodyRef,
     eyesRef,
     bubbleRef,
     panelRef,
+    releaseOverlay,
     reaction,
     quiet,
     setQuiet,

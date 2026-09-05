@@ -56,6 +56,18 @@ pub(crate) fn restore_topmost(window: &tauri::WebviewWindow) {
     let _ = window.set_always_on_top(true);
 }
 
+/// True while a panel has borrowed real focus (see `PET_FOCUS`). The one-second
+/// topmost refresh must stand down then: `SetWindowPos` on the owner window
+/// dismisses an open native `<select>` popup out from under the user.
+#[cfg(desktop)]
+pub(crate) static FOCUS_LENT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Rust -> frontend: the overlay was put back to click-through under it, so the
+/// pet's own hit-test state has to agree or it will not re-arm on the next move.
+#[cfg(desktop)]
+const PET_RELEASED: &str = "pet-released";
+
 /// Push-to-talk key state: true on press, false on release.
 #[cfg(desktop)]
 const PTT: &str = "ptt";
@@ -226,26 +238,63 @@ fn set_capture_hidden(_app: &tauri::AppHandle, _hidden: bool) {}
 
 #[cfg(desktop)]
 fn open_settings(app: &tauri::AppHandle) {
+    // The pet is a full-monitor topmost overlay, so settings always opens *under*
+    // it. That is fine while the overlay is click-through, but a panel open under
+    // the cursor makes it an input sink and the new window cannot be clicked or
+    // even closed. Release it here, where every route to settings passes.
+    if let Some(pet) = app.get_webview_window("pet") {
+        let _ = pet.set_focusable(false);
+        let _ = pet.set_ignore_cursor_events(true);
+    }
+    FOCUS_LENT.store(false, std::sync::atomic::Ordering::Relaxed);
+    // The pet window owns its own hit-test state; tell it what we just did.
+    let _ = app.emit(PET_RELEASED, ());
+
     if let Some(window) = app.get_webview_window("settings") {
+        let _ = window.unminimize();
         let _ = window.show();
         let _ = window.set_focus();
         return;
     }
 
-    if let Err(error) = WebviewWindowBuilder::new(
-        app,
-        "settings",
-        WebviewUrl::App("index.html".into()),
-    )
-    .title("Mellow settings")
-    .inner_size(960.0, 720.0)
-    .min_inner_size(720.0, 600.0)
-    .resizable(true)
-    .center()
-    .build()
-    {
-        eprintln!("could not open settings: {error}");
-    }
+    // Build off the main thread, always. `WebviewWindowBuilder::build` blocks on a
+    // nested Win32 message pump while WebView2 creates the controller, and WebView2
+    // refuses to complete that re-entrantly. On the main thread — a sync command
+    // (inside WebView2's own IPC callback) or a menu handler — the pump never
+    // returns: the frame paints, the content stays white, and the event loop is
+    // dead, so the pet freezes too. Tauri's own docs say to use a separate thread.
+    let handle = app.clone();
+    std::thread::spawn(move || {
+        match WebviewWindowBuilder::new(&handle, "settings", WebviewUrl::App("index.html".into()))
+            .title("Mellow settings")
+            .inner_size(960.0, 720.0)
+            .min_inner_size(720.0, 600.0)
+            .resizable(true)
+            .center()
+            .focused(true)
+            .build()
+        {
+            // A normal window can never sit above the topmost overlay, so it has
+            // to at least own the focus, or it reads as a dead white rectangle.
+            Ok(window) => {
+                let _ = window.set_focus();
+            }
+            Err(error) => eprintln!("could not open settings: {error}"),
+        }
+    });
+}
+
+/// Open the meeting archive from the pet controls.
+///
+/// `async` on purpose: Tauri runs a synchronous command on the main thread, inside
+/// the WebView2 IPC callback, which is the one place window creation must not
+/// happen. `open_settings` also builds on its own thread, so this is belt and
+/// braces — but the belt is what the Tauri docs actually prescribe.
+#[cfg(desktop)]
+#[tauri::command]
+async fn open_meetings(app: tauri::AppHandle) {
+    open_settings(&app);
+    let _ = app.emit("open-meetings", ());
 }
 
 /// First-run setup window (stays until the final acknowledgement).
@@ -378,7 +427,7 @@ fn complete_onboarding(app: tauri::AppHandle) -> Result<(), String> {
 
 /// Native pet context menu (DOM would fall through click-through pixels).
 #[cfg(desktop)]
-fn popup_pet_menu(handle: &tauri::AppHandle, speak: bool, quiet: bool) {
+fn popup_pet_menu(handle: &tauri::AppHandle, speak: bool, quiet: bool, recording: bool) {
     let app = handle.clone();
     let _ = handle.run_on_main_thread(move || {
         let Some(win) = app.get_webview_window("pet") else {
@@ -402,21 +451,24 @@ fn popup_pet_menu(handle: &tauri::AppHandle, speak: bool, quiet: bool) {
             // Conversation action, grouped with the panels.
             let new_chat =
                 MenuItem::with_id(&app, "pet_new_chat", "New conversation", true, None::<&str>)?;
+            let meeting =
+                MenuItem::with_id(&app, "pet_meeting", if recording { "Meeting controls…" } else { "Transcribe meeting…" }, true, None::<&str>)?;
             // Quiet = tuck at edge; Hide = remove the window.
             let quiet_item = MenuItem::with_id(
                 &app,
                 "pet_quiet",
                 if quiet { "Come back" } else { "Stay quiet" },
-                true,
+                !recording,
                 None::<&str>,
             )?;
-            let hide = MenuItem::with_id(&app, "pet_hide", "Hide pet", true, None::<&str>)?;
+            let hide = MenuItem::with_id(&app, "pet_hide", "Hide pet", !recording, None::<&str>)?;
             let quit = MenuItem::with_id(&app, "pet_quit", "Quit Mellow", true, None::<&str>)?;
             Menu::with_items(
                 &app,
                 &[
                     &pomodoro,
                     &reminders,
+                    &meeting,
                     &new_chat,
                     &settings,
                     &mute,
@@ -483,6 +535,7 @@ pub fn run() {
             cursor_monitor,
             move_pet_to_cursor_monitor,
             complete_onboarding,
+            open_meetings,
             cursor::guide_ready,
             cursor::guide_set_target,
             cursor::guide_clear,
@@ -574,7 +627,7 @@ pub fn run() {
                             .unwrap_or(fallback)
                     };
                     // Malformed: assume not quiet.
-                    popup_pet_menu(&handle, flag("speak", true), flag("quiet", false));
+                    popup_pet_menu(&handle, flag("speak", true), flag("quiet", false), flag("meeting", false));
                 });
 
                 let capture_handle = _app.handle().clone();
@@ -597,6 +650,7 @@ pub fn run() {
                         .ok()
                         .and_then(|v| v.get("focus").and_then(|f| f.as_bool()))
                         .unwrap_or(false);
+                    FOCUS_LENT.store(wants, std::sync::atomic::Ordering::Relaxed);
                     let app = focus_handle.clone();
                     let _ = focus_handle.run_on_main_thread(move || {
                         if let Some(win) = app.get_webview_window("pet") {
@@ -618,6 +672,9 @@ pub fn run() {
                     }
                     "pet_reminders" => {
                         let _ = app.emit(OPEN_PANEL, "reminders");
+                    }
+                    "pet_meeting" => {
+                        let _ = app.emit(OPEN_PANEL, "meeting");
                     }
                     "pet_new_chat" => {
                         let _ = app.emit(NEW_CHAT, ());

@@ -5,5 +5,10 @@ This product includes Pixelify Sans, Copyright 2021 The Pixelify Sans
 Project Authors, licensed under the SIL Open Font License, Version 1.1.
 The complete font license is included at src/pet/pixelify-sans.OFL.txt.
 
+Windows meeting capture uses PyAudioWPatch (Hubert Pham, S0D3S edition),
+licensed under Apache-2.0, and its bundled PortAudio runtime (MIT license).
+Upstream: https://github.com/s0d3s/PyAudioWPatch
+The dependency's complete license is bundled with the packaged helper.
+
 Downloaded speech and language models are not distributed as part of the
 Mellow source repository and remain subject to their respective licenses.

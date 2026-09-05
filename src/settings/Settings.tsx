@@ -1,4 +1,7 @@
 import { useEffect, useState, type FormEvent, type ReactNode } from "react";
+import { listen } from "@tauri-apps/api/event";
+import Meetings from "../meetings/Meetings";
+import { MEETING_OPEN } from "../meetings/useMeeting";
 import {
   Action,
   AgentFields,
@@ -105,6 +108,7 @@ type SettingsPage =
   | "stt"
   | "tts"
   | "sessions"
+  | "meetings"
   | "advanced";
 
 const SETTINGS_PAGES: Array<{
@@ -137,6 +141,7 @@ const SETTINGS_PAGES: Array<{
     label: "Sessions",
     description: "Saved conversations",
   },
+  { id: "meetings", label: "Meetings", description: "Transcripts and meeting notes" },
   {
     id: "advanced",
     label: "Advanced",
@@ -215,7 +220,12 @@ const VISION_LABELS: Record<string, string> = {
 };
 
 export default function Settings() {
-  const [activePage, setActivePage] = useState<SettingsPage>("engine");
+  const [activePage, setActivePage] = useState<SettingsPage>(() => localStorage.getItem(MEETING_OPEN) ? "meetings" : "engine");
+  useEffect(() => {
+    localStorage.removeItem(MEETING_OPEN);
+    const stop = listen("open-meetings", () => { setActivePage("meetings"); localStorage.removeItem(MEETING_OPEN); });
+    return () => { stop.then(off => off()).catch(() => {}); };
+  }, []);
   const [navQuery, setNavQuery] = useState("");
   const [form, setForm] = useState<SettingsData | null>(null);
   const [savedEngineKey, setSavedEngineKey] = useState<string | null>(null);
@@ -584,7 +594,7 @@ export default function Settings() {
 
       </aside>
 
-      <form className="settings-workspace" onSubmit={submit}>
+      <form className="settings-workspace" onSubmit={e => { if (activePage === "meetings") e.preventDefault(); else void submit(e); }}>
         <header className="settings-topbar">
           <div>
             <h1>{currentPage.label}</h1>
@@ -857,6 +867,7 @@ export default function Settings() {
             </section>
           )}
 
+          {activePage === "meetings" && <Meetings />}
           {activePage === "sessions" && (
             <section className="settings-page settings-page--sessions" aria-labelledby="sessions-heading">
               <div className="page-heading page-heading--with-action">

@@ -11,6 +11,7 @@ httpx==0.28.1
 
 # step 3 — voice in
 sounddevice==0.5.2
+PyAudioWPatch==0.2.12.8; sys_platform == 'win32'
 numpy==2.3.4
 faster-whisper==1.2.0
 requests==2.33.0  # faster-whisper 1.2.0 imports it but doesn't declare it

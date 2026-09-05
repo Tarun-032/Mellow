@@ -1,12 +1,13 @@
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_all
+from PyInstaller.utils.hooks import collect_all, copy_metadata
 
 
 root = Path(SPECPATH)
 datas = []
 binaries = []
 hiddenimports = []
+datas += copy_metadata("PyAudioWPatch")
 
 # Collect packages whose native/data dependencies load lazily.
 for package in (
@@ -16,6 +17,7 @@ for package in (
     "language_tags",
     "onnx_asr",
     "phonemizer",
+    "pyaudiowpatch",
     "uiautomation",
     "winsdk",
 ):

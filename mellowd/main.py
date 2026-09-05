@@ -16,7 +16,7 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 from mellowd import (
-    act, agents, capture, config, errors, llm, locator, point, remind, sessions, stt, tts,
+    act, agents, capture, config, errors, llm, locator, meetings, point, remind, sessions, stt, tts,
 )
 from mellowd.version import PROTOCOL, SERVICE, VERSION
 
@@ -81,8 +81,10 @@ async def lifespan(_app: FastAPI):
     except Exception:
         log.exception("session log sweep failed")
 
+    await asyncio.to_thread(meetings.manager.store.recover)
     task = asyncio.create_task(warm_models())
     yield
+    await meetings.manager.shutdown()
     task.cancel()
 
 
@@ -106,6 +108,7 @@ async def warm_models() -> None:
 
 
 app = FastAPI(title="mellowd", lifespan=lifespan)
+app.include_router(meetings.router)
 TRUSTED_ORIGINS = {
     "http://localhost:1420",
     "http://127.0.0.1:1420",
@@ -315,6 +318,8 @@ async def audio_devices():
 
 @app.post("/stt/test")
 async def test_stt(body: dict):
+    if meetings.manager.active:
+        raise HTTPException(409, "Stop the meeting before testing speech input.")
     try:
         # The whole stt section, key included
         cfg = _candidate({"stt": body.get("stt", {})})
@@ -359,6 +364,8 @@ async def tts_voices(body: dict):
 
 @app.post("/tts/test")
 async def test_tts(body: dict):
+    if meetings.manager.active:
+        raise HTTPException(409, "Stop the meeting before playing a test voice.")
     """Say one line out loud with the submitted voice, saved or not."""
     try:
         cfg = _candidate({"tts": body.get("tts", {})})
@@ -537,6 +544,8 @@ class Session:
 
     def wake_mic(self) -> None:
         """Grab the microphone as soon as Windows allows, and hold it."""
+        if meetings.manager.active:
+            return
         self.awake = True
         # A pet with no brain never touches the microphone: first run
         if standby():
@@ -568,7 +577,7 @@ class Session:
         refreshed = False
         while self.awake:
             # The config can change while the keeper probes (setup finished
-            if standby():
+            if standby() or meetings.manager.active:
                 return False
             try:
                 self.recorder.open(quiet=True)
@@ -640,6 +649,29 @@ class Session:
 # Every live shell has its own in-memory model history.
 _active_sessions: dict[int, Session] = {}
 _engine_revision = 0
+
+
+async def _meeting_started():
+    for session in list(_active_sessions.values()):
+        session.awake = False
+        session.mic_ready = False
+        await session.abort()
+        if session.warmup and not session.warmup.done():
+            await session.warmup
+        await asyncio.to_thread(session.recorder.close)
+        await session._send_mic("off")
+        with suppress(WebSocketDisconnect, RuntimeError):
+            await send(session.ws, type="state", state="idle")
+
+
+async def _meeting_stopped():
+    for session in list(_active_sessions.values()):
+        if session.alive and not meetings.manager.active:
+            session.wake_mic()
+
+
+meetings.manager.before_start = _meeting_started
+meetings.manager.after_stop = _meeting_stopped
 
 
 async def _reset_for_engine_change() -> None:
@@ -1280,6 +1312,9 @@ async def run_turn(session: Session, prompt: str) -> None:
 async def handle(session: Session, msg: dict) -> None:
     ws = session.ws
     kind = msg.get("type")
+    if meetings.manager.active and kind in {"ptt_start", "ptt_end", "text"}:
+        await send(ws, type="error", message="Meeting transcription is active. Stop the meeting before talking to Mellow.")
+        return
 
     if kind == "ping":
         await send(ws, type="pong", echo=msg.get("text", ""))
@@ -1334,6 +1369,8 @@ async def handle(session: Session, msg: dict) -> None:
         await send(ws, type="state", state="thinking")
         # Blocking C call — off the event loop or the socket stalls.
         text = await asyncio.to_thread(stt.transcribe, audio)
+        if meetings.manager.active:
+            return
         # Show *something* when nothing was heard.
         if not text and session.recorder.last_stats["peak"] < stt.MIN_PEAK:
             await asyncio.to_thread(session.recorder.reopen)

@@ -696,7 +696,8 @@ fn tick(app: &AppHandle, state: &GuideState) {
         return;
     };
 
-    let refresh_topmost = {
+    // A panel holding focus may have a native popup open; leave its z-order alone.
+    let refresh_topmost = !crate::FOCUS_LENT.load(std::sync::atomic::Ordering::Relaxed) && {
         let mut runtime = state
             .runtime
             .lock()
