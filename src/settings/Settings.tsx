@@ -221,9 +221,16 @@ const VISION_LABELS: Record<string, string> = {
 
 export default function Settings() {
   const [activePage, setActivePage] = useState<SettingsPage>(() => localStorage.getItem(MEETING_OPEN) ? "meetings" : "engine");
+  // `visit` remounts Meetings so the sidebar always lands on the list; `deep` says
+  // whether that fresh mount should jump straight to the meeting Mellow asked for.
+  const [meetingsEntry, setMeetingsEntry] = useState(() => ({ visit: 0, deep: !!localStorage.getItem(MEETING_OPEN) }));
   useEffect(() => {
     localStorage.removeItem(MEETING_OPEN);
-    const stop = listen("open-meetings", () => { setActivePage("meetings"); localStorage.removeItem(MEETING_OPEN); });
+    const stop = listen("open-meetings", () => {
+      setActivePage("meetings");
+      setMeetingsEntry(entry => ({ visit: entry.visit + 1, deep: true }));
+      localStorage.removeItem(MEETING_OPEN);
+    });
     return () => { stop.then(off => off()).catch(() => {}); };
   }, []);
   const [navQuery, setNavQuery] = useState("");
@@ -581,7 +588,10 @@ export default function Settings() {
               type="button"
               className="settings-nav__item"
               aria-current={activePage === page.id ? "page" : undefined}
-              onClick={() => setActivePage(page.id)}
+              onClick={() => {
+                setActivePage(page.id);
+                if (page.id === "meetings") setMeetingsEntry(entry => ({ visit: entry.visit + 1, deep: false }));
+              }}
             >
               <span>{page.label}</span>
               <small>{page.description}</small>
@@ -867,7 +877,7 @@ export default function Settings() {
             </section>
           )}
 
-          {activePage === "meetings" && <Meetings />}
+          {activePage === "meetings" && <Meetings key={meetingsEntry.visit} openLast={meetingsEntry.deep} />}
           {activePage === "sessions" && (
             <section className="settings-page settings-page--sessions" aria-labelledby="sessions-heading">
               <div className="page-heading page-heading--with-action">
@@ -1058,14 +1068,17 @@ export default function Settings() {
           )}
         </div>
 
-        <footer className="settings-savebar">
-          <div>
-            {sectionNotice("save")}
-          </div>
-          <button className="button button--primary" type="submit" disabled={busy !== null}>
-            {busy === "save" ? "Saving..." : "Save changes"}
-          </button>
-        </footer>
+        {/* Meetings saves as you go; an inert Save changes bar only takes reading space. */}
+        {activePage !== "meetings" && (
+          <footer className="settings-savebar">
+            <div>
+              {sectionNotice("save")}
+            </div>
+            <button className="button button--primary" type="submit" disabled={busy !== null}>
+              {busy === "save" ? "Saving..." : "Save changes"}
+            </button>
+          </footer>
+        )}
       </form>
       {pendingEngineAction && (
         <div

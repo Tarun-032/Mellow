@@ -379,7 +379,8 @@ button {
   font-weight: 590;
 }
 
-.settings-workspace input:not([type="radio"]):not([type="checkbox"]):not([type="range"]),
+/* .meeting-heading opts out: it is a title styled as a heading, not a form field. */
+.settings-workspace input:not([type="radio"]):not([type="checkbox"]):not([type="range"]):not(.meeting-heading),
 .settings-workspace select,
 .settings-workspace textarea {
   width: 100%;
