@@ -539,16 +539,55 @@ def transcribe(audio: np.ndarray, cfg: dict | None = None) -> str:
         return _transcribe(audio, cfg)
 
 
-def _transcribe(audio: np.ndarray, cfg: dict | None = None) -> str:
+def transcribe_meeting(audio: np.ndarray, cfg: dict | None = None) -> str:
+    """Gate continuous audio without changing push-to-talk conditioning."""
+    from faster_whisper.vad import VadOptions, get_speech_timestamps
+
+    with _inference_lock:
+        speech = get_speech_timestamps(audio, VadOptions(min_speech_duration_ms=120, speech_pad_ms=300))
+        if not speech:
+            return ""
+        # Keep the full window: the gate must not cut off words at its boundaries.
+        return _transcribe(audio, cfg, meeting=True)
+
+
+def transcribe_meeting_segments(audio: np.ndarray, cfg: dict | None = None) -> list[dict]:
+    """Time meeting contributions by speech onset, not the capture window."""
+    from faster_whisper.vad import VadOptions, get_speech_timestamps
+
+    with _inference_lock:
+        regions = get_speech_timestamps(audio, VadOptions(
+            min_speech_duration_ms=120, min_silence_duration_ms=450, speech_pad_ms=0,
+        ))
+        result = []
+        padding = round(SAMPLE_RATE * .3)
+        for region in regions:
+            # Padding protects quiet first/last syllables; ordering uses speech itself.
+            first = max(0, region["start"] - padding)
+            last = min(len(audio), region["end"] + padding)
+            text = _transcribe(audio[first:last], cfg, meeting=True).strip()
+            if text:
+                result.append({"start": region["start"] / SAMPLE_RATE,
+                               "end": region["end"] / SAMPLE_RATE, "text": text})
+        return result
+
+
+def _transcribe(audio: np.ndarray, cfg: dict | None = None, *, meeting: bool = False) -> str:
     if audio.size < SAMPLE_RATE * MIN_SECONDS:
         return ""
     # Replaces vad_filter, which was clipping the first word off utterances.
     peak, rms = levels(audio)
     log.info("%.1fs peak=%.4f rms=%.4f", audio.size / SAMPLE_RATE, peak, rms)
-    if peak < MIN_PEAK:
-        log.info("too quiet, skipping (peak %.4f < %.4f)", peak, MIN_PEAK)
+    min_peak = 0.001 if meeting else MIN_PEAK
+    if peak < min_peak:
+        log.info("too quiet, skipping (peak %.4f < %.4f)", peak, min_peak)
         return ""
-    conditioned, gain = apply_quiet_gain(audio)
+    if meeting:
+        # Do not undo echo suppression by amplifying quiet residual playback 20x.
+        gain = min(2.0, TARGET_PEAK / max(peak, 0.001)) if peak < TARGET_PEAK else 1.0
+        conditioned = audio * gain
+    else:
+        conditioned, gain = apply_quiet_gain(audio)
     if gain > 1:
         log.info("quiet speech gain %.1fx", gain)
     cfg = cfg or config.load()

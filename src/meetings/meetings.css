@@ -20,7 +20,6 @@
 .meeting-transcript { margin-top: 24px; max-height: 55vh; overflow-y: auto; padding-right: 12px; user-select: text; scrollbar-color: #9b532d #f5ecdd; }
 .meeting-transcript section + section { margin-top: 22px; }
 .meeting-transcript section > div { display: flex; gap: 12px; font-size: 13px; }
-.meeting-transcript time { font-variant-numeric: tabular-nums; }
 .meeting-transcript p { margin: 6px 0 0; line-height: 1.65; overflow-wrap: anywhere; }
 .meeting-notes { overflow-wrap: anywhere; line-height: 1.7; margin-top: 24px; user-select: text; }
 .meeting-notes p { margin: 0 0 8px; }

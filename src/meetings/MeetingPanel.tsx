@@ -94,7 +94,7 @@ export function MeetingPanel({ status, connectionError, refresh, onClose, onView
           {devices?.outputs.map(d => <option key={d.id} value={d.id}>{d.name.replace(" [Loopback]", "")}</option>)}
         </select>
       </label>
-      <p className="panel__hint">Captures your mic and all sound on this output. Use headphones to avoid duplicate voices. English transcription; labels are You / Other participants.</p>
+      <p className="panel__hint">Captures your mic and all sound on this output. Echo cancellation reduces speaker audio picked up by your mic; headphones can improve clarity. English transcription; labels are You / Other participants, not individual speakers.</p>
       <p className="panel__hint">{source} Only transcripts and notes are saved.</p>
       <label className="meeting-panel__consent"><input type="checkbox" checked={consent} onChange={e => setConsent(e.target.checked)} /> I have permission to transcribe this meeting.</label>
       <div className="panel__row panel__row--buttons">

@@ -63,9 +63,16 @@ class Store:
             db.execute(f"UPDATE meetings SET {','.join(key + '=?' for key in fields)} WHERE id=?", (*fields.values(), mid))
 
     def segment(self, mid: str, start: float, end: float, speaker: str, text: str):
+        self.append_segments(mid, [{"start": start, "end": end, "speaker": speaker, "text": text}])
+
+    def append_segments(self, mid: str, segments: list[dict]):
+        if not segments:
+            return
         with self.db() as db:
-            db.execute("INSERT INTO segments (meeting,start,end,speaker,text) VALUES (?,?,?,?,?)", (mid, start, end, speaker, text))
-            db.execute("UPDATE meetings SET duration=MAX(duration,?) WHERE id=?", (end, mid))
+            db.executemany("INSERT INTO segments (meeting,start,end,speaker,text) VALUES (?,?,?,?,?)",
+                           [(mid, s["start"], s["end"], s["speaker"], s["text"]) for s in segments])
+            db.execute("UPDATE meetings SET duration=MAX(duration,?) WHERE id=?",
+                       (max(s["end"] for s in segments), mid))
 
     def list(self):
         with self.db() as db:
@@ -92,6 +99,17 @@ def timestamp(seconds: float) -> str:
     return f"{seconds // 3600:02}:{seconds // 60 % 60:02}:{seconds % 60:02}"
 
 
+def conversation_turns(segments: list[dict]) -> list[dict]:
+    turns = []
+    for segment in sorted(segments, key=lambda s: (s["start"], s.get("id", 0))):
+        if turns and turns[-1]["speaker"] == segment["speaker"]:
+            turns[-1]["text"] += " " + segment["text"]
+            turns[-1]["end"] = max(turns[-1]["end"], segment["end"])
+        else:
+            turns.append(dict(segment))
+    return turns
+
+
 def export(meeting: dict, fmt: str) -> str:
     if fmt == "json":
         return json.dumps(meeting, ensure_ascii=False, indent=2)
@@ -101,5 +119,7 @@ def export(meeting: dict, fmt: str) -> str:
     if meeting["notes"]:
         lines += ["## Notes", meeting["notes"], ""]
     lines += ["## Transcript", ""]
-    lines += [f"[{timestamp(s['start'])}] {s['speaker']}: {s['text']}" for s in meeting["segments"]]
+    for turn in conversation_turns(meeting["segments"]):
+        speaker = "Other participant" if turn["speaker"] == "Other participants" else turn["speaker"]
+        lines += [f"{speaker}:", turn["text"], ""]
     return "\n".join(lines)

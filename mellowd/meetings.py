@@ -28,7 +28,7 @@ def deduplicate(previous: str, current: str) -> str:
 
 
 class Manager:
-    def __init__(self, store=None, capture_factory=meeting_audio.Capture, transcribe=stt.transcribe):
+    def __init__(self, store=None, capture_factory=meeting_audio.Capture, transcribe=stt.transcribe_meeting_segments):
         self.store = store or Store()
         self.capture_factory = capture_factory
         self.transcribe = transcribe
@@ -50,6 +50,7 @@ class Manager:
         self.cfg = None
         self.selection = (None, None)
         self.previous = {}
+        self.previous_end = {}
         self.before_start = None
         self.after_stop = None
         self.busy = False
@@ -89,6 +90,10 @@ class Manager:
             self.schedule_pause("Transcription is falling behind. Recording paused while queued audio is processed. Resume when the queue is clear.")
 
     def schedule_pause(self, message):
+        if self.state == "finalizing":
+            self.warning = "Some final audio could not be processed. This transcript may be incomplete. " + message
+            self.persist()
+            return
         if self.state not in {"starting", "recording"}:
             return
         self.warning = message
@@ -117,6 +122,7 @@ class Manager:
             self.origin = time.monotonic()
             self.pending.clear()
             self.previous.clear()
+            self.previous_end.clear()
             self.retry.set()
             try:
                 if self.before_start:
@@ -223,12 +229,25 @@ class Manager:
             self.busy = True
             try:
                 # A single consumer serializes model inference; eight seconds is below Parakeet's cap.
-                text = await asyncio.to_thread(self.transcribe, chunk.audio, self.cfg)
-                if chunk.overlap:
-                    text = deduplicate(self.previous.get(chunk.speaker, ""), text)
-                if text.strip():
-                    self.store.segment(self.id, chunk.start, chunk.end, chunk.speaker, text.strip())
-                    self.previous[chunk.speaker] = text.strip()
+                parts = await asyncio.to_thread(self.transcribe, chunk.audio, self.cfg)
+                if isinstance(parts, str):
+                    parts = [{"start": 0, "end": chunk.end - chunk.start, "text": parts}]
+                previous = self.previous.get(chunk.speaker, "")
+                previous_end = self.previous_end.get(chunk.speaker, -1)
+                rows = []
+                for part in parts:
+                    start = chunk.start + part["start"]
+                    end = min(chunk.end, chunk.start + part["end"])
+                    text = part["text"].strip()
+                    if chunk.overlap and start < previous_end:
+                        text = deduplicate(previous, text)
+                    if text:
+                        rows.append({"start": start, "end": end, "speaker": chunk.speaker, "text": text})
+                        previous, previous_end = text, end
+                if rows:
+                    self.store.append_segments(self.id, rows)
+                    self.previous[chunk.speaker] = previous
+                    self.previous_end[chunk.speaker] = previous_end
             except Exception as exc:
                 if self.state == "finalizing":
                     self.warning = "Some queued audio could not be transcribed. This transcript is incomplete. " + errors.message(exc)

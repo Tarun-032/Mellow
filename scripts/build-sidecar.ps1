@@ -13,6 +13,11 @@ if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {
     throw "Create .venv and install mellowd/requirements.txt before packaging."
 }
 
+& $python (Join-Path $taskRoot "scripts\prepare-meeting-aec.py")
+if ($LASTEXITCODE -ne 0) {
+    throw "Meeting echo cancellation could not be prepared; refusing an incomplete package."
+}
+
 & $python -c "import PyInstaller" 2>$null
 if ($LASTEXITCODE -ne 0) {
     throw "Install build requirements first: .\.venv\Scripts\python.exe -m pip install -r mellowd\requirements-build.txt"

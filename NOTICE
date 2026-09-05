@@ -12,3 +12,11 @@ The dependency's complete license is bundled with the packaged helper.
 
 Downloaded speech and language models are not distributed as part of the
 Mellow source repository and remain subject to their respective licenses.
+
+Meeting echo cancellation uses the OpenWhispr meeting AEC helper v1.0.0
+(Copyright 2024 OpenWhispr Team, MIT), WebRTC Audio Processing (BSD-3-Clause),
+and Abseil (Apache-2.0), including PFFFT and RNNoise components. Their
+notices are bundled beside the helper.
+Source: https://github.com/OpenWhispr/openwhispr/tree/meeting-aec-helper-v1.0.0/native/meeting-aec-helper
+Meeting speech detection uses the Silero VAD assets supplied by faster-whisper
+(Silero Team, MIT); the Silero notice is also bundled beside the helper.

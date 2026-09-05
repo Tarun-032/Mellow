@@ -1,13 +1,25 @@
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_all, copy_metadata
+from PyInstaller.utils.hooks import collect_all, collect_data_files, copy_metadata
 
 
 root = Path(SPECPATH)
 datas = []
 binaries = []
 hiddenimports = []
+aec = root / "build" / "meeting-aec"
+aec_exe = aec / "meeting-aec-helper-win32-x64.exe"
+if not aec_exe.is_file():
+    raise RuntimeError("Run scripts/prepare-meeting-aec.py before packaging")
+binaries += [(str(aec_exe), "meeting-aec")]
+for name in ("OpenWhispr-LICENSE.txt", "WebRTC-COPYING.txt", "WebRTC-PATENTS.txt", "Abseil-LICENSE.txt",
+             "PFFFT-LICENSE.txt", "RNNoise-LICENSE.txt", "Silero-LICENSE.txt"):
+    if not (aec / name).is_file():
+        raise RuntimeError(f"Missing meeting AEC license: {name}")
+    datas += [(str(aec / name), "meeting-aec")]
+datas += collect_data_files("faster_whisper", includes=["assets/*.onnx"])
 datas += copy_metadata("PyAudioWPatch")
+datas += copy_metadata("faster-whisper")
 
 # Collect packages whose native/data dependencies load lazily.
 for package in (

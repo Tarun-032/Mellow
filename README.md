@@ -107,7 +107,7 @@ The first public binaries are not code-signed, so Windows SmartScreen may ask yo
 
 ## Privacy model
 
-Mellow only captures audio while push-to-talk is active. Screen capture is request-driven and can be disabled in Settings.
+Mellow captures audio during push-to-talk or a meeting you explicitly start. Meetings capture your microphone and the selected system output, with local echo cancellation to reduce speaker playback in the microphone. Audio stays in memory; saved meetings contain transcripts and notes, not recordings. Cloud transcription sends audio to your selected speech provider. Screen capture is request-driven and can be disabled in Settings.
 
 - **Local mode:** supported inference runs on the computer. No API key is required.
 - **Cloud mode:** only the data needed for the selected feature is sent to the provider you configure.
@@ -134,6 +134,7 @@ cd Mellow
 
 py -3.12 -m venv .venv
 .venv\Scripts\python.exe -m pip install -r mellowd\requirements.txt -r mellowd\requirements-build.txt
+.venv\Scripts\python.exe scripts\prepare-meeting-aec.py
 
 npm ci
 npm run tauri dev
@@ -164,6 +165,8 @@ Mellow is split into three small layers:
 | Python + FastAPI | Speech, models, provider adapters, screen understanding, reminders, and desktop actions |
 
 The installed application bundles the Python runtime and native dependencies, so end users do not need Python, Node.js, or Rust.
+
+Meeting capture also bundles a pinned OpenWhispr/WebRTC echo-cancellation helper and Silero speech detection. `prepare-meeting-aec.py` verifies the helper download and collects its license notices; the release build runs this automatically. Meeting labels distinguish microphone audio (You) from system playback (Other participants), not individual remote speakers. Speaker playback, room acoustics, and simultaneous speech can still affect accuracy.
 
 ## Contributing
 

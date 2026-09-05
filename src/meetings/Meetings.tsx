@@ -5,11 +5,27 @@ import { clock, MEETING_SELECTION, useMeeting } from "./useMeeting";
 import "./meetings.css";
 
 type Summary = { id: string; title: string; created: string; duration: number; status: string; warning: string; notes_status: string };
+type Segment = { id: number; start: number; end: number; speaker: string; text: string };
 type Detail = Summary & {
-  segments: { id: number; start: number; end: number; speaker: string; text: string }[];
+  segments: Segment[];
   notes: string; notes_status: string; notes_error: string; notes_progress: string; engine: string;
 };
 const live = (status: string) => ["starting", "recording", "paused", "finalizing"].includes(status);
+const speakerLabel = (speaker: string) => speaker === "Other participants" ? "Other participant" : speaker;
+
+function conversationTurns(segments: Segment[]): Segment[] {
+  const turns: Segment[] = [];
+  for (const segment of [...segments].sort((a, b) => a.start - b.start || a.id - b.id)) {
+    const previous = turns[turns.length - 1];
+    if (previous?.speaker === segment.speaker) {
+      previous.text += ` ${segment.text}`;
+      previous.end = Math.max(previous.end, segment.end);
+    } else {
+      turns.push({ ...segment });
+    }
+  }
+  return turns;
+}
 
 export default function Meetings() {
   const [items, setItems] = useState<Summary[]>([]);
@@ -81,6 +97,8 @@ export default function Meetings() {
     document.body.appendChild(link); link.click(); link.remove(); setTimeout(() => URL.revokeObjectURL(url), 1000);
   };
   const filtered = items.filter(item => item.title.toLocaleLowerCase().includes(query.toLocaleLowerCase()));
+  const turns = conversationTurns(detail?.segments ?? []);
+  const matchingTurns = turns.filter(turn => turn.text.toLocaleLowerCase().includes(search.toLocaleLowerCase()));
 
   return <section className="meetings">
     <p className="settings-note">Right-click Mellow and choose Transcribe meeting. Your transcript and notes stay here until you delete them, independently of saved conversations.</p>
@@ -118,11 +136,11 @@ export default function Meetings() {
             <label>Find in transcript<input type="search" value={search} onChange={e => setSearch(e.target.value)} placeholder="Search words or phrases" /></label>
             <p className="meeting-meta">Labels identify your microphone and the meeting audio—not individual speakers.</p>
             <div className="meeting-transcript">
-              {!detail.segments.length ? <p>{live(detail.status) ? "Listening. Transcribed text appears after each short audio chunk." : "No speech was transcribed. Check your microphone, meeting output and speech-to-text settings before recording again."}</p> :
-                detail.segments.filter(s => s.text.toLocaleLowerCase().includes(search.toLocaleLowerCase())).map(segment => <section key={segment.id}>
-                  <div><time>{clock(segment.start)}</time><strong>{segment.speaker}</strong></div><p>{segment.text}</p>
+              {!turns.length ? <p>{live(detail.status) ? "Listening. Your conversation appears here as speech is processed." : "No speech was transcribed. Check your microphone, meeting output and speech-to-text settings before recording again."}</p> :
+                matchingTurns.map(segment => <section key={segment.id}>
+                  <div><strong>{speakerLabel(segment.speaker)}</strong></div><p>{segment.text}</p>
                 </section>)}
-              {search && detail.segments.length > 0 && !detail.segments.some(s => s.text.toLocaleLowerCase().includes(search.toLocaleLowerCase())) && <p>No matching transcript text.</p>}
+              {search && turns.length > 0 && !matchingTurns.length && <p>No matching transcript text.</p>}
             </div>
           </> : <>
             <p className="meeting-meta">{destination}</p>
@@ -138,7 +156,7 @@ export default function Meetings() {
               /^#{1,6}\s/.test(line) ? <h3 key={i}>{line.replace(/^#{1,6}\s*/, "")}</h3> : <p key={i}>{line}</p>)}</div><p className="meeting-meta">Generated with {detail.engine}. Review these notes against the transcript.</p></> : <p>Your summary, decisions and action items will appear here.</p>}
           </>}
           <div className="meeting-actions">
-            <button type="button" disabled={busy} onClick={() => void act(() => navigator.clipboard.writeText(tab === "notes" ? detail.notes : detail.segments.map(s => `[${clock(s.start)}] ${s.speaker}: ${s.text}`).join("\n")), "Copied to clipboard.")}>Copy {tab}</button>
+            <button type="button" disabled={busy} onClick={() => void act(() => navigator.clipboard.writeText(tab === "notes" ? detail.notes : turns.map(s => `${speakerLabel(s.speaker)}:\n${s.text}`).join("\n\n")), "Copied to clipboard.")}>Copy {tab}</button>
             {["md", "txt", "json"].map(format => <button type="button" key={format} disabled={busy} onClick={() => void act(() => exportFile(format))}>Export .{format}</button>)}
             <button type="button" disabled={busy || live(detail.status) || detail.notes_status === "generating"} onClick={() => setConfirmDelete(true)}>Delete meeting</button>
           </div>
