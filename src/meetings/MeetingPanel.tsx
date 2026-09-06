@@ -19,16 +19,15 @@ export function MeetingPanel({ status, connectionError, refresh, onClose, onView
   const [output, setOutput] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
-  const [consent, setConsent] = useState(false);
-  const [source, setSource] = useState("");
+  // Speech settings still have to load before Start: a failure here means we
+  // cannot tell how audio would be transcribed, so the button stays disabled.
+  const [ready, setReady] = useState(false);
   const [levels, setLevels] = useState<Record<string, number> | null>(null);
   const active = status?.active;
   useEffect(() => {
     request<Devices>("/meetings/devices").then(setDevices).catch(e => setError(e.message));
     request<{ settings: { stt: { mode: string; provider: string; input_device: string | null } } }>("/config")
-      .then(({ settings }) => setSource(settings.stt.mode === "cloud"
-        ? `Audio is sent to your configured ${settings.stt.provider} speech provider.`
-        : "Speech is transcribed on this computer using your selected local model."))
+      .then(() => setReady(true))
       .catch(e => setError(e.message));
   }, []);
   // Focusable up front: a <select> opens its native popup before onFocus lands,
@@ -94,15 +93,12 @@ export function MeetingPanel({ status, connectionError, refresh, onClose, onView
           {devices?.outputs.map(d => <option key={d.id} value={d.id}>{d.name.replace(" [Loopback]", "")}</option>)}
         </select>
       </label>
-      <p className="panel__hint">Captures your mic and all sound on this output. Echo cancellation reduces speaker audio picked up by your mic; headphones can improve clarity. English transcription; labels are You / Other participants, not individual speakers.</p>
-      <p className="panel__hint">{source} Only transcripts and notes are saved.</p>
-      <label className="meeting-panel__consent"><input type="checkbox" checked={consent} onChange={e => setConsent(e.target.checked)} /> I have permission to transcribe this meeting.</label>
       <div className="panel__row panel__row--buttons">
-        <button type="button" className="panel__btn panel__btn--wide" disabled={busy || !devices || !consent || !!connectionError} onClick={() => void action("levels")}>Check audio levels (2s)</button>
+        <button type="button" className="panel__btn panel__btn--wide" disabled={busy || !devices || !!connectionError} onClick={() => void action("levels")}>Check audio levels (2s)</button>
       </div>
       {levels && <p className="panel__hint">Microphone: {levels.You > 0.01 ? "sound detected" : "quiet"}. Meeting sound: {levels["Other participants"] > 0.01 ? "sound detected" : "quiet"}. Play meeting audio and speak while checking.</p>}
       <div className="panel__row panel__row--buttons">
-        <button type="button" className="panel__btn panel__btn--wide" disabled={busy || !devices || !source || !consent || !!connectionError}
+        <button type="button" className="panel__btn panel__btn--wide" disabled={busy || !devices || !ready || !!connectionError}
           onClick={() => void action("start")}>{busy ? "Preparing audio…" : "Start transcription"}</button>
       </div>
     </>}

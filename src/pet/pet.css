@@ -72,6 +72,10 @@ body,
 }
 
 .pet-art {
+  /* A pose with no .pet--<name> rule falls back to idle. Without this default
+     --cell is undefined, background-position is invalid, and the sprite silently
+     paints cell 0 anyway — which is how `writing` shipped dead. */
+  --cell: var(--cell-idle);
   --frames: 1;
   --frame-time: 1s;
   --frame-play: paused;
@@ -183,6 +187,21 @@ body,
   --frame-play: var(--frame-play-hunt);
   --motion: hunt-life;
   --motion-time: 0.48s;
+}
+.pet--writing .pet-sprite {
+  --cell: 0;
+  background-image: url("./writing.png");
+  background-size: calc(var(--frames-writing) * var(--cell-px)) var(--cell-px);
+}
+
+.pet--writing {
+  --cell: var(--cell-writing);
+  --frames: var(--frames-writing);
+  --frame-time: var(--frame-time-writing);
+  --frame-play: var(--frame-play-writing);
+  /* Quieter than idle: the dog is bent over a book, the nib carries the motion. */
+  --motion: writing-life;
+  --motion-time: 2.6s;
 }
 
 /* Offline: dim when sidecar is down. */
@@ -321,6 +340,17 @@ body,
   }
   50% {
     transform: scale(1.018, 0.985);
+  }
+}
+
+/* Barely there: a breath, so the nib bob reads as the deliberate motion. */
+@keyframes writing-life {
+  0%,
+  100% {
+    transform: scaleY(1);
+  }
+  50% {
+    transform: translateY(-1px) scaleY(1.008);
   }
 }
 

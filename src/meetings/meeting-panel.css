@@ -2,8 +2,6 @@
 .meeting-panel label { display: block; font-size: 12px; }
 .meeting-panel .panel__input { display: block; box-sizing: border-box; width: 100%; margin-top: 4px; }
 .meeting-panel .panel__row { margin-top: 10px; }
-.meeting-panel .meeting-panel__consent { display: flex; align-items: flex-start; gap: 8px; margin: 10px 0; }
-.meeting-panel input[type="checkbox"] { accent-color: var(--brown); }
 .meeting-panel__status { display: flex; justify-content: space-between; gap: 8px; padding-block: 6px; }
 .meeting-panel__status time { font-variant-numeric: tabular-nums; }
 .meeting-panel__levels { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }

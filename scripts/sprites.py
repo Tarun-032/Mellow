@@ -23,6 +23,7 @@ except ModuleNotFoundError:
 ROOT = Path(__file__).resolve().parent.parent
 ART = ROOT / "Pet ideas"
 OUT_PNG = ROOT / "src" / "pet" / "sprites.png"
+OUT_WRITING = ROOT / "src" / "pet" / "writing.png"
 OUT_CSS = ROOT / "src" / "pet" / "sprites.css"
 OUT_JSON = ROOT / "src" / "pet" / "sprites.json"
 OUT_BUBBLE = ROOT / "src" / "pet" / "bubble.png"
@@ -63,6 +64,11 @@ PALETTE: dict[str, tuple[int, int, int]] = {
     "salmon": (0xF1, 0x89, 0x73),
 }
 
+# Sixth colour, for the pencil in `writing`. Deliberately NOT a snap target: as a
+# PALETTE entry it would pull Mellow's tan fur toward yellow in every pose. It is
+# only ever painted by `writing_details`, which runs after snap_palette.
+PENCIL = (0xE8, 0xA8, 0x3C)
+
 # Role-based snap for off-palette generator tones (nearest-colour gets these wrong).
 SNAP: dict[tuple[int, int, int], str] = {
     (0xAE, 0x66, 0x40): "tan",  # fur fill in think/yawn; idle uses tan there
@@ -102,6 +108,9 @@ class Pose:
     fps: float = 0.0
     # Edge pose: flush right, no shared ground/hit box.
     edge: bool = False
+    # Contributes to the shared body/hit union. Off for display-only poses whose
+    # props (a notebook, say) would make empty space clickable in every pose.
+    union: bool = True
 
     @property
     def files(self) -> tuple[str, ...]:
@@ -120,7 +129,10 @@ POSES: dict[str, Pose] = {
     # Own crop: different silhouettes from the upright set.
     "petting": Pose("Mellow petting.png", "petting", 46, 60),
     "hunt": Pose("Mellow hunt.png", "hunt", 34, 60),
-    "writing": Pose(("mellow transcribe notetaking.png",) * 2, "writing", 46, 60, fps=2),
+    # Same 46 as the other standing poses so it does not tower over them. The
+    # notebook is part of this silhouette, so the dog reads a little smaller — that
+    # is the price of matching footprints, and matching footprints won.
+    "writing": Pose(("mellow transcribe notetaking.png",) * 4, "writing", 46, 60, fps=6, union=False),
     # Edge sliver (from peek_art.py); CSS mirrors for the other side.
     "peek": Pose("Mellow peek.png", "peek", 46, 60, edge=True),
 }
@@ -447,16 +459,107 @@ def hit_mask(cells: list[np.ndarray]) -> list[str]:
     return ["".join("1" if pixel else "0" for pixel in row) for row in opaque]
 
 
-def writing_stroke(cell: np.ndarray) -> np.ndarray:
-    """Move the supplied pencil/paw one art pixel; keep the head and notebook fixed."""
-    result = cell.copy()
-    patch = cell[39:51, 14:24].copy()
-    result[39:51, 14:24] = 0
-    for row, left in enumerate((20, 20, 19, 19, 17, 17, 16, 16, 17, 17, 16, 16), 39):
-        result[row, left:24] = (*PALETTE["cream"], 255)
-    target = result[39:51, 13:23]
-    target[patch[:, :, 3] > 0] = patch[patch[:, :, 3] > 0]
-    return result
+# Features the 27:1 mode-downscale cannot keep, redrawn at sprite scale.
+# Coordinates are read off the rendered cell and pinned by selfcheck(); a change to
+# the pose's height, group or source art invalidates them and must fail there.
+GLASSES = (
+    # (y0, y1, x0, x1) rims, drawn as rounded outlines so the eyes stay visible.
+    (26, 33, 18, 26),  # left lens
+    (26, 33, 31, 39),  # right lens
+)
+GLASSES_BRIDGE = (28, 27, 30)  # y, x0, x1
+# The downscaled art has its own smudge of a pencil baked into the paw. It has to
+# be wiped before a clean one is drawn, or the baked one sits still while the drawn
+# one moves — half the pencil stuck, half of it animating.
+PENCIL_CLEAR = (37, 49, 14, 23)  # y0, y1, x0, x1 (half-open)
+PENCIL_TOP = (38, 16)
+PENCIL_TIP = (47, 21)
+# Nib offsets per frame: a ping-pong, so the loop reverses instead of snapping back.
+NIB_SWING = (0, 1, 0, -1)
+# Ruled lines, kept below the paws and clear of the spine.
+PAGE_RULES = (
+    (52, 15, 23),  # left page
+    (54, 14, 22),
+    (51, 31, 40),  # right page
+    (53, 30, 39),
+)
+
+
+def writing_details(cell: np.ndarray, frame: int) -> np.ndarray:
+    """Redraw glasses, pencil and page rules; `frame` swings the nib."""
+    out = cell.copy()
+    opaque = cell[:, :, 3] > 0
+
+    def put(y, x, colour, only_opaque=True):
+        if not (0 <= y < CELL and 0 <= x < CELL):
+            return
+        if only_opaque and not opaque[y, x]:
+            return
+        out[y, x] = (*colour, 255)
+
+    for y0, y1, x0, x1 in GLASSES:
+        # Corners left off, so the rims read as rounded lenses rather than boxes.
+        for x in range(x0 + 1, x1):
+            put(y0, x, PALETTE["dark"])
+            put(y1, x, PALETTE["dark"])
+        for y in range(y0 + 1, y1):
+            put(y, x0, PALETTE["dark"])
+            put(y, x1, PALETTE["dark"])
+    by, bx0, bx1 = GLASSES_BRIDGE
+    for x in range(bx0, bx1 + 1):
+        put(by, x, PALETTE["dark"])
+
+    # Wipe the baked pencil back to paw/page cream. Only the light pixels go: the
+    # notebook spine runs through this box and must survive.
+    cy0, cy1, cx0, cx1 = PENCIL_CLEAR
+    light = np.zeros(cell.shape[:2], bool)
+    for tone in ("cream", "tan", "salmon"):
+        light |= (cell[:, :, :3] == np.array(PALETTE[tone], np.uint8)).all(-1)
+    band = np.zeros_like(light)
+    band[cy0:cy1, cx0:cx1] = True
+    out[band & light & opaque, :3] = PALETTE["cream"]
+
+    ty, tx = PENCIL_TOP
+    ny, nx = PENCIL_TIP
+    nx += NIB_SWING[frame % len(NIB_SWING)]
+    steps = max(abs(ny - ty), abs(nx - tx))
+    for i in range(steps + 1):
+        y = round(ty + (ny - ty) * i / steps)
+        x = round(tx + (nx - tx) * i / steps)
+        colour = PALETTE["salmon"] if i == 0 else PALETTE["dark"] if i == steps else PENCIL
+        put(y, x, colour, only_opaque=False)
+
+    for y, x0, x1 in PAGE_RULES:
+        for x in range(x0, x1 + 1):
+            put(y, x, PALETTE["tan"])
+    return out
+
+
+def build_writing(art: Path = ART, out: Path = OUT_WRITING):
+    """Keep the reference's fine details at the existing 64px logical footprint."""
+    pose = POSES["writing"]
+    source, (y0, y1, x0, x1) = cutout(art / pose.files[0])
+    scale = 4
+    width = max(1, round(pose.height * (x1 - x0) / (y1 - y0)))
+    left, top = (CELL - width) // 2, pose.ground - pose.height
+    small = Image.fromarray(source[y0:y1, x0:x1]).resize(
+        (width * scale, pose.height * scale), Image.Resampling.NEAREST,
+    )
+    base = np.zeros((CELL * scale, CELL * scale, 4), np.uint8)
+    base[top*scale:pose.ground*scale, left*scale:(left+width)*scale] = np.array(small)
+    frames = []
+    cy0, cy1, cx0, cx1 = (value * scale for value in PENCIL_CLEAR)
+    yy, xx = np.mgrid[cy0:cy1, cx0:cx1]
+    # Keep the existing nib swing, with a feathered displacement of the original art.
+    weight = np.sin(np.pi * (xx-cx0) / (cx1-cx0-1)) * np.sin(np.pi * (yy-cy0) / (cy1-cy0-1))
+    for frame in range(len(pose.files)):
+        cell = base.copy()
+        shift = np.rint(weight * NIB_SWING[frame % len(NIB_SWING)] * scale / 2).astype(int)
+        cell[cy0:cy1, cx0:cx1] = base[yy, xx-shift]
+        frames.append(cell)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(np.concatenate(frames, axis=1)).save(out)
+    print(f"{out.name}: {len(frames)} frames; unchanged {CELL}x{CELL} logical cell, height {pose.height}, ground {pose.ground}")
 
 
 def build(art: Path = ART, out_png: Path = OUT_PNG, write: bool = True):
@@ -472,8 +575,8 @@ def build(art: Path = ART, out_png: Path = OUT_PNG, write: bool = True):
         for (n, _), c in zip(keys, snapped)
     ]
     for index, (name, frame) in enumerate(keys):
-        if name == "writing" and frame == 1:
-            flat[index] = writing_stroke(flat[index])
+        if name == "writing":
+            flat[index] = writing_details(flat[index], frame)
 
     cells: dict[str, list[np.ndarray]] = {}
     for (n, _), c in zip(keys, flat):
@@ -485,9 +588,10 @@ def build(art: Path = ART, out_png: Path = OUT_PNG, write: bool = True):
         index[n] = {"cell": at, "frames": len(fs), "fps": POSES[n].fps}
         at += len(fs)
 
-    standing = [c for (n, _), c in zip(keys, flat) if not POSES[n].edge]
+    standing = [c for (n, _), c in zip(keys, flat) if not POSES[n].edge and POSES[n].union]
 
     if write:
+        build_writing(art)
         sheet = np.concatenate(flat, axis=1)
         out_png.parent.mkdir(parents=True, exist_ok=True)
         Image.fromarray(sheet).save(out_png)
@@ -533,7 +637,7 @@ def build(art: Path = ART, out_png: Path = OUT_PNG, write: bool = True):
         OUT_CSS.write_text("\n".join(lines))
 
     shape = ", ".join(f"{n}x{len(fs)}" if len(fs) > 1 else n for n, fs in cells.items())
-    print(f"{at} cells over {len(cells)} poses, {len(PALETTE)} colours: {shape}")
+    print(f"{at} cells over {len(cells)} poses, {len(PALETTE)} colours + pencil: {shape}")
     return cells
 
 

@@ -178,7 +178,7 @@ export default function Meetings({ openLast = false }: { openLast?: boolean }) {
     leaveSelect();
     try { await refresh(); } catch { /* the 2s poll picks it up */ }
     setBusy(false);
-    if (kept.length) setError(`Deleted ${gone}. ${kept.length} could not be deleted — stop recording and let notes generation finish first.`);
+    if (kept.length) setError(`Deleted ${gone}. ${kept.length} could not be deleted. Stop recording and let notes generation finish first.`);
   };
   const filtered = items.filter(item => item.title.toLocaleLowerCase().includes(query.toLocaleLowerCase()));
   const turns = conversationTurns(detail?.segments ?? []);
@@ -209,7 +209,7 @@ export default function Meetings({ openLast = false }: { openLast?: boolean }) {
     </div>
     {confirmBulk && <Confirm busy={busy}
       heading={`Delete ${picked.size} meeting${picked.size === 1 ? "" : "s"}?`}
-      body="Their transcripts and notes go with them. This cannot be undone — export a copy first if you need one."
+      body={`${picked.size === 1 ? "Its transcript and notes go with it." : "Their transcripts and notes go with them."} This cannot be undone. Export a copy first if you need one.`}
       confirmLabel="Delete permanently" onCancel={() => setConfirmBulk(false)} onConfirm={() => void deletePicked()} />}
     {!loaded ? <p role="status">Loading meetings…</p> : !items.length ? <p>No meetings yet. Start your first from Mellow’s right-click menu.</p> : !filtered.length ? <p>No matching meetings.</p> :
       <ul className={`meetings-list${selecting ? " meetings-list--selecting" : ""}`}>{filtered.map(item => {
@@ -317,7 +317,7 @@ export default function Meetings({ openLast = false }: { openLast?: boolean }) {
         </div>
         {confirmDelete && <Confirm busy={busy}
           heading="Delete this meeting?"
-          body="Its transcript and notes go with it. This cannot be undone — export a copy first if you need one."
+          body="Its transcript and notes go with it. This cannot be undone. Export a copy first if you need one."
           confirmLabel="Delete permanently" onCancel={() => setConfirmDelete(false)}
           onConfirm={() => void act(async () => {
             await request(`/meetings/${selected}/delete`, { method: "POST", body: "{}" });
