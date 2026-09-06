@@ -547,6 +547,15 @@ def build_writing(art: Path = ART, out: Path = OUT_WRITING):
     )
     base = np.zeros((CELL * scale, CELL * scale, 4), np.uint8)
     base[top*scale:pose.ground*scale, left*scale:(left+width)*scale] = np.array(small)
+    # Bring the detailed art toward the other poses' flat colours without losing fine shading.
+    colours = base[:, :, :3].astype(float)
+    palette = np.array([colour for name, colour in PALETTE.items() if name != "salmon"], dtype=float)
+    nearest = ((colours[:, :, None] - palette) ** 2).sum(-1).argmin(-1)
+    tones = palette[nearest]
+    blush = (colours[:, :, 0] - colours[:, :, 1] > 60) & (colours[:, :, 1] - colours[:, :, 2] < 40)
+    tones[blush] = PALETTE["salmon"]
+    opaque = base[:, :, 3] > 0
+    base[opaque, :3] = np.rint(colours[opaque] * 0.25 + tones[opaque] * 0.75).astype(np.uint8)
     frames = []
     cy0, cy1, cx0, cx1 = (value * scale for value in PENCIL_CLEAR)
     yy, xx = np.mgrid[cy0:cy1, cx0:cx1]
