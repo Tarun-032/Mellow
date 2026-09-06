@@ -70,19 +70,33 @@ https://github.com/user-attachments/assets/8cb9e786-4c55-4077-bd6f-3200aedc5f61
   <tr>
     <th>Peek mode</th>
     <th>Meeting notes</th>
-    <th></th>
+    <th>Stretch &amp; yawn</th>
   </tr>
   <tr>
     <td><img src="media/features/peek.gif" width="100%" alt="Mellow hiding at the edge of the screen and peeking back in" /></td>
     <td><img src="media/features/note-taking.gif" width="100%" alt="Mellow wearing glasses and writing in a notebook while transcribing a meeting" /></td>
-    <td></td>
+    <td><img src="media/features/stretch-yawn.gif" width="100%" alt="Mellow stretching and letting out a sleepy yawn" /></td>
   </tr>
   <tr>
     <td align="center"><sub>Need some space? Mellow tucks himself against the screen edge.</sub></td>
     <td align="center"><sub>Stay in the conversation while Mellow takes notes.</sub></td>
-    <td></td>
+    <td align="center"><sub>A little stretch and a big yawn between tasks.</sub></td>
   </tr>
 </table>
+
+## Let Mellow point the way
+
+Sometimes “look in the top-right corner” is not enough. Ask Mellow where something is, and his **bone pointer** moves across your screen to show you the relevant control, with a short explanation beside it.
+
+Hold `Ctrl` + `Shift` + `Space` and try:
+
+- “Where is the settings button?”
+- “Show me the export option on this page.”
+- “Where do I click to change this setting?”
+
+Mellow uses available interface information, on-screen text, and screen understanding to locate the target. While he explains it aloud, the pointer and its dialogue stay visible until the spoken response finishes, then the bone returns to following your cursor. Pointing is a visual guide, not an automatic click: you stay in control of what happens next.
+
+Keep the relevant window visible when asking. For screenshot-based help, choose a vision-capable answer model and allow screenshot inspection under **Settings → Advanced**. Screenshots are taken when needed for your request, not continuously; cloud-based screen understanding sends them to your selected provider. Small icons, unusual layouts, or a page that changes after capture can affect pointing accuracy.
 
 ## Choose your setup
 
