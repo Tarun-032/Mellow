@@ -15,7 +15,7 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-f18773?style=flat-square" alt="Apache 2.0 license" /></a>
 </p>
 
-Mellow is an open-source desktop companion with a real personality and a useful set of hands-free tools. He can listen and answer out loud, understand what is on your screen, point you toward controls, open apps and websites, manage focus sessions and reminders, and react with expressive pixel-art animations.
+Mellow is an open-source desktop companion with a real personality and a useful set of hands-free tools. He can listen and answer out loud, understand what is on your screen, point you toward controls, open apps and websites, manage focus sessions and reminders, transcribe meetings, and react with expressive pixel-art animations.
 
 You choose how much intelligence Mellow has and where it runs. Use local models, connect an OpenAI-compatible provider, use an existing Claude Code or Codex subscription, or disable AI entirely and keep only the pet.
 
@@ -30,6 +30,7 @@ https://github.com/user-attachments/assets/8cb9e786-4c55-4077-bd6f-3200aedc5f61
 - **Point things out.** Ask where a control is and Mellow's bone pointer moves to the relevant place on screen.
 - **Help around the desktop.** Open apps, folders, and websites, play media, or adjust one application's volume.
 - **Keep you on track.** Set reminders and run configurable Pomodoro focus sessions directly from the pet.
+- **Take meeting notes.** Transcribe your microphone and meeting audio, generate structured notes with your chosen answer engine, and export the transcript or notes.
 - **Feel alive.** Pet, drag, wake, and watch Mellow react through idle, listening, thinking, talking, sleeping, peeking, and stretching animations.
 - **Work without AI.** Pet-only mode keeps the companion, reminders, and focus tools without downloading models or contacting an AI service.
 
@@ -66,21 +67,22 @@ https://github.com/user-attachments/assets/8cb9e786-4c55-4077-bd6f-3200aedc5f61
     <td align="center"><sub>Stay focused with work and break sessions.</sub></td>
     <td align="center"><sub>Set reminders and Mellow gets your attention.</sub></td>
   </tr>
-</table>
-
-<table align="center">
   <tr>
     <th>Peek mode</th>
+    <th>Meeting notes</th>
+    <th></th>
   </tr>
   <tr>
-    <td><img src="media/features/peek.gif" width="252" alt="Mellow hiding at the edge of the screen and peeking back in" /></td>
+    <td><img src="media/features/peek.gif" width="100%" alt="Mellow hiding at the edge of the screen and peeking back in" /></td>
+    <td><img src="media/features/note-taking.gif" width="100%" alt="Mellow wearing glasses and writing in a notebook while transcribing a meeting" /></td>
+    <td></td>
   </tr>
   <tr>
-    <td align="center"><sub>Need some space? Mellow tucks himself<br />against the screen edge.</sub></td>
+    <td align="center"><sub>Need some space? Mellow tucks himself against the screen edge.</sub></td>
+    <td align="center"><sub>Stay in the conversation while Mellow takes notes.</sub></td>
+    <td></td>
   </tr>
 </table>
-
-
 
 ## Choose your setup
 
@@ -94,6 +96,37 @@ Mellow does not force one AI stack on everyone. Each capability can be configure
 
 Local speech models are downloaded once during onboarding and reused afterward. Parakeet and Kokoro require roughly one gigabyte of disk space together. Ollama models are installed and managed separately by Ollama.
 
+## Meetings, transcripts, and notes
+
+Let Mellow handle the transcript while you focus on the conversation. Meeting features are available in the current source build.
+
+### Start a meeting
+
+1. Configure **Speech to text** in Settings with your local model or cloud provider.
+2. Right-click Mellow and open **Transcribe a meeting**. Add an optional title, select your microphone, and choose the output device playing the meeting audio.
+3. Use **Check audio levels (2s)** while speaking and playing meeting audio, then click **Start transcription**.
+4. Mellow puts on his glasses and starts writing. Use the bar above him to pause or resume; its **×** button ends the meeting and saves the transcript. You can also use **Stop & save** in the meeting controls.
+5. When processing finishes, click **View notes**, or open **Settings → Meetings** any time to find the saved meeting.
+
+Transcripts group speech into readable turns. **You** means your microphone; **Other participant** means audio from the selected output, not a separately identified person. Echo cancellation helps reduce speaker audio leaking into the microphone, but headphones can improve clarity. Only start transcription with everyone's permission.
+
+### Generate structured notes
+
+Open a saved meeting, switch to **Notes**, and select **Generate notes**. Mellow uses the answer engine configured in Settings: a local model, cloud provider, or supported agent connection. Transcription itself does not require generating notes.
+
+Notes cover the overview, key topics, decisions, action items, and open questions when present in the conversation. You can leave the page while they generate, or use **Regenerate notes** to try again. Review generated notes against the transcript before relying on them.
+
+### Export or copy
+
+In a saved meeting, click **Export**, choose **Transcript** or **Notes**, then select:
+
+- **Markdown (.md)** for formatted notes and documentation.
+- **Plain text (.txt)** for a simple, readable copy.
+- **JSON (.json)** for structured data you can use in other tools.
+- **Copy to clipboard** to paste the selected content elsewhere.
+
+Transcripts and notes are exported separately. Saved meetings can also be renamed or deleted from Settings. Audio recordings are not saved; cloud transcription sends audio to your speech provider, and cloud or agent note generation sends the transcript to your chosen answer service.
+
 ## Install on Windows
 
 1. Open the [Releases](https://github.com/Tarun-032/Mellow/releases) page.
@@ -101,7 +134,7 @@ Local speech models are downloaded once during onboarding and reused afterward. 
 3. Run the installer, then follow Mellow's first-run onboarding.
 4. Choose local, cloud, agent, or pet-only options for each feature.
 
-Mellow currently supports 64-bit Windows. Microphone access is required only for voice input. For the best motion and pet reactions, enable **Animation effects** under **Windows Settings → Accessibility → Visual effects**.
+Mellow currently supports 64-bit Windows. Microphone access is required for voice input and capturing your side of a meeting. For the best motion and pet reactions, enable **Animation effects** under **Windows Settings → Accessibility → Visual effects**.
 
 The first public binaries are not code-signed, so Windows SmartScreen may ask you to confirm the installer. Release notes will include a SHA-256 checksum so the download can be verified.
 
