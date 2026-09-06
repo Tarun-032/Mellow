@@ -691,7 +691,9 @@ def selfcheck() -> None:
     # Skip edge poses for shared ground/centre checks.
     feet, mids = {}, {}
     for n, c in cells.items():
-        if POSES[n].edge:
+        # `cells` is keyed by frame label ("writing[0]"), not pose name — this
+        # raised KeyError for every multi-frame pose.
+        if POSES[pose_of[n]].edge:
             continue
         ys, xs = np.where(c[:, :, 3] > 0)
         feet[n], mids[n] = ys.max(), (xs.min() + xs.max()) / 2
@@ -727,6 +729,38 @@ def selfcheck() -> None:
         assert hunt[47:52, 33:38, 3].all(), "hunt: right eye contains transparency"
         print("ok  hunt eyes are fully opaque beneath the moving highlights")
 
+    # writing_details draws onto coordinates read off the rendered cell. A change to
+    # the pose height, group or source art silently moves the art out from under
+    # them, so pin the result here rather than discovering a bare-faced dog later.
+    written = [n for n in cells if pose_of[n] == "writing"]
+    if written:
+        shots = [cells[n] for n in written]
+        f0 = shots[0]
+        pencil = [(c[:, :, :3] == np.array(PENCIL, np.uint8)).all(-1).sum() for c in shots]
+        assert min(pencil) >= 5, f"writing: pencil nearly gone ({pencil} px)"
+        for lens, (y0, y1, x0, x1) in zip(("left", "right"), GLASSES):
+            rim = (f0[y0, x0 + 1 : x1, :3] == np.array(PALETTE["dark"], np.uint8)).all(-1)
+            assert rim.mean() > 0.5, f"writing: {lens} lens rim did not land on the face"
+        rules = (f0[:, :, :3] == np.array(PALETTE["tan"], np.uint8)).all(-1)
+        assert all(rules[y, x0 : x1 + 1].any() for y, x0, x1 in PAGE_RULES), (
+            "writing: a page rule fell off the notebook"
+        )
+        # The downscaled art bakes its own tan smudge of a pencil into the paw. If
+        # PENCIL_CLEAR stops covering it, that one sits still while the drawn one
+        # swings — the animation reads as a pencil snapping in half. Counting yellow
+        # blobs does not catch it (the baked one is fur-coloured), so assert the band
+        # itself came out clean: no tan left inside it.
+        cy0, cy1, cx0, cx1 = PENCIL_CLEAR
+        for name, c in zip(written, shots):
+            band = c[cy0:cy1, cx0:cx1]
+            tan = (band[:, :, :3] == np.array(PALETTE["tan"], np.uint8)).all(-1) & (band[:, :, 3] > 0)
+            assert not tan.any(), (
+                f"{name}: {tan.sum()}px of the baked-in pencil survived PENCIL_CLEAR"
+            )
+        moved = {tuple(np.argwhere((c[:, :, :3] == np.array(PENCIL, np.uint8)).all(-1))[-1]) for c in shots}
+        assert len(moved) > 1, "writing: the nib never moves, every frame is identical"
+        print(f"ok  writing keeps its glasses, one {min(pencil)}px pencil, and a nib that swings")
+
     # Automated ear-cream check for fix_ear poses only.
     fixed = [n for n in cells if POSES[pose_of[n]].fix_ear]
     for n in fixed:
@@ -745,9 +779,17 @@ def selfcheck() -> None:
     print(f"ok  all four feet are cream on {', '.join(creamed)}")
 
     seen = {tuple(p) for c in cells.values() for p in c[c[:, :, 3] > 0][:, :3].tolist()}
-    extra = seen - set(PALETTE.values())
+    # PENCIL is allowed, but only in `writing` — it must not leak into a pose via
+    # the snap table, which is why it is kept out of PALETTE.
+    extra = seen - set(PALETTE.values()) - {PENCIL}
     assert not extra, "off-palette: " + ", ".join("#%02x%02x%02x" % c for c in sorted(extra))
-    print(f"ok  every pixel is one of the {len(PALETTE)} locked colours")
+    for n, c in cells.items():
+        if pose_of[n] == "writing":
+            continue
+        assert not (c[:, :, :3] == np.array(PENCIL, np.uint8)).all(-1).any(), (
+            f"{n}: pencil yellow leaked outside the writing pose"
+        )
+    print(f"ok  every pixel is one of the {len(PALETTE)} locked colours (+ pencil in writing)")
 
     # Bubble and bone (not in the strip) must also be on-palette.
     bone = make_bone()

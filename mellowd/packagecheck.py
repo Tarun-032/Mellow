@@ -31,6 +31,21 @@ def run() -> None:
     checks["meeting_portaudio"] = pyaudiowpatch.get_portaudio_version_text()
     from mellowd.meetings import router
     checks["meeting_routes"] = len(router.routes)
+    import numpy as np
+    from mellowd.meeting_aec import EchoCanceller, SAMPLES
+    from faster_whisper.vad import get_speech_timestamps
+    aec = EchoCanceller()
+    try:
+        silence = np.zeros(SAMPLES, dtype=np.float32)
+        cleaned = aec.process_pair(silence, silence)
+        if cleaned.shape != silence.shape or not np.isfinite(cleaned).all():
+            raise RuntimeError("the packaged meeting AEC returned invalid audio")
+    finally:
+        aec.close()
+    if get_speech_timestamps(np.zeros(16000, dtype=np.float32)):
+        raise RuntimeError("the packaged meeting VAD detected speech in silence")
+    checks["meeting_echo_cancellation"] = "webrtc-aec3"
+    checks["meeting_speech_detection"] = "silero"
 
     espeak_library = Path(espeakng_loader.get_library_path())
     espeak_data = Path(espeakng_loader.get_data_path())

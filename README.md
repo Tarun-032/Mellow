@@ -11,7 +11,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/platform-Windows-5b3328?style=flat-square" alt="Windows" />
-  <img src="https://img.shields.io/badge/version-1.0.0-cb7a42?style=flat-square" alt="Version 1.0.0" />
+  <img src="https://img.shields.io/badge/version-1.1.0-cb7a42?style=flat-square" alt="Version 1.1.0" />
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-f18773?style=flat-square" alt="Apache 2.0 license" /></a>
 </p>
 
@@ -112,7 +112,7 @@ Local speech models are downloaded once during onboarding and reused afterward. 
 
 ## Meetings, transcripts, and notes
 
-Let Mellow handle the transcript while you focus on the conversation. Meeting features are available in the current source build.
+Let Mellow handle the transcript while you focus on the conversation. Available starting with Mellow 1.1.0.
 
 ### Start a meeting
 
@@ -144,7 +144,7 @@ Transcripts and notes are exported separately. Saved meetings can also be rename
 ## Install on Windows
 
 1. Open the [Releases](https://github.com/Tarun-032/Mellow/releases) page.
-2. Download `Mellow-Setup-1.0.0-x64.exe` from the latest release.
+2. Download `Mellow-Setup-1.1.0-x64.exe` from the latest release.
 3. Run the installer, then follow Mellow's first-run onboarding.
 4. Choose local, cloud, agent, or pet-only options for each feature.
 
@@ -196,7 +196,7 @@ npm run release:windows
 The release command freezes the Python service, verifies its native audio/AI stack and security boundaries, builds the frontend and Tauri application, then produces:
 
 ```text
-src-tauri/target/release/bundle/nsis/Mellow-Setup-1.0.0-x64.exe
+src-tauri/target/release/bundle/nsis/Mellow-Setup-1.1.0-x64.exe
 ```
 
 Large model weights are deliberately excluded from the repository and installer. They are downloaded only when the user selects the corresponding local feature.

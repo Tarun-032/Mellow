@@ -1,6 +1,6 @@
 [package]
 name = "mellow"
-version = "1.0.0"
+version = "1.1.0"
 description = "A pixel-art Windows desktop companion that listens, speaks, helps, and keeps you company."
 authors = ["Tarun-032"]
 license = "Apache-2.0"
