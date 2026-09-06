@@ -136,7 +136,7 @@ Transcripts and notes are exported separately. Saved meetings can also be rename
 
 Mellow currently supports 64-bit Windows. Microphone access is required for voice input and capturing your side of a meeting. For the best motion and pet reactions, enable **Animation effects** under **Windows Settings → Accessibility → Visual effects**.
 
-The first public binaries are not code-signed, so Windows SmartScreen may ask you to confirm the installer. Release notes will include a SHA-256 checksum so the download can be verified.
+The first public binaries are not code-signed, so Windows SmartScreen may ask you to confirm the installer.
 
 ## Privacy model
 
