@@ -178,6 +178,7 @@ DEFAULTS = {
     "remember_conversations": True,
     # The whole AI half, off at the master switch ([[roadmap]] step 8's "just the pet").
     "ai_enabled": True,
+    "writing_enabled": False,
     # Empty on purpose. The rules that make Mellow sound like Mellow moved to llm.CORE
     "system_prompt": "",
 }
@@ -257,6 +258,8 @@ def validate(candidate: dict) -> dict:
         raise ValueError("settings must be a JSON object")
     cfg = dict(DEFAULTS)
     cfg.update(candidate)
+    if not isinstance(cfg.get("writing_enabled"), bool):
+        raise ValueError("writing_enabled must be true or false")
     cfg["system_prompt"] = str(cfg.get("system_prompt") or "")
 
     for name in CAPABILITIES:

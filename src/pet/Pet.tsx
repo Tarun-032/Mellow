@@ -7,6 +7,7 @@ import { clock as meetingClock, useMeeting, viewMeeting } from "../meetings/useM
 import { GUIDE_DIALOGUE_KEY, type GuideDialogue } from "./guideDialogue";
 import { PHASE_LABEL, mmss, usePomodoro } from "./usePomodoro";
 import { useSocket } from "./useSocket";
+import { WritingPanel } from "./WritingPanel";
 import { bonePlacement, usePetMotion, type Reaction } from "./usePetMotion";
 import "./sprites.css"; // generated: --cell-<state> indices into sprites.png
 import "./pet.css";
@@ -80,6 +81,7 @@ export default function Pet() {
     transcript,
     reply,
     error,
+    writing,
     speak,
     reminder,
     point,
@@ -101,6 +103,7 @@ export default function Pet() {
   }, [completedMeetingId, dismissedMeetingId]);
   const [nap, setNap] = useState<Nap>("awake");
   const [panel, setPanel] = useState<Panel>(null);
+  const writingPanel = writing && writing.status !== "inserted" && writing.status !== "idle" ? writing : null;
   // Local pomodoro fire (separate from sidecar reminders).
   const [fired, setFired] = useState("");
   // Queued while quiet; sidecar already deleted them from disk.
@@ -110,7 +113,7 @@ export default function Pet() {
   useEffect(() => { if (meetingActive && alert) setPanel("meeting"); }, [meetingActive, alert]);
   // Hold awake through sidecar work; break sleep; otherwise use the nap clock.
   const holdMode: Hold =
-    meetingActive || panel !== null || alert !== "" || state !== "idle"
+    meetingActive || panel !== null || writingPanel !== null || alert !== "" || state !== "idle"
       ? "awake"
       : !timer.running
         ? null
@@ -508,7 +511,7 @@ export default function Pet() {
         )}
         {/* Waiting marker while quiet (not a count). */}
         {quiet && waiting.length > 0 && <i className="quiet-dot" />}
-        {!panel && (meetingActive || meetingSaved) && (
+        {!panel && !writingPanel && (meetingActive || meetingSaved) && (
           <div className="badge badge--meeting" data-state={meeting.status?.status} ref={motion.panelRef}>
             <button
               type="button"
@@ -558,7 +561,12 @@ export default function Pet() {
             {PHASE_LABEL[timer.phase]} {mmss(timer.remaining)}
           </div>
         )}
-        {panel && (
+        {writingPanel && !meetingActive && !quiet && (
+          <div className="panel-anchor" ref={motion.panelRef}>
+            <WritingPanel draft={writingPanel} send={send} />
+          </div>
+        )}
+        {panel && !writingPanel && (
           <div className="panel-anchor" ref={motion.panelRef}>
             {panel === "meeting" ? (
               <MeetingPanel status={meeting.status} connectionError={meeting.error} refresh={meeting.refresh} alert={alert} onDismissAlert={dismiss} onClose={() => setPanel(null)} onView={viewMeetings} />
@@ -570,7 +578,7 @@ export default function Pet() {
           </div>
         )}
         {/* Bubble only when awake, no panel, not pointing. */}
-        {!panel && !quiet && !pointing && pose === "awake" &&
+        {!panel && !writingPanel && !quiet && !pointing && pose === "awake" &&
           // Skip empty listening balloon.
           (state === "thinking" || state === "looking" || said) && (
           <div className="bubble">

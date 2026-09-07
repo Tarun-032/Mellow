@@ -117,7 +117,7 @@ Let Mellow handle the transcript while you focus on the conversation. Available 
 ### Start a meeting
 
 1. Configure **Speech to text** in Settings with your local model or cloud provider.
-2. Right-click Mellow and open **Transcribe a meeting**. Add an optional title, select your microphone, and choose the output device playing the meeting audio.
+2. Right-click Mellow and choose **Transcribe meeting…**. Add an optional title, select your microphone, and choose the output device playing the meeting audio.
 3. Use **Check audio levels (2s)** while speaking and playing meeting audio, then click **Start transcription**.
 4. Mellow puts on his glasses and starts writing. Use the bar above him to pause or resume; its **×** button ends the meeting and saves the transcript. You can also use **Stop & save** in the meeting controls.
 5. When processing finishes, click **View notes**, or open **Settings → Meetings** any time to find the saved meeting.
@@ -148,13 +148,15 @@ Transcripts and notes are exported separately. Saved meetings can also be rename
 3. Run the installer, then follow Mellow's first-run onboarding.
 4. Choose local, cloud, agent, or pet-only options for each feature.
 
+Already using Mellow? Quit it from the tray before running the new installer. Keep your existing app data to retain settings, downloaded models, and saved meetings; a clean uninstall is only for removing that data.
+
 Mellow currently supports 64-bit Windows. Microphone access is required for voice input and capturing your side of a meeting. For the best motion and pet reactions, enable **Animation effects** under **Windows Settings → Accessibility → Visual effects**.
 
 The first public binaries are not code-signed, so Windows SmartScreen may ask you to confirm the installer.
 
 ## Privacy model
 
-Mellow captures audio during push-to-talk or a meeting you explicitly start. Meetings capture your microphone and the selected system output, with local echo cancellation to reduce speaker playback in the microphone. Audio stays in memory; saved meetings contain transcripts and notes, not recordings. Cloud transcription sends audio to your selected speech provider. Screen capture is request-driven and can be disabled in Settings.
+For voice input, Mellow can keep the microphone open while awake to maintain a short pre-roll buffer; push-to-talk selects the audio to transcribe. A meeting you explicitly start captures your microphone and the selected system output, with local echo cancellation to reduce speaker playback in the microphone. Audio stays in memory; saved meetings contain transcripts and notes, not recordings. Cloud transcription sends audio to your selected speech provider. Screen capture is request-driven and can be disabled in Settings.
 
 - **Local mode:** supported inference runs on the computer. No API key is required.
 - **Cloud mode:** only the data needed for the selected feature is sent to the provider you configure.
@@ -182,12 +184,15 @@ cd Mellow
 py -3.12 -m venv .venv
 .venv\Scripts\python.exe -m pip install -r mellowd\requirements.txt -r mellowd\requirements-build.txt
 .venv\Scripts\python.exe scripts\prepare-meeting-aec.py
+.venv\Scripts\python.exe scripts\sprites.py
 
 npm ci
 npm run tauri dev
 ```
 
 ### Build the Windows installer
+
+Quit running copies of Mellow first. The packaged-helper verification needs port `8765` to be free. The sprite-generation step above creates `bone.png`, which is intentionally not tracked in Git.
 
 ```powershell
 npm run release:windows

@@ -5,6 +5,7 @@ import json
 import logging
 import re
 import sys
+import threading
 import time
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
@@ -16,7 +17,7 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 from mellowd import (
-    act, agents, capture, config, errors, llm, locator, meetings, point, remind, sessions, stt, tts,
+    act, agents, capture, config, errors, llm, locator, meetings, point, remind, sessions, stt, tts, writing,
 )
 from mellowd.version import PROTOCOL, SERVICE, VERSION
 
@@ -27,6 +28,7 @@ PORT = 8765
 
 # Last N turns kept for context.
 HISTORY_TURNS = 10
+_transcription_lock = threading.Lock()
 
 # Short, and it names the thing being tested, so a wrong voice is obvious.
 TTS_PROBE = "hi, this is how mellow sounds."
@@ -228,6 +230,12 @@ async def put_config(body: dict):
         raise HTTPException(status_code=400, detail=str(e)) from e
     if engine_changed:
         await _reset_for_engine_change()
+    elif previous.get("writing_enabled") != cfg.get("writing_enabled"):
+        for session in list(_active_sessions.values()):
+            await session.abort()
+            session.writer.reset()
+            await writing.status(session, send, "idle")
+            await send(session.ws, type="state", state="idle")
     return {
         "settings": config.redacted(cfg),
         "engine_changed": engine_changed,
@@ -538,6 +546,7 @@ class Session:
     hidden: asyncio.Event = field(default_factory=asyncio.Event)
     # Physical monitor containing the cursor when this turn was submitted.
     turn_monitor: dict | None = None
+    writer: writing.Writer = field(default_factory=writing.Writer)
 
     def __post_init__(self) -> None:
         self.speaker = tts.Speaker(self.ws, send)
@@ -638,6 +647,7 @@ class Session:
 
     async def abort(self) -> None:
         """Stop whatever the pet is doing, right now."""
+        self.writer.cancel()
         if self.turn and not self.turn.done():
             self.turn.cancel()
             with suppress(asyncio.CancelledError):
@@ -656,6 +666,8 @@ async def _meeting_started():
         session.awake = False
         session.mic_ready = False
         await session.abort()
+        session.writer.reset()
+        await writing.status(session, send, "idle")
         if session.warmup and not session.warmup.done():
             await session.warmup
         await asyncio.to_thread(session.recorder.close)
@@ -686,6 +698,8 @@ async def _reset_for_engine_change() -> None:
         finally:
             session.history.clear()
             session.destination = None
+            session.writer.reset()
+            await writing.status(session, send, "idle")
         try:
             await send(session.ws, type="state", state="idle")
         except (WebSocketDisconnect, RuntimeError):
@@ -1292,6 +1306,10 @@ async def answer(session: Session, prompt: str) -> None:
 async def run_turn(session: Session, prompt: str) -> None:
     """A turn owns its own error handling, because as a separate task it's outside the message loop's"""
     try:
+        if config.load().get("writing_enabled") and prompt:
+            await _hide_point(session)
+            if await writing.handle(session, prompt, send):
+                return
         await answer(session, prompt)
     except asyncio.CancelledError:
         raise
@@ -1309,10 +1327,47 @@ async def run_turn(session: Session, prompt: str) -> None:
         await send(session.ws, type="state", state="idle")
 
 
+def _transcribe_voice(audio, cancelled):
+    # A cancelled to_thread call can still be running the local model.
+    with _transcription_lock:
+        return "" if cancelled.is_set() else stt.transcribe(audio)
+
+
+async def _voice_turn(session: Session, audio) -> None:
+    try:
+        text = await asyncio.to_thread(_transcribe_voice, audio, session.writer.cancelled)
+        if meetings.manager.active or session.writer.cancelled.is_set():
+            return
+        if not text and session.recorder.last_stats["peak"] < stt.MIN_PEAK:
+            await asyncio.to_thread(session.recorder.reopen)
+            text_shown = "that was too quiet — say it again"
+        else:
+            text_shown = text or "…didn't catch that"
+        await send(session.ws, type="transcript", text=text_shown)
+        await run_turn(session, text)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        await send(session.ws, type="error", message=errors.message(exc))
+        await send(session.ws, type="state", state="idle")
+
+
+async def _writing_start(session: Session) -> None:
+    session.writer.begin()
+    await writing.status(session, send, "idle")
+    if config.load().get("writing_enabled"):
+        try:
+            session.writer.target = await asyncio.wait_for(
+                asyncio.to_thread(writing.desktop.snapshot), 0.75
+            )
+        except asyncio.TimeoutError:
+            session.writer.target = writing.desktop.Target(error="The field took too long to respond. Copy the draft instead.")
+
+
 async def handle(session: Session, msg: dict) -> None:
     ws = session.ws
     kind = msg.get("type")
-    if meetings.manager.active and kind in {"ptt_start", "ptt_end", "text"}:
+    if meetings.manager.active and kind in {"ptt_start", "ptt_end", "text", "writing_retry"}:
         await send(ws, type="error", message="Meeting transcription is active. Stop the meeting before talking to Mellow.")
         return
 
@@ -1357,6 +1412,7 @@ async def handle(session: Session, msg: dict) -> None:
         # Off the loop: the first press after a wake does the full device open now
         await asyncio.to_thread(session.recorder.start)
         await send(ws, type="state", state="listening")
+        await _writing_start(session)
 
     elif kind == "ptt_end":
         # A release can race a press rejected during warm-up (or arrive from an older renderer).
@@ -1367,18 +1423,8 @@ async def handle(session: Session, msg: dict) -> None:
             log.warning("ignored an invalid cursor monitor on ptt_end")
         audio = session.recorder.stop()
         await send(ws, type="state", state="thinking")
-        # Blocking C call — off the event loop or the socket stalls.
-        text = await asyncio.to_thread(stt.transcribe, audio)
-        if meetings.manager.active:
-            return
-        # Show *something* when nothing was heard.
-        if not text and session.recorder.last_stats["peak"] < stt.MIN_PEAK:
-            await asyncio.to_thread(session.recorder.reopen)
-            text_shown = "that was too quiet — say it again"
-        else:
-            text_shown = text or "…didn't catch that"
-        await send(ws, type="transcript", text=text_shown)
-        session.turn = asyncio.create_task(run_turn(session, text))
+        # Keep cancellation responsive during speech recognition too.
+        session.turn = asyncio.create_task(_voice_turn(session, audio))
 
     elif kind == "text":
         await session.abort()
@@ -1391,20 +1437,36 @@ async def handle(session: Session, msg: dict) -> None:
             await send(ws, type="state", state="idle")
             return
         await send(ws, type="state", state="thinking")
+        await _writing_start(session)
         session.turn = asyncio.create_task(
             run_turn(session, msg.get("text", "").strip())
         )
 
     elif kind == "cancel":
         await session.abort()
+        session.writer.clarification = None
         session.recorder.stop()
+        await writing.status(session, send, "idle")
         await send(ws, type="state", state="idle")
+
+    elif kind == "writing_retry":
+        if session.turn is None or session.turn.done():
+            session.turn = asyncio.create_task(writing.retry(session, send, str(msg.get("id", ""))))
+
+    elif kind == "writing_dismiss":
+        if msg.get("id") == session.writer.id:
+            await session.abort()
+            session.writer.clarification = None
+            await writing.status(session, send, "idle")
+            await send(ws, type="state", state="idle")
 
     elif kind == "new_conversation":
         # Both halves, or neither is worth doing
         await session.abort()
         session.history.clear()
         session.destination = None
+        session.writer.reset()
+        await writing.status(session, send, "idle")
         await asyncio.to_thread(sessions.close)
         await send(ws, type="state", state="idle")
 

@@ -43,6 +43,7 @@ type SettingsData = {
   remember_conversations: boolean;
   /** AI enabled; false = pet-only mode. */
   ai_enabled: boolean;
+  writing_enabled: boolean;
 };
 
 type Device = {
@@ -145,7 +146,7 @@ const SETTINGS_PAGES: Array<{
   {
     id: "advanced",
     label: "Advanced",
-    description: "Model behavior and vision",
+    description: "Model, vision and dictation",
   },
 ];
 
@@ -173,6 +174,7 @@ type SessionEvent = {
   model?: string;
   provider?: string;
   aborted?: boolean;
+  status?: string;
 };
 
 /** Session time range for the history list. */
@@ -959,6 +961,7 @@ export default function Settings() {
                                     <span className="line-who">
                                       {event.type === "user_said" ? "You" : "Mellow"}
                                       {event.aborted ? " (cut off)" : ""}
+                                      {event.type === "writing_result" ? ` (writing: ${event.status ?? "unknown"})` : ""}
                                     </span>
                                     {event.text || `[${event.type}]`}
                                   </p>
@@ -1024,6 +1027,18 @@ export default function Settings() {
                     </div>
                   )}
                   <div className="settings-group">
+                    <label className="checkbox">
+                      <input type="checkbox" checked={form.writing_enabled ?? false}
+                        onChange={(event) => setForm((current) => current ? { ...current, writing_enabled: event.target.checked } : current)} />
+                      Screen-aware writing
+                    </label>
+                    <p className="field-note">
+                      Click an editable field, hold Ctrl + Shift + Space, and say what to write.
+                      Mellow can dictate, draft replies, and revise its last unchanged draft.
+                      Text is inserted after you release the shortcut; it is never sent automatically.
+                      Screen-based drafts use the focused app through your selected provider.
+                      Terminal prompts are single-line. Unsupported fields offer a copyable draft.
+                    </p>
                     <label>
                       Vision
                       <select value={form.llm.vision} onChange={(event) => patch("llm", { vision: event.target.value })}>

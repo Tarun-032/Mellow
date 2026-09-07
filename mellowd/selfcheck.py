@@ -1145,6 +1145,8 @@ async def check_pet_only() -> None:
         s.ws = FakeWS()
         s.history = []
         s.destination = None
+        # object.__new__ skips __init__, so dataclass defaults never run.
+        s.writer = main.writing.Writer()
         s.speaker = FakeSpeaker()
         s.turn = None
         s.recorder = FakeRecorder()
@@ -1456,6 +1458,7 @@ async def check_turn_logging() -> None:
         s.ws = FakeWS()
         s.history = []
         s.destination = None
+        s.writer = main.writing.Writer()
         s.speaker = FakeSpeaker()
         return s
 
@@ -1846,6 +1849,7 @@ async def _run_pass(chunks, look="ask", fired=None):
     s.ws = ws
     s.history = []
     s.destination = None
+    s.writer = main.writing.Writer()
     s.speaker = type("S", (), {"begin": lambda self: None})()
     async def hook(pick):
         # What had already reached the bubble when the marker landed.
@@ -2258,6 +2262,7 @@ async def check_one_turn_one_bone() -> None:
     session.ws = FakeWS()
     session.history = []
     session.destination = None
+    session.writer = main.writing.Writer()
     session.hidden = asyncio.Event()
     session.hidden.set()
     session.speaker = types.SimpleNamespace(
@@ -2850,6 +2855,7 @@ async def check_point_first() -> None:
         session.ws = FakeWS()
         session.history = []
         session.destination = None
+        session.writer = main.writing.Writer()
         session.hidden = asyncio.Event()
         session.speaker = types.SimpleNamespace(
             begin=lambda: None,

@@ -904,12 +904,14 @@ async def chat(
         yield chunk
 
 
-async def complete_text(prompt: str, cfg: dict, system: str) -> str:
+async def complete_text(prompt: str, cfg: dict, system: str, image: bytes | None = None) -> str:
     """A text-only completion with no persona, anchoring or tool execution."""
     section = {**cfg["llm"], "raw": True, "anchor": False, "system_prompt": system,
                "max_tokens": 4096, "temperature": 0.2}
     adapter = _anthropic if section["provider"] == "anthropic" else _openai
-    return "".join([part async for part in adapter(section, [{"role": "user", "content": prompt}])]).strip()
+    import base64
+    image_b64 = base64.b64encode(image).decode("ascii") if image else None
+    return "".join([part async for part in adapter(section, [{"role": "user", "content": prompt}], image_b64)]).strip()
 
 
 async def complete_vision(prompt: str, cfg: dict, image: bytes) -> str:

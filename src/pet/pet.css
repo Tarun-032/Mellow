@@ -964,6 +964,25 @@ body,
   gap: calc(2 * var(--px));
 }
 
+.writing-panel__text {
+  max-height: min(30vh, 220px);
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: inherit;
+  scrollbar-width: thin;
+  scrollbar-color: var(--brown) var(--paper);
+}
+
+.writing-panel__actions {
+  flex-wrap: wrap;
+}
+
+.writing-panel button:focus-visible {
+  outline: 2px solid var(--brown);
+  outline-offset: 2px;
+}
+
 .panel__btn {
   font: 600 13px/1 var(--panel-font);
   color: var(--paper);

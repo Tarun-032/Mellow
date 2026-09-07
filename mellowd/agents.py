@@ -884,11 +884,11 @@ async def chat(
         yield chunk
 
 
-async def complete_text(prompt: str, cfg: dict, system: str) -> str:
+async def complete_text(prompt: str, cfg: dict, system: str, image: bytes | None = None) -> str:
     """An isolated notes call, never a normal pet conversation."""
     section = cfg["llm"]
     # Codex ignores the separate system argument, so include these rules in stdin too.
-    turn = _prepare(section["provider"], section, system, system + "\n\n" + prompt)
+    turn = _prepare(section["provider"], section, system, system + "\n\n" + prompt, image=image)
     if section["provider"] == "codex":
         flags = ["features.shell_tool=false", "features.unified_exec=false",
                  "features.apply_patch_freeform=false", "features.js_repl=false",

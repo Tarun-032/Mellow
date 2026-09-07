@@ -9,7 +9,17 @@ export type MicrophoneState = "warming" | "ready" | "off";
 
 type Monitor = { left: number; top: number; width: number; height: number };
 
+export type WritingStatus = {
+  type: "writing";
+  id: string;
+  status: "idle" | "thinking" | "inserting" | "inserted" | "blocked" | "uncertain";
+  text: string;
+  message: string;
+  retry: boolean;
+};
+
 type Incoming =
+  | WritingStatus
   | { type: "state"; state: PetState }
   | { type: "microphone"; state: MicrophoneState }
   | { type: "transcript"; text: string }
@@ -35,6 +45,7 @@ export function useSocket() {
   const [reply, setReply] = useState("");
   // Errors are their own state (not folded into reply).
   const [error, setError] = useState("");
+  const [writing, setWriting] = useState<WritingStatus | null>(null);
   // speak mirrors the sidecar flag.
   const [speak, setSpeak] = useState(true);
   // Fired reminder from the sidecar clock.
@@ -61,6 +72,9 @@ export function useSocket() {
       sock.onmessage = async (e) => {
         const msg: Incoming = JSON.parse(e.data);
         switch (msg.type) {
+          case "writing":
+            setWriting(msg.status === "idle" ? null : msg);
+            break;
           case "state":
             setState(msg.state);
             break;
@@ -127,6 +141,7 @@ export function useSocket() {
       sock.onerror = () => sock.close();
       sock.onclose = () => {
         setConnected(false);
+        setWriting(null);
         setMicrophone("off");
         // A disconnected sidecar cannot own a live pointing guide.
         setPoint(null);
@@ -183,6 +198,7 @@ export function useSocket() {
     transcript,
     reply,
     error,
+    writing,
     speak,
     reminder,
     point,
