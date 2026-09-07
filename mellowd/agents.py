@@ -884,8 +884,13 @@ async def chat(
         yield chunk
 
 
-async def complete_text(prompt: str, cfg: dict, system: str, image: bytes | None = None) -> str:
-    """An isolated notes call, never a normal pet conversation."""
+async def complete_text(prompt: str, cfg: dict, system: str, image: bytes | None = None,
+                        temperature: float = 0.2) -> str:
+    """An isolated notes call, never a normal pet conversation.
+
+    `temperature` is accepted for parity with the API backend and ignored: a
+    signed-in CLI exposes no such knob.
+    """
     section = cfg["llm"]
     # Codex ignores the separate system argument, so include these rules in stdin too.
     turn = _prepare(section["provider"], section, system, system + "\n\n" + prompt, image=image)

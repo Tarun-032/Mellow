@@ -904,10 +904,16 @@ async def chat(
         yield chunk
 
 
-async def complete_text(prompt: str, cfg: dict, system: str, image: bytes | None = None) -> str:
-    """A text-only completion with no persona, anchoring or tool execution."""
+async def complete_text(prompt: str, cfg: dict, system: str, image: bytes | None = None,
+                        temperature: float = 0.2) -> str:
+    """A text-only completion with no persona, anchoring or tool execution.
+
+    0.2 suits classifying and note-taking, where the same input should give the
+    same answer. Prose written for a person needs room: at 0.2 a request to
+    draft an email came back as the user's own sentence in tidier English.
+    """
     section = {**cfg["llm"], "raw": True, "anchor": False, "system_prompt": system,
-               "max_tokens": 4096, "temperature": 0.2}
+               "max_tokens": 4096, "temperature": temperature}
     adapter = _anthropic if section["provider"] == "anthropic" else _openai
     import base64
     image_b64 = base64.b64encode(image).decode("ascii") if image else None

@@ -1356,12 +1356,12 @@ async def _writing_start(session: Session) -> None:
     session.writer.begin()
     await writing.status(session, send, "idle")
     if config.load().get("writing_enabled"):
-        try:
-            session.writer.target = await asyncio.wait_for(
-                asyncio.to_thread(writing.desktop.snapshot), 0.75
-            )
-        except asyncio.TimeoutError:
-            session.writer.target = writing.desktop.Target(error="The field took too long to respond. Copy the draft instead.")
+        # Started, not awaited: Chrome can take a second or more to publish a
+        # page's accessibility tree, and `ptt_end` must not queue behind that.
+        # writing.where() collects it once speech recognition has finished.
+        session.writer.finding = asyncio.create_task(
+            asyncio.to_thread(writing.desktop.resolve, writing.FIND_SECONDS)
+        )
 
 
 async def handle(session: Session, msg: dict) -> None:
@@ -1444,7 +1444,6 @@ async def handle(session: Session, msg: dict) -> None:
 
     elif kind == "cancel":
         await session.abort()
-        session.writer.clarification = None
         session.recorder.stop()
         await writing.status(session, send, "idle")
         await send(ws, type="state", state="idle")
@@ -1456,7 +1455,6 @@ async def handle(session: Session, msg: dict) -> None:
     elif kind == "writing_dismiss":
         if msg.get("id") == session.writer.id:
             await session.abort()
-            session.writer.clarification = None
             await writing.status(session, send, "idle")
             await send(ws, type="state", state="idle")
 

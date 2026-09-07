@@ -12,7 +12,10 @@ type Monitor = { left: number; top: number; width: number; height: number };
 export type WritingStatus = {
   type: "writing";
   id: string;
-  status: "idle" | "thinking" | "inserting" | "inserted" | "blocked" | "uncertain";
+  // "sent": pasted into an app that publishes an advisory instead of its own
+  // text, so there was nothing to verify against — distinct from "uncertain",
+  // where the field could be read and the draft was not in it.
+  status: "idle" | "thinking" | "inserting" | "inserted" | "sent" | "blocked" | "uncertain";
   text: string;
   message: string;
   retry: boolean;

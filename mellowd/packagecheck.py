@@ -65,6 +65,11 @@ def run() -> None:
     if root is None:
         raise RuntimeError("Windows UI Automation did not return a root control")
     checks["uia"] = root.ControlTypeName
+    from mellowd import writing, writing_input
+    if writing_input.clean_text("one\ntwo\x1b", terminal=True) != "one two":
+        raise RuntimeError("packaged writing text validation failed")
+    writing.parse_draft('{"text":"Package check","say":"I put that in."}')
+    checks["screen_writing"] = True
 
     # Prove the generated WinRT extensions were collected.
     checks["winrt"] = all(

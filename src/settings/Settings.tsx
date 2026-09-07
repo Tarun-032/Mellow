@@ -1037,7 +1037,8 @@ export default function Settings() {
                       Mellow can dictate, draft replies, and revise its last unchanged draft.
                       Text is inserted after you release the shortcut; it is never sent automatically.
                       Screen-based drafts use the focused app through your selected provider.
-                      Terminal prompts are single-line. Unsupported fields offer a copyable draft.
+                      Terminal and editor prompts are single-line and Mellow never presses Enter,
+                      so nothing runs until you do. Unsupported fields offer a copyable draft.
                     </p>
                     <label>
                       Vision

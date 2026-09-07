@@ -103,7 +103,11 @@ export default function Pet() {
   }, [completedMeetingId, dismissedMeetingId]);
   const [nap, setNap] = useState<Nap>("awake");
   const [panel, setPanel] = useState<Panel>(null);
-  const writingPanel = writing && writing.status !== "inserted" && writing.status !== "idle" ? writing : null;
+  // Only a hard block, where nothing was pasted and this panel holds the only
+  // copy of the draft. Progress is carried by the pet's own thinking pose and
+  // the result is spoken, so a panel over text that plainly arrived — or worse,
+  // over a request that was never about writing — is pure noise.
+  const writingPanel = writing && writing.status === "blocked" ? writing : null;
   // Local pomodoro fire (separate from sidecar reminders).
   const [fired, setFired] = useState("");
   // Queued while quiet; sidecar already deleted them from disk.
