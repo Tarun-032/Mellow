@@ -5,25 +5,25 @@
   font-display: block;
 }
 
-/* Locked palette (matches sprites.py); only what the box needs. */
+/* Sprite palette. */
 :root {
   --ink: #4c2923;
   --paper: #f5ecdd;
-  /* Brown (palette colour three). */
+  /* Dark fur. */
   --brown: #9b532d;
-  /* Timer focus/break colours (art lock does not cover CSS). */
+  /* Timer colors. */
   --red: #b8402f;
   --green: #4f7a3a;
-  /* Panel body font (Pixelify stays on titles). */
+  /* Panel font. */
   --panel-font: "Segoe UI", system-ui, sans-serif;
-  /* Tabular monospace for clocks. */
+  /* Clock font. */
   --panel-digits: Consolas, "Cascadia Mono", ui-monospace, monospace;
-  /* One art pixel (must include unit for calc lengths). */
+  /* Art pixel. */
   --px: 3px;
-  --cell-px: calc(64 * var(--px)); /* 192px */
+  --cell-px: calc(64 * var(--px));
 }
 
-/* Transparent window; only pet and bubble paint. */
+/* Transparent window. */
 html,
 body,
 #root {
@@ -36,7 +36,7 @@ body,
   cursor: default;
 }
 
-/* Click-through overlay; pet-body opts back into pointers. */
+/* Click-through stage. */
 .stage {
   position: fixed;
   inset: 0;
@@ -72,9 +72,7 @@ body,
 }
 
 .pet-art {
-  /* A pose with no .pet--<name> rule falls back to idle. Without this default
-     --cell is undefined, background-position is invalid, and the sprite silently
-     paints cell 0 anyway — which is how `writing` shipped dead. */
+  /* Fallback pose. */
   --cell: var(--cell-idle);
   --frames: 1;
   --frame-time: 1s;
@@ -104,7 +102,7 @@ body,
   animation-play-state: var(--frame-play);
 }
 
-/* Pose cells from generated sprites.css. */
+/* Generated pose cells. */
 .pet--idle {
   --cell: var(--cell-idle);
   --frames: var(--frames-idle);
@@ -199,17 +197,17 @@ body,
   --frames: var(--frames-writing);
   --frame-time: var(--frame-time-writing);
   --frame-play: var(--frame-play-writing);
-  /* Quieter than idle: the dog is bent over a book, the nib carries the motion. */
+  /* Keep writing motion subtle. */
   --motion: writing-life;
   --motion-time: 2.6s;
 }
 
-/* Offline: dim when sidecar is down. */
+/* Offline state. */
 .pet--offline {
   filter: grayscale(1) brightness(0.75);
 }
 
-/* Mic warmup spinner (clears when PortAudio starts). */
+/* Mic warm-up spinner. */
 .mic-warmup {
   position: absolute;
   left: 50%;
@@ -343,7 +341,7 @@ body,
   }
 }
 
-/* Barely there: a breath, so the nib bob reads as the deliberate motion. */
+/* Writing breath. */
 @keyframes writing-life {
   0%,
   100% {
@@ -365,7 +363,7 @@ body,
   }
 }
 
-/* Eye overlays; gaze moves these pixels, not the root. */
+/* Eye overlays. */
 .pet-eyes,
 .pet-mouth {
   position: absolute;
@@ -400,7 +398,7 @@ body,
 .pet-eyes--talking .pet-eye,
 .pet-eyes--angry .pet-eye {
   top: calc(28 * var(--px));
-  /* angry keeps the 6x6 patch and the anchors, and repaints what's inside it */
+  /* Angry eye patch. */
   width: calc(6 * var(--px));
   height: calc(6 * var(--px));
 }
@@ -452,7 +450,7 @@ body,
   animation: eye-blink 4.8s steps(1, end) infinite;
 }
 
-/* Angry brows drawn here (sprite downscale loses them). */
+/* Angry brows. */
 .pet-eyes--angry .pet-eye::before {
   content: "";
   position: absolute;
@@ -482,9 +480,9 @@ body,
   box-shadow: calc(-2 * var(--px)) var(--px) #4c2923;
 }
 
-/* Angry skips blink/gaze — a stare. */
+/* Angry stare. */
 
-/* Hunt: opaque dark eyes + moving cream pupils. */
+/* Hunt eyes. */
 .pet-eyes--hunt {
   animation: none;
 }
@@ -538,7 +536,7 @@ body,
   }
 }
 
-/* Talking mouth flap until dedicated art exists. */
+/* Talking mouth. */
 .pet-mouth {
   display: none;
 }
@@ -548,7 +546,7 @@ body,
   inset: calc(35 * var(--px)) auto auto calc(25 * var(--px));
   width: calc(5 * var(--px));
   height: calc(3 * var(--px));
-  /* Paper cover over baked idle mouth before flap. */
+  /* Cover the baked mouth. */
   background: #f5ecdd;
 }
 
@@ -569,7 +567,7 @@ body,
   }
 }
 
-/* Particles mount with the reaction and leave with it. */
+/* Reaction particles. */
 .particles {
   position: absolute;
   inset: 0;
@@ -710,18 +708,16 @@ body,
   }
 }
 
-/* 9-slice dialogue bubble; tail lives in the bottom-right corner slice. */
+/* Nine-slice dialogue. */
 .bubble {
   position: absolute;
   right: 91px;
   bottom: calc(var(--cell-px) - 34px);
-  /* Right-anchored: grows left; tail stays fixed to the dog. */
-  /* Local box-sizing (pet.css has no global reset). */
   box-sizing: border-box;
   min-width: 132px;
-  /* max-content so parent width doesn't cap the bubble. */
+  /* Ignore parent width. */
   width: max-content;
-  /* Landscape cap; min includes border. */
+  /* Dialogue width limits. */
   max-width: 420px;
   border-style: solid;
   border-width: calc(5 * var(--px)) calc(8 * var(--px)) calc(7 * var(--px))
@@ -730,13 +726,13 @@ body,
   border-image-slice: 5 8 7 6 fill;
   border-image-repeat: stretch;
   image-rendering: pixelated;
-  /* Paper fill closes hairline seams; padding-box keeps chamfers. */
+  /* Hide slice seams. */
   background-color: #f5ecdd;
   background-clip: padding-box;
-  /* Anchor: 91px to head centre, 34px bottom inset. */
+  /* Head anchor. */
 }
 
-/* --- Legacy point explanation anchor (pre-monitor guide window) --- */
+/* Legacy point anchor. */
 .bone {
   position: absolute;
   top: 0;
@@ -746,7 +742,7 @@ body,
   pointer-events: none;
 }
 
-/* Bone bubble anchors; side from half-screen, not measured width. */
+/* Bone dialogue anchors. */
 .bubble--bone {
   right: auto;
   bottom: auto;
@@ -756,7 +752,7 @@ body,
 .bubble--bone.is-below { top: calc(var(--bone-h) * var(--px)); }
 .bubble--bone.is-above { bottom: calc(var(--bone-h) * var(--px)); }
 
-/* Mirror bubble so baked tail aims at the bone. */
+/* Aim the bubble tail. */
 .bubble--bone.is-right.is-above { transform: scaleX(-1); }
 .bubble--bone.is-left.is-below { transform: scaleY(-1); }
 .bubble--bone.is-right.is-below { transform: scale(-1, -1); }
@@ -768,9 +764,9 @@ body,
   font: 400 13px/1.45 "Pixelify Sans", ui-monospace, monospace;
   color: var(--ink);
   image-rendering: auto;
-  /* Eight-line cap (1.45 × 8 = 11.6em). */
+  /* Eight-line limit. */
   max-height: 11.6em;
-  /* Bottom-up scroll; pointer-events for wheel while overflowing. */
+  /* Bottom-up scrolling. */
   pointer-events: auto;
   overflow-y: auto;
   scrollbar-width: thin;
@@ -780,8 +776,7 @@ body,
   overflow-wrap: break-word;
 }
 
-/* Thinking dots. */
-/* Errors: colour + italic (not just colour). */
+/* Error state. */
 .bubble__text--error {
   color: var(--brown);
   font-style: italic;
@@ -815,8 +810,7 @@ body,
   }
 }
 
-/* ── Alert motion (listening cell + hops) ── */
-/* Peek: dedicated art, still (`--motion: none`). */
+/* Peek pose. */
 .pet--peek {
   --cell: var(--cell-peek);
   --frames: var(--frames-peek);
@@ -825,12 +819,12 @@ body,
   --motion: none;
 }
 
-/* Mirror peek art for the left edge (on .pet-art, not JS-owned body). */
+/* Mirror left-edge peek. */
 .pet-root[data-quiet="left"] .pet-art {
   transform: scaleX(-1);
 }
 
-/* Quiet waiting dot (on pet-root, not body). */
+/* Quiet alert dot. */
 .quiet-dot {
   position: absolute;
   top: calc(20 * var(--px));
@@ -838,12 +832,12 @@ body,
   height: calc(4 * var(--px));
   border-radius: 50%;
   background: var(--red);
-  /* The same paper ring the badge uses, so it reads against his cream coat. */
+  /* Contrast against cream fur. */
   box-shadow: 0 0 0 var(--px) var(--paper);
   z-index: 1;
 }
 
-/* Left-edge quiet: dot on the visible (right) end. */
+/* Left-edge alert dot. */
 .pet-root[data-quiet="left"] .quiet-dot {
   left: calc(50 * var(--px));
 }
@@ -887,7 +881,7 @@ body,
   }
 }
 
-/* ── Pomodoro badge over the dog while the panel is closed ── */
+/* Pomodoro badge. */
 .badge {
   position: absolute;
   left: 50%;
@@ -899,7 +893,7 @@ body,
   font-variant-numeric: tabular-nums;
   letter-spacing: 0.04em;
   white-space: nowrap;
-  /* Read-only: the panel is where you press things. */
+  /* Read-only badge. */
   pointer-events: none;
 }
 
@@ -913,18 +907,18 @@ body,
   color: var(--paper);
 }
 
-/* ── Panels (same head-centre anchor as the bubble) ── */
+/* Pet panels. */
 .panel-anchor {
   position: absolute;
   right: 91px;
   bottom: calc(var(--cell-px) - 34px);
-  width: calc(112 * var(--px)); /* 336px */
-  /* DOM + native hit-test both required (see inBox). */
+  width: calc(112 * var(--px));
+  /* Enable hit-testing. */
   pointer-events: auto;
 }
 
 .panel {
-  /* Local box-sizing (no global reset here). */
+  /* Local box sizing. */
   box-sizing: border-box;
   width: 100%;
   border-style: solid;
@@ -934,7 +928,7 @@ body,
   border-image-slice: 5 8 7 6 fill;
   border-image-repeat: stretch;
   image-rendering: pixelated;
-  /* Paper fill for hairline seams; padding-box for chamfers. */
+  /* Hide slice seams. */
   background-color: #f5ecdd;
   background-clip: padding-box;
   font: 400 14px/1.45 var(--panel-font);
@@ -955,7 +949,7 @@ body,
 
 .panel__title {
   flex: 1;
-  /* Pixelify for the short title only. */
+  /* Pixel title. */
   font: 600 16px/1 "Pixelify Sans", ui-monospace, monospace;
 }
 
@@ -963,6 +957,38 @@ body,
   display: flex;
   gap: calc(2 * var(--px));
 }
+
+/* Live mic level. */
+.mic-meter {
+  position: absolute;
+  top: calc(-7 * var(--px));
+  left: calc(50% - 5px);
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  gap: calc(1.1 * var(--px));
+  height: calc(12 * var(--px));
+  pointer-events: none;
+  transform: translateX(-50%);
+}
+
+.mic-meter i {
+  display: block;
+  width: calc(2.25 * var(--px));
+  height: calc(12 * var(--px));
+  background: var(--paper);
+  border-radius: calc(1.125 * var(--px));
+  box-shadow: 0 2px 0 var(--ink);
+  transform-origin: center;
+  transition: transform 130ms cubic-bezier(0.16, 1, 0.3, 1);
+  will-change: transform;
+}
+
+.mic-meter i:nth-child(2),
+.mic-meter i:nth-child(6) { transition-duration: 115ms; }
+.mic-meter i:nth-child(3),
+.mic-meter i:nth-child(5) { transition-duration: 95ms; }
+.mic-meter i:nth-child(4) { transition-duration: 80ms; }
 
 .writing-panel__text {
   max-height: min(30vh, 220px);
@@ -1001,7 +1027,7 @@ body,
   cursor: default;
 }
 
-/* Ghost = outline (shape, not colour) for unchosen pair half. */
+/* Unselected option. */
 .panel__btn--ghost {
   background: var(--paper);
   color: var(--ink);
@@ -1023,7 +1049,7 @@ body,
   list-style: none;
   margin: 0;
   padding: 0;
-  /* Cap height; scroll instead of growing off-screen. */
+  /* Scroll long drafts. */
   max-height: calc(38 * var(--px));
   overflow-y: auto;
   scrollbar-width: thin;
@@ -1069,14 +1095,14 @@ body,
 .panel__input {
   box-sizing: border-box;
   flex: 1;
-  /* Allow flex shrink below content size. */
+  /* Allow flex shrink. */
   min-width: 0;
   font: 400 14px/1.2 var(--panel-font);
   color: var(--ink);
   background: var(--paper);
   border: var(--px) solid var(--ink);
   padding: calc(2 * var(--px));
-  /* Antialiased text input. */
+  /* Smooth input text. */
   image-rendering: auto;
 }
 
@@ -1106,7 +1132,7 @@ body,
   font-style: italic;
 }
 
-/* Phase label above the digits. */
+/* Timer phase. */
 .panel__clock {
   display: flex;
   flex-direction: column;
@@ -1116,7 +1142,7 @@ body,
 
 .panel__phase {
   font: 700 13px/1 var(--panel-font);
-  /* Letter-spacing for a label. */
+  /* Label tracking. */
   letter-spacing: 0.14em;
   text-transform: uppercase;
 }
@@ -1126,7 +1152,7 @@ body,
   font-variant-numeric: tabular-nums;
 }
 
-/* Phase colour on the whole clock via the wrapper. */
+/* Phase colors. */
 .panel__clock--focus .panel__phase,
 .panel__clock--focus .panel__count {
   color: var(--red);
@@ -1137,7 +1163,7 @@ body,
   color: var(--green);
 }
 
-/* Idle/paused clock colour. */
+/* Idle clock. */
 .panel__clock--idle .panel__phase,
 .panel__clock--idle .panel__count {
   color: var(--brown);
@@ -1150,7 +1176,7 @@ body,
   font-size: 13px;
 }
 
-/* Duration settings; only at rest (keeps panel height stable). */
+/* Duration settings. */
 .panel__settings {
   padding-top: calc(2 * var(--px));
 }
@@ -1160,7 +1186,7 @@ body,
   color: var(--brown);
 }
 
-/* Fixed number width so steppers don't jog. */
+/* Stable number width. */
 .panel__num {
   min-width: calc(9 * var(--px));
   text-align: center;
@@ -1168,7 +1194,7 @@ body,
   font-variant-numeric: tabular-nums;
 }
 
-/* Equal-width −/+ steppers. */
+/* Equal steppers. */
 .panel__btn--step {
   min-width: calc(7 * var(--px));
   padding-inline: 0;
@@ -1186,7 +1212,13 @@ body,
     animation: none !important;
   }
 
-  /* Hide ambience particles; hearts keep a short fallback. */
+  .mic-meter i {
+    transform: scaleY(0.19) !important;
+    transition: none;
+    will-change: auto;
+  }
+
+  /* Hide ambient particles. */
   .particles--steam,
   .particles--sleep {
     display: none;

@@ -1,6 +1,7 @@
 """Speech to text. Records from the mic, transcribes with Parakeet or whisper."""
 
 import logging
+import math
 import threading
 import time
 from collections import deque
@@ -14,31 +15,35 @@ from mellowd import config, errors, wav
 
 log = logging.getLogger("mellowd.stt")
 
-# Generous: a long hold on a slow connection is still worth waiting for, and the user is already
+# Cloud timeout.
 CLOUD_TIMEOUT = 60.0
 
-SAMPLE_RATE = 16_000  # what both engines want
-MIN_SECONDS = 0.3  # shorter than this is a stray keypress, not speech
-MIN_PEAK = 0.01  # measured just above this machine's empty-room peak (~0.007)
+SAMPLE_RATE = 16_000  # Shared engine rate.
+MIN_SECONDS = 0.3  # Ignore stray presses.
+MIN_PEAK = 0.01  # Above room noise.
 TARGET_PEAK = 0.25
-# Applied only *after* MIN_PEAK has judged the take to be speech
+# Quiet-speech gain.
 MAX_GAIN = 20.0
 
-# Windows' modern audio API
+# Meter range in dBFS.
+METER_FLOOR_DB = -42.0
+METER_CEILING_DB = -12.0
+
+# Windows audio API.
 WASAPI = "Windows WASAPI"
 
-# How the take is split when ranking channels, and how much of it counts.
+# Channel ranking.
 RANK_FRAMES = 100
 RANK_LOUDEST = 0.2
 
-# Starting a WASAPI stream on this laptop transiently fails with "Unanticipated host error
+# WASAPI retries.
 OPEN_RETRIES = 3
 OPEN_RETRY_DELAY = 0.5
 
-# Audio kept from *before* the hotkey press.
+# Pre-roll audio.
 PREROLL_SECONDS = 0.5
 
-# Parakeet's usable attention window.
+# Parakeet window.
 MAX_SECONDS = 25.0
 
 PARAKEET = "parakeet-tdt-0.6b-v2"
@@ -63,12 +68,12 @@ _model = None
 _model_key: str | None = None
 _backend = "not loaded"
 
-# One second of silence.
+# Silent probe.
 _PROBE = np.zeros(SAMPLE_RATE, dtype=np.float32)
 
 
 def _load_whisper(model_name: str):
-    # CUDA needs cuDNN 9 / cuBLAS DLLs we deliberately don't bundle
+    # CUDA DLLs are not bundled.
     for device, compute in (("cuda", "int8_float16"), ("cpu", "int8")):
         try:
             m = WhisperModel(model_name, device=device, compute_type=compute)
@@ -80,16 +85,16 @@ def _load_whisper(model_name: str):
     raise RuntimeError("could not load whisper on cuda or cpu")
 
 
-# The onnx-asr name resolves to this HuggingFace repo (see onnx_asr.resolver).
+# Parakeet repository.
 PARAKEET_HF_REPO = "istupakov/parakeet-tdt-0.6b-v2-onnx"
-# The int8 weights, vocabulary and config that onnx-asr currently resolves.
+# Parakeet files.
 PARAKEET_PATTERNS = (
     "config.json",
     "vocab.txt",
     "encoder-model.int8.onnx",
     "decoder_joint-model.int8.onnx",
 )
-# The denominator when the repo metadata can't be reached.
+# Download size fallback.
 PARAKEET_TOTAL = 640_000_000
 
 
@@ -122,13 +127,13 @@ def _ensure_parakeet(progress=None) -> None:
     def cached() -> int:
         return sum(f.stat().st_size for f in cache.rglob("*") if f.is_file())
 
-    # Report once before the watcher starts.
+    # Report initial progress.
     progress(PARAKEET_HF_REPO, min(cached(), total), total)
 
     stop = threading.Event()
 
     def watch() -> None:
-        # The cache directory is the only byte count huggingface_hub exposes without a tqdm hook
+        # Read progress from cache.
         while True:
             try:
                 progress(PARAKEET_HF_REPO, min(cached(), total), total)
@@ -143,13 +148,13 @@ def _ensure_parakeet(progress=None) -> None:
         snapshot_download(PARAKEET_HF_REPO, allow_patterns=list(PARAKEET_PATTERNS))
     finally:
         stop.set()
-    # The cache can already have been complete
+    # Handle a complete cache.
     progress(PARAKEET_HF_REPO, total, total)
 
 
 def _load_parakeet(progress=None):
     """Parakeet via onnx-asr. Prefers the int8 weights; falls back to full."""
-    # Imported here, not at module scope
+    # Lazy import.
     import onnx_asr
 
     _ensure_parakeet(progress)
@@ -182,7 +187,7 @@ def _load(cfg: dict | None = None, progress=None):
         return _model
 
     if progress and model_name != PARAKEET:
-        # faster-whisper downloads through its own hub layer; no hook exists.
+        # Faster Whisper has no hook.
         progress(model_name, 0, 0)
     _model, _backend = (
         _load_parakeet(progress)
@@ -234,8 +239,8 @@ def refresh_devices() -> bool:
         if sd.get_stream().active:
             return False
     except RuntimeError:
-        pass  # nothing has played yet
-    # ponytail: doesn't see streams built outside sd.play (e.g.
+        pass  # Nothing is playing.
+    # Ignore external streams.
     sd._terminate()
     sd._initialize()
     return True
@@ -252,7 +257,7 @@ def _candidates() -> tuple[list[int], int | None]:
         return _inputs(range(len(sd.query_devices()))), sd.default.device[0]
     indices = _inputs(api["devices"])
     default = api["default_input_device"]
-    # A default that is not in its own host API's input list is stale.
+    # Reject stale defaults.
     if default not in indices:
         if default is not None:
             log.warning("host api default %s is stale, ignoring it", default)
@@ -351,17 +356,18 @@ class Recorder:
         self._ring_samples = 0
         self._preroll = 0
         self._armed = False
-        # The callback runs on PortAudio's thread.
+        self._live_peak = 0.0
+        # PortAudio lock.
         self._lock = threading.Lock()
         self._stream: sd.InputStream | None = None
         self._device: str | None = None
-        # open()/close() run on to_thread pool threads
+        # Device I/O lock.
         self._io = threading.RLock()
         self._rate = SAMPLE_RATE
-        # For the log line.
+        # Stream timing.
         self._opened_at = time.monotonic()
         self._takes = 0
-        # Callback status flags seen during the current take, e.g.
+        # Callback status.
         self._status = ""
         self.last_stats = {
             "seconds": 0.0,
@@ -376,9 +382,22 @@ class Recorder:
     def active(self) -> bool:
         return self._armed
 
+    @property
+    def live_level(self) -> float:
+        """Current microphone level normalized for the listening indicator."""
+        with self._lock:
+            peak = self._live_peak
+        if peak <= 0:
+            return 0.0
+        db = 20.0 * math.log10(max(peak, 1e-6))
+        return max(
+            0.0,
+            min(1.0, (db - METER_FLOOR_DB) / (METER_CEILING_DB - METER_FLOOR_DB)),
+        )
+
     def _capture(self, indata, _frames, _time, status) -> None:
         if status:
-            # Now that the stream stays open
+            # Log active failures loudly.
             (log.warning if self._armed else log.debug)(
                 "microphone callback: %s", status
             )
@@ -388,9 +407,10 @@ class Recorder:
         with self._lock:
             if self._armed:
                 self._frames.append(block)
+                self._live_peak = float(np.max(np.abs(block))) if block.size else 0.0
             self._ring.append(block)
             self._ring_samples += len(block)
-            # Trim only while the *oldest* block is entirely surplus
+            # Trim surplus pre-roll.
             while self._ring_samples - len(self._ring[0]) >= self._preroll:
                 self._ring_samples -= len(self._ring.popleft())
 
@@ -399,7 +419,7 @@ class Recorder:
         cfg = self._cfg or config.load()
         name = cfg["stt"].get("input_device")
         with self._io:
-            # Compared by name, before anything touches PortAudio
+            # Reuse the same device.
             if self._stream is not None and name == self._device:
                 return
             self.close()
@@ -408,12 +428,12 @@ class Recorder:
             for attempt in range(OPEN_RETRIES):
                 if attempt:
                     time.sleep(OPEN_RETRY_DELAY)
-                # Re-resolved each round: cheap, and the device list can change.
+                # Refresh candidates each round.
                 for device in _resolve_all(name):
                     try:
                         self._start(device)
                     except sd.PortAudioError as e:
-                        # Enumeration cannot see everything: an index can be stale
+                        # Skip stale indices.
                         (log.debug if quiet else log.warning)(
                             "microphone %s refused to start: %s", device, e
                         )
@@ -421,7 +441,7 @@ class Recorder:
                         continue
                     self._device = name
                     return
-        # The raw PortAudio text is already in the log
+        # Keep raw details in logs.
         raise RuntimeError(
             "the microphone refused to start. try again in a moment"
         ) from failure
@@ -431,7 +451,7 @@ class Recorder:
         self._rate = int(dev["default_samplerate"])
         self._preroll = int(self._rate * PREROLL_SECONDS)
 
-        # Deliberately the default ('high') buffer
+        # Use the default buffer.
         stream = sd.InputStream(
             device=device,
             samplerate=self._rate,
@@ -439,7 +459,7 @@ class Recorder:
             dtype="float32",
             callback=self._capture,
         )
-        # Assigned only once it is genuinely running.
+        # Assign after startup.
         try:
             stream.start()
         except BaseException:
@@ -467,7 +487,7 @@ class Recorder:
         try:
             self.open()
         except Exception as e:
-            # Best-effort: this runs mid-handler, and the next keypress opens again anyway.
+            # The next press retries.
             log.warning("reopen failed, staying closed: %s", e)
 
     def close(self) -> None:
@@ -477,6 +497,7 @@ class Recorder:
             self._device = None
             with self._lock:
                 self._armed = False
+                self._live_peak = 0.0
                 self._frames = []
                 self._ring.clear()
                 self._ring_samples = 0
@@ -490,6 +511,7 @@ class Recorder:
         self.open()
         with self._lock:
             self._frames = list(self._ring)
+            self._live_peak = 0.0
             self._armed = True
 
     def stop(self) -> np.ndarray:
@@ -497,15 +519,16 @@ class Recorder:
             if not self._armed:
                 return np.zeros(0, dtype=np.float32)
             self._armed = False
+            self._live_peak = 0.0
             frames, self._frames = self._frames, []
         if not frames:
             return np.zeros(0, dtype=np.float32)
         raw = np.concatenate(frames)
-        # Always automatic
+        # Select the best channel.
         mono, channel = choose_channel(raw)
         audio = resample(mono, self._rate, SAMPLE_RATE)
         peak, rms = levels(audio)
-        # Every channel, not just the winner.
+        # Log all channels.
         per_channel = [round(float(v), 4) for v in _speech_energy(raw)]
         self._takes += 1
         status, self._status = self._status, ""
@@ -547,7 +570,7 @@ def transcribe_meeting(audio: np.ndarray, cfg: dict | None = None) -> str:
         speech = get_speech_timestamps(audio, VadOptions(min_speech_duration_ms=120, speech_pad_ms=300))
         if not speech:
             return ""
-        # Keep the full window: the gate must not cut off words at its boundaries.
+        # Preserve boundary words.
         return _transcribe(audio, cfg, meeting=True)
 
 
@@ -562,7 +585,7 @@ def transcribe_meeting_segments(audio: np.ndarray, cfg: dict | None = None) -> l
         result = []
         padding = round(SAMPLE_RATE * .3)
         for region in regions:
-            # Padding protects quiet first/last syllables; ordering uses speech itself.
+            # Pad edge syllables.
             first = max(0, region["start"] - padding)
             last = min(len(audio), region["end"] + padding)
             text = _transcribe(audio[first:last], cfg, meeting=True).strip()
@@ -575,7 +598,7 @@ def transcribe_meeting_segments(audio: np.ndarray, cfg: dict | None = None) -> l
 def _transcribe(audio: np.ndarray, cfg: dict | None = None, *, meeting: bool = False) -> str:
     if audio.size < SAMPLE_RATE * MIN_SECONDS:
         return ""
-    # Replaces vad_filter, which was clipping the first word off utterances.
+    # Avoid VAD clipping.
     peak, rms = levels(audio)
     log.info("%.1fs peak=%.4f rms=%.4f", audio.size / SAMPLE_RATE, peak, rms)
     min_peak = 0.001 if meeting else MIN_PEAK
@@ -583,7 +606,7 @@ def _transcribe(audio: np.ndarray, cfg: dict | None = None, *, meeting: bool = F
         log.info("too quiet, skipping (peak %.4f < %.4f)", peak, min_peak)
         return ""
     if meeting:
-        # Do not undo echo suppression by amplifying quiet residual playback 20x.
+        # Preserve echo suppression.
         gain = min(2.0, TARGET_PEAK / max(peak, 0.001)) if peak < TARGET_PEAK else 1.0
         conditioned = audio * gain
     else:
@@ -604,7 +627,7 @@ def _transcribe(audio: np.ndarray, cfg: dict | None = None, *, meeting: bool = F
                 MAX_SECONDS,
             )
             conditioned = conditioned[:limit]
-        # English-only and greedy TDT decoding, so no language or beam settings.
+        # Greedy English decoding.
         return str(model.recognize(conditioned, sample_rate=SAMPLE_RATE)).strip()
 
     segments, _ = model.transcribe(
@@ -612,7 +635,7 @@ def _transcribe(audio: np.ndarray, cfg: dict | None = None, *, meeting: bool = F
         language="en",
         beam_size=5,
         vad_filter=False,
-        # Stops one bad guess from steering every later segment
+        # Isolate segment guesses.
         condition_on_previous_text=False,
     )
     return " ".join(s.text.strip() for s in segments).strip()

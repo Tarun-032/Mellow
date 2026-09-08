@@ -9,23 +9,25 @@ import { PHASE_LABEL, mmss, usePomodoro } from "./usePomodoro";
 import { useSocket } from "./useSocket";
 import { WritingPanel } from "./WritingPanel";
 import { bonePlacement, usePetMotion, type Reaction } from "./usePetMotion";
-import "./sprites.css"; // generated: --cell-<state> indices into sprites.png
+import "./sprites.css"; // Generated sprite indices.
 import "./pet.css";
 
 const YAWN_AFTER = 60_000;
-// Reading time after the turn ends (not while still speaking).
+// Silent reply timeout.
 const DISMISS_AFTER = 20_000;
-// Reading time for a pointed reply when no audio was played.
+// Silent point timeout.
 const POINT_DISMISS = 10_000;
-// Yawn sequence length before sleep.
+// Yawn duration.
 const YAWN_LENGTH = 3_200;
-// Settle delay at break start (uses the yawn, then sleeps).
+// Break settle delay.
 const DOZE_AFTER = 1_500;
 const PARTICLES = [0, 1, 2, 3, 4];
-// Cap on unanswered alert attention.
+const MIC_BAR_REST = 0.19;
+const MIC_BARS = [0.19, 0.34, 0.62, 1, 0.62, 0.34, 0.19];
+// Alert timeout.
 const ALERT_CAP = 120_000;
 
-/** Badge wording per meeting state; the panel spells things out at length. */
+/** Meeting badge labels. */
 const MEETING_LABEL: Record<string, string> = {
   starting: "Getting ready",
   recording: "Notes",
@@ -33,18 +35,18 @@ const MEETING_LABEL: Record<string, string> = {
   finalizing: "Saving notes",
 };
 
-/** Which panel is hovering over Mellow, if any. */
+/** Open panel. */
 type Panel = "pomodoro" | "reminders" | "meeting" | null;
 
-/** Nap clock for the mic; pose may be overruled by a pomodoro. */
+/** Nap state. */
 type Nap = "awake" | "yawn" | "sleeping";
 
-/** Hold overrides nap: awake, sleep, or null for the clock. */
+/** Nap override. */
 type Hold = "awake" | "sleep" | null;
 
 type GuideAck = { accepted: boolean; arrived: boolean };
 
-// Monotonic guide revisions; Date.now beats a remounted window's stale cmds.
+// Monotonic guide revision.
 let lastGuideRevision = 0;
 function nextGuideRevision() {
   lastGuideRevision = Math.max(lastGuideRevision + 1, Date.now() * 1_000);
@@ -58,16 +60,16 @@ function resolvePose(
   alerting: boolean,
   quiet: boolean,
 ) {
-  // Physical reactions outrank sidecar state.
+  // Reactions win.
   if (reaction === "angry") return "angry";
   if (reaction === "drag") return "listening";
   if (reaction === "pet") return "petting";
   if (reaction === "hunt") return "hunt";
-  // Quiet above alert, below reactions.
+  // Quiet precedes alerts.
   if (quiet) return "peek";
-  // Fired timer outranks sidecar until acknowledged.
+  // Alerts persist until dismissed.
   if (alerting) return "alert";
-  // Looking uses thinking pose (not alert).
+  // Looking shares thinking art.
   if (state === "looking") return "thinking";
   if (state !== "idle") return state;
   return nap === "awake" ? "idle" : nap;
@@ -78,6 +80,7 @@ export default function Pet() {
     connected,
     state,
     microphone,
+    micLevel,
     transcript,
     reply,
     error,
@@ -85,7 +88,7 @@ export default function Pet() {
     speak,
     reminder,
     point,
-    // Socket timer request; hook below owns the live round as `timer`.
+    // Socket timer request.
     timer: asked,
     send,
     clear,
@@ -103,19 +106,16 @@ export default function Pet() {
   }, [completedMeetingId, dismissedMeetingId]);
   const [nap, setNap] = useState<Nap>("awake");
   const [panel, setPanel] = useState<Panel>(null);
-  // Only a hard block, where nothing was pasted and this panel holds the only
-  // copy of the draft. Progress is carried by the pet's own thinking pose and
-  // the result is spoken, so a panel over text that plainly arrived — or worse,
-  // over a request that was never about writing — is pure noise.
+  // Show only blocked drafts.
   const writingPanel = writing && writing.status === "blocked" ? writing : null;
-  // Local pomodoro fire (separate from sidecar reminders).
+  // Local pomodoro alert.
   const [fired, setFired] = useState("");
-  // Queued while quiet; sidecar already deleted them from disk.
+  // Alerts queued while quiet.
   const [waiting, setWaiting] = useState<string[]>([]);
   const timer = usePomodoro(setFired);
   const alert = fired || reminder;
   useEffect(() => { if (meetingActive && alert) setPanel("meeting"); }, [meetingActive, alert]);
-  // Hold awake through sidecar work; break sleep; otherwise use the nap clock.
+  // Activity overrides naps.
   const holdMode: Hold =
     meetingActive || panel !== null || writingPanel !== null || alert !== "" || state !== "idle"
       ? "awake"
@@ -126,17 +126,17 @@ export default function Pet() {
           : "sleep";
   const hold = useRef(holdMode);
   const naps = useRef<number[]>([]);
-  // Outside the effect so StrictMode remounts stay in sync.
+  // Survive StrictMode remounts.
   const held = useRef(false);
 
-  // Local inactivity (interaction with Mellow only).
+  // Mellow inactivity timer.
   const wake = useCallback(() => {
     naps.current.forEach(clearTimeout);
     setNap("awake");
-    // Always arm: mic follows `nap`, not the visible hold.
+    // Follow nap state.
     const yawnAt = hold.current === "sleep" ? DOZE_AFTER : YAWN_AFTER;
     naps.current = [
-      // Clear on yawn (not wake); skip while held awake.
+      // Clear before sleep.
       setTimeout(() => {
         setNap("yawn");
         if (hold.current !== "awake") clear();
@@ -145,7 +145,7 @@ export default function Pet() {
     ];
   }, [clear]);
 
-  // Wake existing renderer after onboarding (it may already be asleep).
+  // Wake after onboarding.
   useEffect(() => {
     const stop = listen("pet-wake", wake);
     return () => {
@@ -153,20 +153,20 @@ export default function Pet() {
     };
   }, [wake]);
 
-  // Sidecar activity counts as interaction.
+  // Sidecar activity wakes Mellow.
   useEffect(() => {
     wake();
   }, [state, wake]);
 
   useEffect(() => () => naps.current.forEach(clearTimeout), []);
 
-  // Re-arm naps whenever hold mode changes.
+  // Re-arm the nap timer.
   useEffect(() => {
     hold.current = holdMode;
     wake();
   }, [holdMode, wake]);
 
-  // Visible pose; mic still follows `nap`.
+  // Visible nap pose.
   const pose: Nap = holdMode === "awake" ? "awake" : nap;
 
   const dismiss = useCallback(() => {
@@ -174,14 +174,14 @@ export default function Pet() {
     dismissReminder();
   }, [dismissReminder]);
 
-  // Auto-dismiss unanswered alerts.
+  // Auto-dismiss alerts.
   useEffect(() => {
     if (!alert) return;
     const timeout = setTimeout(dismiss, ALERT_CAP);
     return () => clearTimeout(timeout);
   }, [alert, dismiss]);
 
-  // Spoken timer request: start and open the panel.
+  // Handle spoken timers.
   useEffect(() => {
     if (!asked) return;
     if (asked.action === "stop") {
@@ -192,7 +192,7 @@ export default function Pet() {
     setPanel("pomodoro");
   }, [asked]);
 
-  // Native menu opens panels (pet window is click-through).
+  // Open native-menu panels.
   useEffect(() => {
     const stop = listen<string>("open-panel", ({ payload }) => {
       setPanel(payload === "meeting" ? "meeting" : payload === "reminders" ? "reminders" : "pomodoro");
@@ -207,10 +207,9 @@ export default function Pet() {
     wake,
     pose === "sleeping",
   );
-  // Quiet edge from the motion hook.
+  // Quiet edge state.
   const { quiet, setQuiet, toggleQuiet } = motion;
-  // Hand off to the settings window: drop the panel and stop eating clicks
-  // first, or the new window opens under a full-screen overlay that has them.
+  // Release the overlay before Settings.
   const viewMeetings = useCallback(
     (id: string | null) => {
       setDismissedMeetingId(id);
@@ -221,8 +220,7 @@ export default function Pet() {
     [motion],
   );
 
-  // Settings can also be opened from the tray with a panel still up; the shell
-  // drops click-through for us, so mirror it or the pet never re-arms.
+  // Mirror tray releases.
   useEffect(() => {
     const stop = listen("pet-released", () => {
       setPanel(null);
@@ -236,14 +234,14 @@ export default function Pet() {
     if (meetingActive || panel === "meeting") setQuiet(null);
     if (meetingActive) { held.current = false; clear(); }
   }, [meetingActive, panel, setQuiet, clear]);
-  // Pointing: words ride the bone; skip if quiet or asleep.
+  // Disable pointing while hidden.
   const pointing = point !== null && !quiet && pose === "awake";
-  // Wait for native bone arrival before showing dialogue.
+  // Wait for bone arrival.
   const [landed, setLanded] = useState(false);
-  // Remember a pointing turn after the bone clears.
+  // Track the pointing turn.
   const pointed = useRef(false);
-  // Audio completion, not elapsed time, dismisses spoken pointing turns.
-  const spokeWhilePointing = useRef(false);
+  // Dismiss after playback.
+  const spokeThisTurn = useRef(false);
   const guideRevision = useRef(0);
   const dialogueRevision = useRef(0);
 
@@ -256,7 +254,7 @@ export default function Pet() {
     };
   }, []);
 
-  // Clear native guide state on unmount.
+  // Clear the guide on unmount.
   useEffect(() => () => {
     dialogueRevision.current += 1;
     localStorage.removeItem(GUIDE_DIALOGUE_KEY);
@@ -288,7 +286,7 @@ export default function Pet() {
       })
       .catch((error) => {
         console.error("[mellow] guide target failed:", error);
-        // Show dialogue even if native guide failed.
+        // Fall back to dialogue.
         if (revision === guideRevision.current) setLanded(true);
       });
   }, [point]);
@@ -299,17 +297,17 @@ export default function Pet() {
     );
   }, [quiet]);
 
-  // Reset pointed flag when a new turn starts.
+  // Track turn playback.
   useEffect(() => {
     if (state === "listening" || state === "thinking") {
       pointed.current = false;
-      spokeWhilePointing.current = false;
-    } else if (state === "talking" && pointed.current) {
-      spokeWhilePointing.current = true;
+      spokeThisTurn.current = false;
+    } else if (state === "talking") {
+      spokeThisTurn.current = true;
     }
-  }, [state, point]);
+  }, [state]);
 
-  // Queue firings while quiet (both channels, not combined alert).
+  // Queue alerts while quiet.
   useEffect(() => {
     if (!quiet || (!fired && !reminder)) return;
     setWaiting((queue) => [...queue, fired, reminder].filter(Boolean));
@@ -317,7 +315,7 @@ export default function Pet() {
     dismissReminder();
   }, [quiet, fired, reminder, dismissReminder]);
 
-  // Close panels when going quiet.
+  // Close panels when quiet.
   useEffect(() => {
     if (quiet) setPanel(null);
   }, [quiet]);
@@ -328,21 +326,21 @@ export default function Pet() {
     setWaiting((queue) => queue.slice(1));
   }, [quiet, alert, waiting]);
 
-  // React to the Rust-registered PTT hotkey.
+  // Handle the PTT hotkey.
   useEffect(() => {
     const stop = listen<boolean>("ptt", ({ payload: down }) => {
       if (meetingActive) return;
-      // Ignore PTT while mic is warming (and matching releases).
+      // Ignore mic warm-up.
       if (down && microphone === "warming") return;
       if (!down && !held.current) return;
-      // Dedupe Windows key-repeat.
+      // Ignore key-repeat.
       if (down === held.current) return;
       held.current = down;
       if (down) {
-        // Come back from quiet when talking.
+        // Exit quiet mode.
         setQuiet(null);
         wake();
-        // Clear stale bubble on press.
+        // Clear stale dialogue.
         clear();
         send({ type: "ptt_start" });
       } else {
@@ -354,19 +352,19 @@ export default function Pet() {
     };
   }, [send, wake, clear, setQuiet, microphone, meetingActive]);
 
-  // Mic open while awake and not quiet.
+  // Keep the mic ready while awake.
   const listening = !meetingActive && nap !== "sleeping" && !quiet;
   useEffect(() => {
     if (connected) send({ type: "awake", value: listening });
   }, [connected, listening, send]);
 
-  // Native context menu (DOM can't receive clicks on click-through).
+  // Open the native context menu.
   const openMenu = useCallback(
     (event: React.MouseEvent) => {
-      // Suppress WebView2's default menu.
+      // Suppress the WebView menu.
       event.preventDefault();
       wake();
-      // Pass speak/quiet so Rust can label menu items.
+      // Sync menu labels.
       emit("pet-menu", { speak, quiet: quiet !== null, meeting: meetingActive }).catch(() => {});
     },
     [speak, wake, quiet, meetingActive],
@@ -388,7 +386,7 @@ export default function Pet() {
     };
   }, [send, speak]);
 
-  // New chat: clear bubble and tell the sidecar.
+  // Start a new conversation.
   useEffect(() => {
     const stop = listen("new-chat", () => {
       clear();
@@ -399,29 +397,29 @@ export default function Pet() {
     };
   }, [send, clear]);
 
-  // Display priority: alert > error > reply > transcript.
+  // Dialogue priority.
   const said = alert || error || reply || transcript;
 
-  // Auto-clear finished idle exchanges (own timer, not naps).
+  // Clear completed exchanges.
   useEffect(() => {
-    // `idle` arrives only after queued speech has actually finished playing.
+    // Idle follows playback.
     if (state !== "idle" || !said || alert) return;
-    if (pointed.current && spokeWhilePointing.current) {
+    if (spokeThisTurn.current) {
       pointed.current = false;
-      spokeWhilePointing.current = false;
+      spokeThisTurn.current = false;
       clear();
       return;
     }
     const reading = setTimeout(
       () => {
         pointed.current = false;
-        spokeWhilePointing.current = false;
+        spokeThisTurn.current = false;
         clear();
       },
       pointing || pointed.current ? POINT_DISMISS : DISMISS_AFTER,
     );
     return () => clearTimeout(reading);
-    // `point` restarts the clock per walkthrough step.
+    // Points restart the timer.
   }, [state, said, alert, pointing, point, clear]);
 
   const shown = meetingActive ? "writing" :
@@ -442,7 +440,7 @@ export default function Pet() {
   useEffect(() => {
     const revision = ++dialogueRevision.current;
     const update = async () => {
-      // Show native dialogue window before emitting text.
+      // Open dialogue before text.
       const payload: GuideDialogue | null = remoteDialogue && spot
         ? {
             text: said,
@@ -452,7 +450,7 @@ export default function Pet() {
           }
         : null;
       if (payload) {
-        // localStorage backup if the guide WebView reloads.
+        // Back up guide text.
         localStorage.setItem(GUIDE_DIALOGUE_KEY, JSON.stringify(payload));
       } else {
         localStorage.removeItem(GUIDE_DIALOGUE_KEY);
@@ -465,7 +463,7 @@ export default function Pet() {
         side: spot?.side,
         lift: spot?.lift,
       });
-      // Drop stale async dialogue updates.
+      // Drop stale updates.
       if (revision !== dialogueRevision.current) return;
       if (payload) {
         await emitTo("guide-bubble", "guide-dialogue", payload);
@@ -511,6 +509,19 @@ export default function Pet() {
             aria-label="Getting the microphone ready"
           >
             {Array.from({ length: 8 }, (_, dot) => <i key={dot} />)}
+          </div>
+        )}
+        {!meetingActive && connected && state === "listening" && !quiet && pose === "awake" && (
+          <div className="mic-meter" role="status" aria-label="Listening">
+            {MIC_BARS.map((weight, index) => (
+              <i
+                key={index}
+                aria-hidden="true"
+                style={{
+                  transform: `scaleY(${MIC_BAR_REST + micLevel * (weight - MIC_BAR_REST)})`,
+                }}
+              />
+            ))}
           </div>
         )}
         {/* Waiting marker while quiet (not a count). */}
@@ -583,7 +594,7 @@ export default function Pet() {
         )}
         {/* Bubble only when awake, no panel, not pointing. */}
         {!panel && !writingPanel && !quiet && !pointing && pose === "awake" &&
-          // Skip empty listening balloon.
+          // Hide empty dialogue.
           (state === "thinking" || state === "looking" || said) && (
           <div className="bubble">
             {(state === "thinking" || state === "looking") && !said ? (

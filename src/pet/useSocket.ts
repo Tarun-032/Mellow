@@ -12,9 +12,7 @@ type Monitor = { left: number; top: number; width: number; height: number };
 export type WritingStatus = {
   type: "writing";
   id: string;
-  // "sent": pasted into an app that publishes an advisory instead of its own
-  // text, so there was nothing to verify against — distinct from "uncertain",
-  // where the field could be read and the draft was not in it.
+// Insertion was not verified.
   status: "idle" | "thinking" | "inserting" | "inserted" | "sent" | "blocked" | "uncertain";
   text: string;
   message: string;
@@ -25,6 +23,7 @@ type Incoming =
   | WritingStatus
   | { type: "state"; state: PetState }
   | { type: "microphone"; state: MicrophoneState }
+  | { type: "mic_level"; level: number }
   | { type: "transcript"; text: string }
   | { type: "reply_chunk"; text: string }
   | { type: "speak"; value: boolean }
@@ -35,27 +34,28 @@ type Incoming =
   | { type: "pomodoro"; action: "start" | "stop"; minutes?: number | null }
   | { type: "error"; message: string };
 
-/** Bone target as a fraction of the captured monitor. */
+/** Normalized bone target. */
 export type Point = { nx: number; ny: number; label: string; monitor?: Monitor };
 
-/** Talks to the Python sidecar. Retries forever so start order doesn't matter. */
+/** Sidecar connection. */
 export function useSocket() {
   const [connected, setConnected] = useState(false);
   const [state, setState] = useState<PetState>("idle");
-  // Mic may still be warming after the socket connects.
+  // Microphone readiness.
   const [microphone, setMicrophone] = useState<MicrophoneState>("warming");
+  const [micLevel, setMicLevel] = useState(0);
   const [transcript, setTranscript] = useState("");
   const [reply, setReply] = useState("");
-  // Errors are their own state (not folded into reply).
+  // Current error.
   const [error, setError] = useState("");
   const [writing, setWriting] = useState<WritingStatus | null>(null);
-  // speak mirrors the sidecar flag.
+  // Sidecar voice flag.
   const [speak, setSpeak] = useState(true);
-  // Fired reminder from the sidecar clock.
+  // Fired reminder.
   const [reminder, setReminder] = useState("");
-  // Current point target, or null.
+  // Current point target.
   const [point, setPoint] = useState<Point | null>(null);
-  // Spoken pomodoro requests land here (not in Python).
+  // Spoken pomodoro request.
   const [timer, setTimer] = useState<{ action: "start" | "stop"; minutes: number | null; n: number } | null>(null);
   const ws = useRef<WebSocket | null>(null);
 
@@ -80,9 +80,13 @@ export function useSocket() {
             break;
           case "state":
             setState(msg.state);
+            if (msg.state !== "listening") setMicLevel(0);
             break;
           case "microphone":
             setMicrophone(msg.state);
+            break;
+          case "mic_level":
+            setMicLevel(Math.max(0, Math.min(1, msg.level)));
             break;
           case "transcript":
             setTranscript(msg.text);
@@ -101,9 +105,9 @@ export function useSocket() {
             console.log("[mellow] pong:", msg.echo);
             break;
           case "capture":
-            // Hide before screenshot so Mellow isn't in the capture.
+            // Hide before capture.
             if (msg.phase === "begin") {
-              // Turn already owns the cursor's monitor.
+              // Keep the turn monitor.
               void emit("pet-capture", { hidden: true }).then(() => {
                 sock.send(JSON.stringify({ type: "capture_ready" }));
               }).catch((error) => {
@@ -134,7 +138,7 @@ export function useSocket() {
             );
             break;
           case "error":
-            // Devtools trail; sentence also goes on screen.
+            // Log visible errors.
             console.error("[mellow]", msg.message);
             setError(msg.message);
             break;
@@ -146,7 +150,8 @@ export function useSocket() {
         setConnected(false);
         setWriting(null);
         setMicrophone("off");
-        // A disconnected sidecar cannot own a live pointing guide.
+        setMicLevel(0);
+        // Clear disconnected guides.
         setPoint(null);
         if (!disposed) timer = setTimeout(connect, 1000);
       };
@@ -160,7 +165,7 @@ export function useSocket() {
     };
   }, []);
 
-  /** Clear on-screen dialogue (e.g. when nodding off). */
+  /** Clear dialogue. */
   const clear = useCallback(() => {
     setTranscript("");
     setReply("");
@@ -169,10 +174,10 @@ export function useSocket() {
     setPoint(null);
   }, []);
 
-  /** Acknowledge a reminder without wiping the conversation underneath it. */
+  /** Dismiss a reminder. */
   const dismissReminder = useCallback(() => setReminder(""), []);
 
-  // Stable send identity for effect deps.
+  // Stable sender.
   const send = useCallback((msg: object) => {
     const transmit = (payload: object) => {
       if (ws.current?.readyState === WebSocket.OPEN) {
@@ -185,12 +190,12 @@ export function useSocket() {
       return;
     }
 
-    // Snapshot on release; don't wait on model latency.
+    // Lock the turn monitor.
     void invoke<Monitor>("cursor_monitor")
       .then((monitor) => transmit({ ...msg, monitor }))
       .catch((error) => {
         console.error("[mellow] could not lock cursor monitor", error);
-        transmit(msg); // sidecar retains its measured active-monitor fallback
+        transmit(msg); // Use the sidecar fallback.
       });
   }, []);
 
@@ -198,6 +203,7 @@ export function useSocket() {
     connected,
     state,
     microphone,
+    micLevel,
     transcript,
     reply,
     error,

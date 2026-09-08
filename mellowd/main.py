@@ -30,16 +30,21 @@ PORT = 8765
 HISTORY_TURNS = 10
 _transcription_lock = threading.Lock()
 
-# Short, and it names the thing being tested, so a wrong voice is obvious.
+# Voice probe.
 TTS_PROBE = "hi, this is how mellow sounds."
 
-# After app launch the OS refuses this microphone to everyone in the process for a while (a capped
+# Microphone retry timing.
 WARM_RETRY_SECONDS = 2.0
 WARM_SLOW_AFTER = 30
 WARM_SLOW_SECONDS = 10.0
 
 # Reminders are set to the minute
 REMINDER_TICK_SECONDS = 20.0
+
+# Meter tuning.
+METER_INTERVAL = 0.05
+METER_ATTACK = 0.65
+METER_RELEASE = 0.20
 
 
 def set_dpi_aware() -> None:
@@ -59,7 +64,7 @@ def standby() -> bool:
     return not config.load().get("ai_enabled", True)
 
 
-# What the bubble shows when someone talks to a pet that has no brain.
+# Pet-only reply.
 PET_ONLY_LINE = "I'm just the pet right now. Settings can turn my brain back on."
 
 @asynccontextmanager
@@ -68,7 +73,7 @@ async def lifespan(_app: FastAPI):
 
     set_dpi_aware()
     cfg = config.load()
-    # Which interpreter, which model, whose prompt.
+    # Runtime summary.
     log.info(
         "mellowd on %s | llm %s/%s | prompt %s",
         sys.executable,
@@ -77,7 +82,7 @@ async def lifespan(_app: FastAPI):
         "default" if cfg["system_prompt"] == config.DEFAULTS["system_prompt"] else "custom",
     )
 
-    # Retention runs at boot, not on a timer: it rarely deletes anything
+    # Run retention at boot.
     try:
         await asyncio.to_thread(sessions.sweep)
     except Exception:
@@ -92,20 +97,20 @@ async def lifespan(_app: FastAPI):
 
 async def warm_models() -> None:
     """Warm the speech engines at boot."""
-    # First run, or just the pet: neither download may fire.
+    # Skip pet-only mode.
     if standby():
         log.info("no brain configured; skipping model warm-up")
         return
     cfg = config.load()
-    # Only what actually runs here. A cloud engine has nothing to load
+    # Warm local engines only.
     for name, loader in (("stt", stt.load), ("tts", tts.load)):
         if cfg[name]["mode"] != "local":
             continue
         try:
-            # By keyword, because the two loaders do not have the same shape
+            # Loader signatures differ.
             await asyncio.to_thread(loader, progress=_progress_cb(name))
         except Exception:
-            # Not fatal. Both retry their load on first use and report properly
+            # First use retries.
             log.exception("%s warm-up failed", name)
 
 
@@ -127,7 +132,7 @@ app.add_middleware(
 
 @app.get("/health")
 async def health():
-    # The shell checks all four fields before trusting an existing listener on Mellow's fixed
+    # Shell identity fields.
     return {
         "ok": True,
         "service": SERVICE,
@@ -140,9 +145,9 @@ def _merge_section(name: str, current: dict, submitted: dict) -> dict:
     """Merge one capability's form without leaking its key to a different host."""
     merged = {**current, **submitted}
     merged.pop("has_api_key", None)
-    # Agent mode speaks no HTTP transport, so "same place" has no meaning here
+    # Agent mode has no HTTP destination.
     if merged.get("mode") == "agent" or current.get("mode") == "agent":
-        # Blank still means "keep the saved one" here
+        # Keep a saved key when blank.
         if not str(merged.get("api_key") or "").strip():
             merged["api_key"] = current["api_key"]
         return merged
@@ -157,7 +162,7 @@ def _merge_section(name: str, current: dict, submitted: dict) -> dict:
             and config.normalize_base_url(str(base)) == current["base_url"]
         )
     except ValueError:
-        same_destination = False  # unparseable is not "the same place"
+        same_destination = False  # Invalid destinations never match.
     merged["api_key"] = current["api_key"] if same_destination else ""
     return merged
 
@@ -203,10 +208,10 @@ async def get_config():
         "presets": config.PRESETS,
         "stt_models": config.STT_MODELS,
         "tts_voices": config.KOKORO_VOICES,
-        # Served rather than hardcoded in the form, so the two can't drift.
+        # Keep the form in sync.
         "reasoning_efforts": list(config.REASONING_EFFORTS),
         "vision_modes": list(config.VISION_MODES),
-        # The shipped prompt
+        # Default prompt.
         "default_prompt": config.DEFAULTS["system_prompt"],
     }
 
@@ -218,7 +223,7 @@ async def put_config(body: dict):
         cfg = _candidate(body)
         section = cfg["llm"]
         if section.get("mode") == "agent":
-            # A saved engine is a promise about what will run.
+            # Validate the saved engine.
             await asyncio.to_thread(
                 agents.require_exact_model,
                 str(section.get("provider", "")),
@@ -246,7 +251,7 @@ async def put_config(body: dict):
 async def test_config(body: dict):
     try:
         cfg = _candidate(body)
-        # Agent probes cover installation and sign-in failures.
+        # Probe agent setup.
         probe = agents.test if cfg["llm"]["mode"] == "agent" else llm.test
         answer = await asyncio.wait_for(probe(cfg), 30.0)
     except (TypeError, ValueError, json.JSONDecodeError) as e:
@@ -284,7 +289,7 @@ async def agent_login(body: dict):
             detail=f"{config.AGENT_PRESETS[agent_id]['label']} is not installed",
         )
     try:
-        # Do this before the capability probe
+        # Validate the model first.
         await asyncio.to_thread(agents.require_exact_model, agent_id, model)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
@@ -329,7 +334,7 @@ async def test_stt(body: dict):
     if meetings.manager.active:
         raise HTTPException(409, "Stop the meeting before testing speech input.")
     try:
-        # The whole stt section, key included
+        # Include the STT key.
         cfg = _candidate({"stt": body.get("stt", {})})
         recorder = stt.Recorder(cfg)
         recorder.start()
@@ -337,7 +342,7 @@ async def test_stt(body: dict):
             await asyncio.sleep(5)
         finally:
             audio = recorder.stop()
-            # This recorder is a throwaway
+            # Release the test recorder.
             recorder.close()
         transcript = await asyncio.to_thread(stt.transcribe, audio, cfg)
     except (TypeError, ValueError) as e:
@@ -359,7 +364,7 @@ async def tts_voices(body: dict):
     """List the ElevenLabs account's voices, from the form rather than the file."""
     section = body.get("tts") or {}
     try:
-        # ElevenLabs validation needs a temporary voice before listing voices.
+        # Supply a temporary voice.
         cfg = _candidate({"tts": {**section, "voice": section.get("voice") or "-"}})
         found = await asyncio.to_thread(tts.voices, cfg)
     except (TypeError, ValueError) as e:
@@ -393,7 +398,7 @@ async def test_tts(body: dict):
     }
 
 
-# - Model downloads (step 8) The wizard's download screen polls this twice a second.
+# Model download progress.
 
 _download_progress: dict[str, dict] = {
     "stt": {"state": "idle", "name": "", "done": 0, "total": 0, "error": "", "base": 0},
@@ -434,7 +439,7 @@ async def _run_download(which: str, cfg: dict) -> None:
         s["state"] = "done"
         log.info("%s model ready", which)
     except Exception as e:
-        # A sentence, not a traceback: this goes in the wizard's failed state.
+        # Show a readable error.
         s["state"] = "failed"
         s["error"] = errors.message(e)
         log.warning("%s download failed: %s", which, e)
@@ -447,7 +452,7 @@ async def start_model_download(body: dict):
     if which not in _download_progress:
         raise HTTPException(status_code=400, detail="which must be 'stt' or 'tts'")
     try:
-        # First-run downloads deliberately happen before config.json exists.
+        # First-run has no config yet.
         cfg = _candidate(body.get("settings", {}))
     except (TypeError, ValueError, json.JSONDecodeError) as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
@@ -531,20 +536,21 @@ class Session:
     recorder: stt.Recorder = field(default_factory=stt.Recorder)
     speaker: tts.Speaker = None
     history: list[dict] = field(default_factory=list)
-    # (provider, base_url, model) — see answer(). All three
+    # Active model destination.
     destination: tuple[str, str, str] | None = None
-    # The in-flight turn. Held as a task so the message loop can keep reading while the pet talks
+    # In-flight turn.
     turn: asyncio.Task | None = None
     awake: bool = False
     warmup: asyncio.Task | None = None
-    # The shell uses this to gate push-to-talk during Windows' brief startup refusal.
+    meter: asyncio.Task | None = None
+    # Push-to-talk readiness.
     mic_ready: bool = False
-    # Cleared on disconnect so the reminder tick stops at its next wake-up
+    # Connection lifetime.
     alive: bool = True
     reminders: asyncio.Task | None = None
-    # Set when the shell confirms Mellow's windows are out of the frame.
+    # Capture visibility signal.
     hidden: asyncio.Event = field(default_factory=asyncio.Event)
-    # Physical monitor containing the cursor when this turn was submitted.
+    # Turn monitor.
     turn_monitor: dict | None = None
     writer: writing.Writer = field(default_factory=writing.Writer)
 
@@ -556,7 +562,7 @@ class Session:
         if meetings.manager.active:
             return
         self.awake = True
-        # A pet with no brain never touches the microphone: first run
+        # Pet-only mode skips the mic.
         if standby():
             self.mic_ready = False
             asyncio.create_task(self._send_mic("off"))
@@ -579,13 +585,41 @@ class Session:
         else:
             await self._send_mic("off")
 
+    def start_meter(self) -> None:
+        """Publish smoothed local microphone levels while push-to-talk is held."""
+        if self.meter is None or self.meter.done():
+            self.meter = asyncio.create_task(self._meter_levels())
+
+    async def _meter_levels(self) -> None:
+        shown = 0.0
+        try:
+            while self.alive and self.recorder.active:
+                current = self.recorder.live_level
+                strength = METER_ATTACK if current > shown else METER_RELEASE
+                shown += (current - shown) * strength
+                await send(self.ws, type="mic_level", level=round(shown, 3))
+                await asyncio.sleep(METER_INTERVAL)
+        except (WebSocketDisconnect, RuntimeError):
+            return
+
+    async def stop_meter(self) -> None:
+        task, self.meter = getattr(self, "meter", None), None
+        if task is None:
+            return
+        if not task.done():
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+        with suppress(WebSocketDisconnect, RuntimeError):
+            await send(self.ws, type="mic_level", level=0.0)
+
     def _warm_open(self) -> bool:
-        # Runs in a thread. Never raises and logs one warning total
+        # Runs in a worker thread.
         started = time.monotonic()
         probes = 0
         refreshed = False
         while self.awake:
-            # The config can change while the keeper probes (setup finished
+            # Recheck config while probing.
             if standby() or meetings.manager.active:
                 return False
             try:
@@ -593,17 +627,17 @@ class Session:
             except Exception as e:
                 probes += 1
                 if probes == 1:
-                    # Expected, and documented at WARM_RETRY_SECONDS
+                    # Expected startup delay.
                     log.info(
                         "microphone busy at startup (%s) — retrying quietly", e
                     )
                 elif probes == WARM_SLOW_AFTER:
-                    # Past the window it is no longer a warm-up
+                    # Report prolonged failure.
                     log.warning(
                         "microphone still refusing after %d tries (%s)", probes, e
                     )
                 if probes >= 2 and not refreshed and stt.refresh_devices():
-                    # Once: if this process's device cache was poisoned by initialising mid-churn
+                    # Refresh a stale device cache once.
                     refreshed = True
                     log.info("refreshed portaudio device list")
                     continue
@@ -612,7 +646,7 @@ class Session:
                 )
                 continue
             if not self.awake:
-                # Napped while the open was in flight
+                # Close after a mid-open nap.
                 self.recorder.close()
             elif probes:
                 log.info("microphone ready after %.1fs", time.monotonic() - started)
@@ -625,7 +659,7 @@ class Session:
             self.reminders = asyncio.create_task(self._tick_reminders())
 
     async def _tick_reminders(self) -> None:
-        # Its own error handling, because a create_task runs outside the message loop's guard
+        # Background tasks handle errors.
         while self.alive:
             await asyncio.sleep(REMINDER_TICK_SECONDS)
             if not self.alive:
@@ -635,19 +669,20 @@ class Session:
                 fired, keep = remind.due(items, datetime.now())
                 if not fired:
                     continue
-                # Persisted before sending: if this frame never lands
+                # Persist before sending.
                 await asyncio.to_thread(remind.save, keep)
                 for item in fired:
                     log.info("reminder fired: %s", item["text"])
                     await send(self.ws, type="remind", text=item["text"], id=item["id"])
             except (WebSocketDisconnect, RuntimeError):
-                return  # the socket went away; the disconnect handler owns cleanup
+                return  # Disconnect cleanup owns this.
             except Exception:
                 log.exception("reminder tick failed")
 
     async def abort(self) -> None:
         """Stop whatever the pet is doing, right now."""
         self.writer.cancel()
+        await self.stop_meter()
         if self.turn and not self.turn.done():
             self.turn.cancel()
             with suppress(asyncio.CancelledError):
@@ -656,7 +691,7 @@ class Session:
         await self.speaker.stop()
 
 
-# Every live shell has its own in-memory model history.
+# Per-shell histories.
 _active_sessions: dict[int, Session] = {}
 _engine_revision = 0
 
@@ -714,7 +749,7 @@ def _said(cfg: dict, reply: str, aborted: bool) -> dict:
         "text": reply,
         "model": cfg["llm"]["model"],
         "provider": cfg["llm"]["provider"],
-        # Which endpoint actually answered
+        # Answering endpoint.
         "base_url": cfg["llm"]["base_url"],
         "aborted": aborted,
     }
@@ -726,11 +761,11 @@ class Shot(NamedTuple):
     data: bytes
     width: int
     height: int
-    # The unshrunk frame, for point.find's OCR tier. Never sent anywhere.
+    # Full frame for local OCR.
     pixels: object
-    # The physical desktop monitor these pixels came from.
+    # Source monitor.
     monitor: dict
-    # Top-level application underneath Mellow on that monitor.
+    # Source window.
     hwnd: int
 
 
@@ -747,7 +782,7 @@ def _shot(
     return shot, app, title
 
 
-# How long to wait for the shell to take Mellow out of the frame.
+# Capture-hide timeout.
 HIDE_TIMEOUT = 0.4
 
 
@@ -760,47 +795,47 @@ async def _unseen_shot(
     try:
         await asyncio.wait_for(session.hidden.wait(), HIDE_TIMEOUT)
     except asyncio.TimeoutError:
-        # Degraded, not broken: the shot still happens, Mellow is just in it.
+        # Capture despite a hide timeout.
         log.warning("shell did not confirm the hide in %.1fs, capturing anyway", HIDE_TIMEOUT)
     try:
         return await asyncio.to_thread(
             _shot, max_edge, getattr(session, "turn_monitor", None)
         )
     finally:
-        # Always, including on barge-in. Shielded because a cancelled task raises at its next await
+        # Always restore Mellow.
         with suppress(Exception, asyncio.CancelledError):
             await asyncio.shield(send(session.ws, type="capture", phase="end"))
 
 
-# How much of a pass to inspect before committing it to the bubble and the voice.
+# Marker scan window.
 LOOK_SCAN = 64
 
-# The marker as a standalone token: bracketed
+# Screen marker.
 _LOOK_TOKEN = re.compile(re.escape(llm.LOOK) + r"(?![0-9A-Za-z])", re.IGNORECASE)
 
-# The other marker. [POINT:7] picking a row off the list
+# Point marker.
 _POINT_TOKEN = re.compile(
     re.escape(llm.POINT) + r"\s*([^\]\n]{0,60}?)\s*\]",
     re.IGNORECASE,
 )
 
-# Longest a held-back tail may grow before it is released as ordinary text.
+# Marker tail limit.
 POINT_HOLD = 120
 
-# Which row of point.candidates() to fly to: a 1-based index
+# One-based target row.
 Pick = int | str
 
-# [POINT:none] as a value
+# Point veto.
 NONE = "none"
 
 
-# The third marker. [DO:7] or [DO:7|back in black]
+# Action marker.
 _DO_TOKEN = re.compile(
     re.escape(llm.DO) + r"\s*([^\]\n]{0,160}?)\s*\]",
     re.IGNORECASE,
 )
 
-# What to do and what to do it to: a row of act.catalog
+# Action and argument.
 Deed = tuple[int | str, str]
 
 
@@ -815,11 +850,11 @@ def _split_point(text: str, token=None) -> tuple[str, str, Pick | Deed | None]:
         body, _, argument = body.partition("|")
         body, argument = body.strip(), argument.strip()
         if body.lower() == NONE or not body:
-            point = NONE  # it would not help, and it said so
+            point = NONE  # Explicit veto.
         elif body.isdigit():
             point = int(body)
         else:
-            # A label rather than a number.
+            # Label target.
             point = body
         if doing and point is not NONE:
             point = (point, argument)
@@ -847,13 +882,13 @@ async def _pass(
     held = ""
     settled = not look
     reply = ""
-    # The tail of the stream, held back only while it could still be growing a [POINT:...].
+    # Hold a possible point marker.
     tail = ""
     point: Pick | None = None
 
     async def emit(text: str, final: bool = False) -> None:
         nonlocal reply, tail, point
-        # The marker is machinery, never something to read.
+        # Hide internal markers.
         text = _LOOK_TOKEN.sub("", text)
         if not text and not final:
             return
@@ -863,7 +898,7 @@ async def _pass(
             if on_point is not None:
                 await on_point(found)
         if final and tail:
-            # The stream is over, so nothing is still arriving to close that bracket.
+            # Flush an unfinished tail.
             text, tail = text + tail, ""
         if not text:
             return
@@ -880,13 +915,13 @@ async def _pass(
         if not _LOOK_TOKEN.search(text):
             return text, False
         if look == "ask":
-            # Whatever sits around it is throat-clearing before a question the model cannot answer yet
+            # Drop pre-capture filler.
             return "", True
-        # Phase 2 already has the screenshot, so the marker is noise here
+        # Strip phase-two markers.
         return _LOOK_TOKEN.sub("", text), False
 
     try:
-        # One of two brains: an agent CLI streams the same shape llm.chat yields
+        # Both engines share a stream shape.
         stream = (
             agents.chat(session.history, cfg, image=image)
             if cfg.get("llm", {}).get("mode") == "agent"
@@ -899,16 +934,16 @@ async def _pass(
                 if asked:
                     return "", True, None
                 if token is _DO_TOKEN and _declined(held):
-                    # It read the catalog and said none of it was the point.
+                    # Respect an action veto.
                     return "", False, NONE
-                # Hold the whole window, not just until a bracket shows up
+                # Hold the scan window.
                 if not (token or _POINT_TOKEN).search(held) and len(held.lstrip()) < LOOK_SCAN:
                     continue
                 settled = True
                 chunk, held = text, ""
             await emit(chunk)
     except asyncio.CancelledError:
-        # Barge-in inside the scan window. The words never reached the bubble or the voice
+        # Preserve cancelled text.
         if held and partial is not None:
             text, asked = resolve(held)
             if not asked:
@@ -916,7 +951,7 @@ async def _pass(
         raise
 
     if not settled and held:
-        # The stream ended inside the scan window. What is left is the whole answer
+        # Flush a short answer.
         text, asked = resolve(held)
         if asked:
             return "", True, None
@@ -1003,7 +1038,7 @@ def _chosen(deed, things: list[act.Thing]) -> tuple[act.Thing | None, str]:
     which, argument = deed
     if isinstance(which, int):
         return (things[which - 1] if 1 <= which <= len(things) else None), argument
-    # It answered with words. Matched against the rows it was shown and nothing else
+    # Match labels to offered rows.
     wanted = point.terms(which)
     best = None
     for thing in things:
@@ -1019,7 +1054,7 @@ def _picked(pick: Pick | None, cands: list[point.Target]) -> point.Target | None
         return None
     if isinstance(pick, int):
         return cands[pick - 1] if 1 <= pick <= len(cands) else None
-    # It answered with words instead of a number.
+    # Match a label.
     wanted = point.terms(pick)
     best = None
     for cand in cands:
@@ -1043,7 +1078,7 @@ async def _act(
 ) -> tuple[str, bool]:
     """Try to do what they asked."""
     things = await asyncio.to_thread(act.catalog, prompt)
-    # An exact name beats the fuzzy score, so ask before the threshold throws it out.
+    # Exact names beat fuzzy scores.
     if not things or (things[0].score < act.THRESHOLD and not act.direct(prompt, things)):
         log.info("act: nothing on this machine matches %r", prompt)
         return "", False
@@ -1056,14 +1091,14 @@ async def _act(
             log.info("act: %s", said)
             done.append(said)
             if thing.kind in act.ON_SCREEN:
-                # The pomodoro lives in the frontend on purpose
+                # Pomodoro runs in the frontend.
                 await send(
                     session.ws,
                     type="pomodoro",
                     action="stop" if thing.kind.endswith("stop") else "start",
                     minutes=act.minutes(argument),
                 )
-            # `what`, not `kind`: sessions.record's own first parameter is called kind
+            # Avoid the reserved `kind` argument.
             await asyncio.to_thread(
                 sessions.record,
                 "acted",
@@ -1072,7 +1107,7 @@ async def _act(
                 detail=argument,
             )
         except Exception:
-            # All of it inside the try now.
+            # Keep failures contained.
             log.exception("act: %s failed", thing.label)
 
     async def fire(deed) -> None:
@@ -1082,7 +1117,7 @@ async def _act(
                 argument = act.media_argument(prompt, argument) or argument
             await execute(thing, argument)
 
-    # Exact folders/sites/apps and explicit play requests do not need semantic arbitration.
+    # Run exact requests directly.
     immediate = act.direct(prompt, things)
     if immediate is not None:
         thing, argument = immediate
@@ -1099,7 +1134,7 @@ async def _act(
         session,
         _act_cfg(cfg, things),
         speak,
-        # No screenshot anywhere in here. Opening an app is not a question about what is on screen
+        # Actions need no screenshot.
         look="pick",
         partial=partial,
         on_point=fire,
@@ -1115,11 +1150,11 @@ async def answer(session: Session, prompt: str) -> None:
         await send(ws, type="state", state="idle")
         return
 
-    # Whatever the last turn pointed at, it is not what this one is about. The clear lives here
+    # Clear the previous point.
     await _hide_point(session)
 
     cfg = config.load()
-    # The model belongs in here
+    # Active model.
     destination = (
         cfg["llm"]["provider"],
         cfg["llm"]["base_url"],
@@ -1133,24 +1168,24 @@ async def answer(session: Session, prompt: str) -> None:
         session.speaker.begin()
 
     session.history.append({"role": "user", "content": prompt})
-    # Off the loop, like every other blocking write.
+    # Keep disk I/O off-loop.
     await asyncio.to_thread(sessions.record, "user_said", text=prompt)
     reply = ""
-    # What was actually said before a cancellation, across both passes
+    # Preserve partial output.
     partial = {"text": ""}
-    # Ollama can say outright whether a local model takes images
+    # Probe local vision.
     await asyncio.to_thread(llm.probe_vision, cfg["llm"])
-    # Same trip out to Ollama, different question
+    # Check model fit.
     await asyncio.to_thread(llm.check_fit, cfg["llm"])
     sighted = llm.vision_ok(cfg["llm"])
-    # Decided here, before the model gets a say
+    # Route screen requests.
     pointing = sighted and capture.wants_pointing(prompt)
     asked = sighted and (capture.wants_screen(prompt) or pointing)
-    # Which row of the on-screen list the bone ended up on, if any.
+    # Selected target.
     aimed: point.Target | None = None
-    # Agent mode returns this beside the selection
+    # Agent-grounded answer.
     grounded_answer = ""
-    # Step 15a. Cloud and agent brains only, and that is a measured limit rather than caution
+    # Actions require cloud or agent mode.
     doing = cfg["llm"]["mode"] in ("cloud", "agent") and capture.wants_action(prompt)
     try:
         if doing:
@@ -1170,14 +1205,14 @@ async def answer(session: Session, prompt: str) -> None:
                 session,
                 cfg,
                 speak,
-                # Vision off means the marker rule was never sent
+                # Vision-off has no marker.
                 look="ask" if sighted else "",
                 partial=partial,
             )
         if asked:
-            # The pet needs something honest to do while the second round trip runs
+            # Show screen processing.
             await send(ws, type="state", state="looking")
-            # A pointing turn gets the smaller frame: it is choosing off a list
+            # Pointing uses a smaller frame.
             shot, app, title = await _unseen_shot(
                 session, capture.POINT_EDGE if pointing else capture.MAX_EDGE
             )
@@ -1202,7 +1237,7 @@ async def answer(session: Session, prompt: str) -> None:
                         shot.hwnd,
                     )
 
-                    # Semantic vision chooses a region, then an exact measured hitbox or a fine-grid cell.
+                    # Resolve a measured target.
                     if cfg["llm"]["mode"] == "agent":
                         grounded = await locator.locate_and_answer(
                             prompt, shot, cfg, cands, session.history
@@ -1277,15 +1312,15 @@ async def answer(session: Session, prompt: str) -> None:
                         partial=partial,
                     )
             else:
-                # No picture this turn, so no pretending
+                # Report capture failure.
                 blind = {**cfg, "llm": {**cfg["llm"], "screen": "failed"}}
                 reply, _, _ = await _pass(session, blind, speak, partial=partial)
     except asyncio.CancelledError:
-        # Barge-in. What Mellow managed to say is still what happened
+        # Preserve interrupted speech.
         text = partial["text"] or reply
         if text.strip():
             await asyncio.to_thread(sessions.record, "assistant_said", **_said(cfg, text, True))
-        # Shielded for the same reason the capture-end send is: a cancelled task raises at its next await
+        # Clear the point despite cancellation.
         with suppress(Exception, asyncio.CancelledError):
             await asyncio.shield(_hide_point(session))
         raise
@@ -1297,10 +1332,10 @@ async def answer(session: Session, prompt: str) -> None:
     del session.history[: max(0, len(session.history) - HISTORY_TURNS * 2)]
 
     if speak:
-        # Blocks until the audio genuinely stops
+        # Wait for playback.
         await session.speaker.finish()
 
-    # The bone is left where it is. The frontend retires it after ten quiet seconds
+    # The frontend retires the bone.
     await send(ws, type="state", state="idle")
 
 
@@ -1316,11 +1351,11 @@ async def run_turn(session: Session, prompt: str) -> None:
         raise
     except Exception as e:
         log.exception("turn failed")
-        # A log that shows the question and then nothing is worse than one that says the turn died
+        # Record failed turns.
         await asyncio.to_thread(
             sessions.record, "turn_failed", reason=errors.message(e)
         )
-        # A turn that died mid-point must not leave the bone standing there pointing at something nobody
+        # Clear failed points.
         with suppress(Exception):
             await _hide_point(session)
         await session.speaker.stop()
@@ -1329,7 +1364,7 @@ async def run_turn(session: Session, prompt: str) -> None:
 
 
 def _transcribe_voice(audio, cancelled):
-    # A cancelled to_thread call can still be running the local model.
+    # Serialize local transcription.
     with _transcription_lock:
         return "" if cancelled.is_set() else stt.transcribe(audio)
 
@@ -1344,7 +1379,9 @@ async def _voice_turn(session: Session, audio) -> None:
             text_shown = "that was too quiet — say it again"
         else:
             text_shown = text or "…didn't catch that"
-        await send(session.ws, type="transcript", text=text_shown)
+        # Show only recognition failures.
+        if not text:
+            await send(session.ws, type="transcript", text=text_shown)
         await run_turn(session, text)
     except asyncio.CancelledError:
         raise
@@ -1357,9 +1394,7 @@ async def _writing_start(session: Session) -> None:
     session.writer.begin()
     await writing.status(session, send, "idle")
     if config.load().get("writing_enabled"):
-        # Started, not awaited: Chrome can take a second or more to publish a
-        # page's accessibility tree, and `ptt_end` must not queue behind that.
-        # writing.where() collects it once speech recognition has finished.
+        # Resolve the writing target.
         session.writer.finding = asyncio.create_task(
             asyncio.to_thread(writing.desktop.resolve, writing.FIND_SECONDS)
         )
@@ -1376,11 +1411,11 @@ async def handle(session: Session, msg: dict) -> None:
         await send(ws, type="pong", echo=msg.get("text", ""))
 
     elif kind == "capture_ready":
-        # The shell has taken Mellow's windows out of the frame
+        # Capture is ready.
         session.hidden.set()
 
     elif kind == "awake":
-        # Waking starts the keeper (see WARM_RETRY_SECONDS)
+        # Wake the mic keeper.
         if msg.get("value"):
             session.wake_mic()
         else:
@@ -1398,33 +1433,35 @@ async def handle(session: Session, msg: dict) -> None:
         await send(ws, type="speak", value=cfg["tts"]["speak"])
 
     elif kind == "ptt_start":
-        # Barge-in: talking over the user is the worst failure mode a pet has.
+        # Stop current speech first.
         await session.abort()
         session.turn_monitor = None
-        # A pet with no brain cannot listen: the recorder never opens
+        # Pet-only mode cannot listen.
         if standby():
             await send(ws, type="reply_chunk", text=PET_ONLY_LINE)
             await send(ws, type="state", state="idle")
             return
-        # The normal frontend prevents this press
+        # Reject early presses.
         if not session.mic_ready:
             await session._send_mic("warming")
             return
-        # Off the loop: the first press after a wake does the full device open now
+        # Open the mic off-loop.
         await asyncio.to_thread(session.recorder.start)
         await send(ws, type="state", state="listening")
+        session.start_meter()
         await _writing_start(session)
 
     elif kind == "ptt_end":
-        # A release can race a press rejected during warm-up (or arrive from an older renderer).
+        # Ignore unmatched releases.
         if not session.recorder.active:
             return
         session.turn_monitor = capture.known_monitor(msg.get("monitor"))
         if msg.get("monitor") is not None and session.turn_monitor is None:
             log.warning("ignored an invalid cursor monitor on ptt_end")
         audio = session.recorder.stop()
+        await session.stop_meter()
         await send(ws, type="state", state="thinking")
-        # Keep cancellation responsive during speech recognition too.
+        # Keep transcription cancellable.
         session.turn = asyncio.create_task(_voice_turn(session, audio))
 
     elif kind == "text":
@@ -1432,7 +1469,7 @@ async def handle(session: Session, msg: dict) -> None:
         session.turn_monitor = capture.known_monitor(msg.get("monitor"))
         if msg.get("monitor") is not None and session.turn_monitor is None:
             log.warning("ignored an invalid cursor monitor on text submission")
-        # Same answer as the hotkey: no brain, one polite line, no turn.
+        # Match pet-only hotkey behavior.
         if standby():
             await send(ws, type="reply_chunk", text=PET_ONLY_LINE)
             await send(ws, type="state", state="idle")
@@ -1460,7 +1497,7 @@ async def handle(session: Session, msg: dict) -> None:
             await send(ws, type="state", state="idle")
 
     elif kind == "new_conversation":
-        # Both halves, or neither is worth doing
+        # Reset both histories.
         await session.abort()
         session.history.clear()
         session.destination = None
@@ -1483,24 +1520,24 @@ async def ws_endpoint(ws: WebSocket):
     log.info("shell connected")
     try:
         await send(ws, type="state", state="idle")
-        # The shell labels its menu "Mute" or "Unmute" from this, so it has to know before the user
+        # Initialize the tray voice state.
         await send(ws, type="speak", value=config.load()["tts"]["speak"])
     except WebSocketDisconnect:
-        # The dev webview connects twice at launch and abandons one instantly
+        # Ignore the abandoned dev socket.
         log.info("shell left during the greeting")
         return
     session = Session(ws)
     connected_revision = _engine_revision
-    # The log already has this conversation
+    # Resume conversation state.
     session.history, session.destination = await asyncio.to_thread(sessions.resume)
-    # A config save can land while resume() is reading from disk.
+    # Reject a stale resume.
     if connected_revision != _engine_revision:
         session.history.clear()
         session.destination = None
     _active_sessions[id(session)] = session
     if session.history:
         log.info("resumed %d message(s) from the open session", len(session.history))
-    # Reminders are not tied to the microphone or to being awake
+    # Reminders stay independent.
     session.watch_reminders()
 
     try:
@@ -1509,7 +1546,7 @@ async def ws_endpoint(ws: WebSocket):
             try:
                 await handle(session, msg)
             except Exception as e:
-                # One guard for every handler
+                # Guard each message.
                 if type(e) is RuntimeError:
                     log.warning("handler %r refused: %s", msg.get("type"), e)
                 else:
@@ -1522,11 +1559,11 @@ async def ws_endpoint(ws: WebSocket):
         log.info("shell disconnected")
     finally:
         _active_sessions.pop(id(session), None)
-        session.awake = False  # a keeper in flight stops at its next probe
+        session.awake = False  # Stop the mic keeper.
         session.mic_ready = False
-        session.alive = False  # and the reminder tick stops at its next wake-up
+        session.alive = False  # Stop reminders.
         session.recorder.close()
-        # Closing the window must kill the audio
+        # Stop audio on close.
         await session.abort()
 
 
