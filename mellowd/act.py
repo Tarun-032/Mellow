@@ -24,9 +24,9 @@ APPS_TTL = 900.0
 # Files are scanned live but not on every keystroke of a conversation.
 FILES_TTL = 60.0
 
-# How deep into Desktop/Downloads/Documents to look
-FILE_DEPTH = 2
-MAX_FILES = 400
+# How deep into the user's own folders to look
+FILE_DEPTH = 3
+MAX_FILES = 1200
 
 # Windows' own names for the folders people ask for by name.
 PLACES = {
@@ -41,23 +41,72 @@ PLACES = {
     "Downloads folder": "shell:Downloads",
 }
 
-# The handful of places people ask for by name rather than by URL.
-SITES = {
-    "Google Drive": "https://drive.google.com",
-    "Gmail": "https://mail.google.com",
-    "Google Calendar": "https://calendar.google.com",
-    "Google Docs": "https://docs.google.com",
-    "YouTube": "https://www.youtube.com",
-    "Stripe dashboard": "https://dashboard.stripe.com",
-    "GitHub": "https://github.com",
-    "WhatsApp Web": "https://web.whatsapp.com",
-    "ChatGPT": "https://chatgpt.com",
-    "Claude": "https://claude.ai",
-    "Google Maps": "https://maps.google.com",
-    "Amazon": "https://www.amazon.in",
-    "Netflix": "https://www.netflix.com",
-    "LinkedIn": "https://www.linkedin.com",
+# Settings pages by name (not the Settings app itself).
+SETTINGS = {
+    "Bluetooth settings": ("ms-settings:bluetooth", ("bluetooth",)),
+    "Wi-Fi settings": ("ms-settings:network-wifi", ("wifi", "wi fi", "wireless")),
+    "Display settings": ("ms-settings:display", ("display", "screen resolution", "monitor settings")),
+    "Sound settings": ("ms-settings:sound", ("sound", "audio settings", "speakers")),
+    "Battery settings": ("ms-settings:batterysaver", ("battery", "battery saver")),
+    "Windows Update": ("ms-settings:windowsupdate", ("updates", "check for updates")),
+    "Installed apps": ("ms-settings:appsfeatures", ("apps and features", "uninstall a program")),
+    "Storage settings": ("ms-settings:storagesense", ("storage", "disk space")),
+    "Default apps": ("ms-settings:defaultapps", ("default apps", "default programs")),
+    "Mouse settings": ("ms-settings:mousetouchpad", ("mouse", "touchpad")),
+    "Printers and scanners": ("ms-settings:printers", ("printers", "scanners", "printer settings")),
+    "Notification settings": ("ms-settings:notifications", ("notifications", "do not disturb")),
+    "Night light settings": ("ms-settings:nightlight", ("night light", "blue light")),
+    "About this PC": ("ms-settings:about", ("about this pc", "system info", "pc specs")),
 }
+
+# Spoken aliases that acronyms won't invent.
+APP_ALIASES = {
+    "Calculator": ("calc",),
+    "Command Prompt": ("cmd", "command line", "terminal"),
+    # Bare "computer": direct() already strips leading my/the.
+    "File Explorer": ("explorer", "windows explorer", "computer", "file manager"),
+    "Task Manager": ("task mgr", "taskmgr", "processes"),
+    "Control Panel": ("control panel",),
+    "Snipping Tool": ("snip", "screenshot tool", "screen clipping"),
+    "Character Map": ("charmap", "special characters"),
+    "System Information": ("sysinfo", "msinfo", "system specs"),
+    "Resource Monitor": ("resmon", "resource usage"),
+    "On-Screen Keyboard": ("osk", "virtual keyboard"),
+    "Visual Studio Code": ("vs code", "vscode", "code editor"),
+    "Windows PowerShell": ("powershell", "posh"),
+    "Windows Terminal": ("terminal", "wt"),
+    "Remote Desktop Connection": ("rdp", "remote desktop"),
+    "Notepad": ("text editor",),
+    "Settings": ("windows settings", "system settings"),
+}
+
+# Named sites and optional in-site search URLs ({} = quoted query).
+SITES = {
+    "Google Drive": ("https://drive.google.com", "https://drive.google.com/drive/search?q={}"),
+    "Gmail": ("https://mail.google.com", "https://mail.google.com/mail/u/0/#search/{}"),
+    "Google Calendar": ("https://calendar.google.com", ""),
+    "Google Docs": ("https://docs.google.com", ""),
+    "YouTube": ("https://www.youtube.com", "https://www.youtube.com/results?search_query={}"),
+    "Stripe dashboard": ("https://dashboard.stripe.com", ""),
+    "GitHub": ("https://github.com", "https://github.com/search?q={}"),
+    "WhatsApp Web": ("https://web.whatsapp.com", ""),
+    "ChatGPT": ("https://chatgpt.com", ""),
+    "Claude": ("https://claude.ai", ""),
+    "Google Maps": ("https://maps.google.com", "https://www.google.com/maps/search/{}"),
+    "Amazon": ("https://www.amazon.in", "https://www.amazon.in/s?k={}"),
+    "Netflix": ("https://www.netflix.com", "https://www.netflix.com/search?q={}"),
+    "LinkedIn": ("https://www.linkedin.com", "https://www.linkedin.com/search/results/all/?keywords={}"),
+    "Wikipedia": ("https://en.wikipedia.org", "https://en.wikipedia.org/w/index.php?search={}"),
+    "Reddit": ("https://www.reddit.com", "https://www.reddit.com/search/?q={}"),
+}
+
+
+# Searchable sites, longest name first ("google maps" before "google").
+SEARCHABLE = sorted(
+    (name for name, (_, template) in SITES.items() if template),
+    key=len,
+    reverse=True,
+)
 
 
 @dataclass
@@ -70,6 +119,8 @@ class Thing:
     # What the free text after the marker means for this row
     wants: str = ""
     score: float = 0.0
+    # Spoken names beyond the Windows label.
+    aliases: tuple[str, ...] = ()
 
 
 # --- what is on this machine ------------------------------------------------
@@ -94,6 +145,25 @@ def _powershell(script: str, budget: float = 15.0) -> str:
 _apps: tuple[float, list[Thing]] = (0.0, [])
 
 
+# Vendor prefixes people usually drop when speaking.
+_VENDORS = ("microsoft ", "google ", "windows ", "adobe ", "nvidia ", "intel ")
+
+
+def app_aliases(label: str) -> tuple[str, ...]:
+    """Hand aliases, acronym (3+ words), and vendor-stripped name."""
+    out = list(APP_ALIASES.get(label, ()))
+    words = [w for w in re.split(r"[^A-Za-z0-9]+", label) if w]
+    # Acronyms only help once there are three words.
+    if len(words) >= 3:
+        out.append("".join(w[0] for w in words).lower())
+    low = label.lower()
+    for vendor in _VENDORS:
+        if low.startswith(vendor) and len(low) > len(vendor) + 2:
+            out.append(low[len(vendor):])
+            break
+    return tuple(dict.fromkeys(out))
+
+
 def apps() -> list[Thing]:
     """Everything on the Start Menu, the way Windows itself lists it."""
     global _apps
@@ -107,28 +177,120 @@ def apps() -> list[Thing]:
     for line in raw.splitlines():
         name, _, app_id = line.strip().partition("|")
         if name and app_id:
-            out.append(Thing(label=name, kind="app", target=app_id))
+            out.append(Thing(label=name, kind="app", target=app_id,
+                             aliases=app_aliases(name)))
     log.info("act: %d apps on the start menu", len(out))
     if out:
         _apps = (time.monotonic(), out)
     return out
 
 
+# DriveTypeW → Explorer-style kind when the volume has no label.
+_DRIVE_KIND = {2: "USB Drive", 3: "Local Disk", 4: "Network Drive", 5: "DVD Drive"}
+
+
+def drives() -> list[Thing]:
+    """Drives as Explorer labels them, e.g. "Local Disk (C:)". Aliases cover
+    spoken forms; `point.terms` drops single letters so C vs D needs `direct`.
+    """
+    out: list[Thing] = []
+    try:
+        import ctypes as C
+        from ctypes import wintypes as W
+
+        kernel = C.WinDLL("kernel32", use_last_error=True)
+        kernel.GetDriveTypeW.argtypes = [W.LPCWSTR]
+        kernel.GetVolumeInformationW.argtypes = [
+            W.LPCWSTR, W.LPWSTR, W.DWORD, C.POINTER(W.DWORD), C.POINTER(W.DWORD),
+            C.POINTER(W.DWORD), W.LPWSTR, W.DWORD,
+        ]
+        mask = kernel.GetLogicalDrives()
+    except Exception:
+        log.exception("act: could not enumerate drives")
+        return out
+    for index in range(26):
+        if not mask & (1 << index):
+            continue
+        letter = chr(ord("A") + index)
+        root = f"{letter}:\\"
+        kind = _DRIVE_KIND.get(kernel.GetDriveTypeW(root), "Drive")
+        name = C.create_unicode_buffer(261)
+        try:
+            # Empty media may error; the letter still exists.
+            kernel.GetVolumeInformationW(root, name, len(name), None, None, None, None, 0)
+        except Exception:
+            pass
+        volume = (name.value or "").strip()
+        aliases = [f"{letter} drive", f"drive {letter}", f"{letter}:", f"{letter}: drive",
+                   f"{kind} {letter}", f"{letter} colon"]
+        if volume:
+            aliases += [volume, f"{volume} drive"]
+        out.append(Thing(label=f"{volume or kind} ({letter}:)", kind="place",
+                         target=root, aliases=tuple(aliases)))
+    return out
+
+
 def places() -> list[Thing]:
     """The folders people ask for by name, plus whatever drives exist."""
     out = [Thing(label=n, kind="place", target=t) for n, t in PLACES.items()]
-    for letter in "CDEFGH":
-        root = f"{letter}:\\"
-        if os.path.isdir(root):
-            out.append(Thing(label=f"{letter}: drive", kind="place", target=root))
+    return out + drives() + settings()
+
+
+def settings() -> list[Thing]:
+    """The pages inside the Settings app, which the app itself cannot offer."""
+    out = []
+    for name, (uri, extra) in SETTINGS.items():
+        # Both "bluetooth" and "bluetooth settings" — direct() is exact.
+        aliases = list(extra)
+        aliases += [f"{a} settings" for a in extra if not a.endswith("settings")]
+        out.append(Thing(label=name, kind="setting", target=uri,
+                         aliases=tuple(dict.fromkeys(aliases))))
     return out
 
 
 def sites() -> list[Thing]:
-    return [Thing(label=n, kind="site", target=u) for n, u in SITES.items()]
+    return [Thing(label=n, kind="site", target=u[0]) for n, u in SITES.items()]
 
 
 _files: tuple[float, list[Thing]] = (0.0, [])
+
+
+# Known-folder GUIDs (not path guesses).
+_KNOWN = {
+    "Desktop": "{B4BFCC3A-DB2C-424C-B029-7FE99A87C641}",
+    "Downloads": "{374DE290-123F-4565-9164-39C4925E467B}",
+    "Documents": "{FDD39AD0-238F-46AF-ADB4-6C85480369C7}",
+    "Pictures": "{33E28130-4E1E-4676-835A-98395C3BC3BB}",
+    "Videos": "{18989B1D-99B5-455B-841C-AB7C74E4DDFC}",
+}
+
+
+def known_folder(name: str) -> str:
+    """Resolve a known folder via Windows; ~/Name fails under OneDrive backup."""
+    try:
+        import ctypes as C
+        from ctypes import wintypes as W
+
+        class _GUID(C.Structure):
+            _fields_ = [("a", W.DWORD), ("b", W.WORD), ("c", W.WORD), ("d", C.c_byte * 8)]
+
+        shell = C.WinDLL("shell32", use_last_error=True)
+        ole = C.WinDLL("ole32", use_last_error=True)
+        guid = _GUID()
+        if C.WinDLL("ole32").IIDFromString(_KNOWN[name], C.byref(guid)) != 0:
+            raise OSError("bad folder id")
+        out = C.c_wchar_p()
+        shell.SHGetKnownFolderPath.argtypes = [
+            C.POINTER(_GUID), W.DWORD, W.HANDLE, C.POINTER(C.c_wchar_p)]
+        if shell.SHGetKnownFolderPath(C.byref(guid), 0, None, C.byref(out)) != 0:
+            raise OSError("no path for " + name)
+        try:
+            return out.value or ""
+        finally:
+            ole.CoTaskMemFree(out)
+    except Exception:
+        log.warning("act: falling back to ~/%s", name)
+        return os.path.join(os.path.expanduser("~"), name)
 
 
 def files() -> list[Thing]:
@@ -137,11 +299,10 @@ def files() -> list[Thing]:
     when, cached = _files
     if cached and time.monotonic() - when < FILES_TTL:
         return cached
-    home = os.path.expanduser("~")
     out: list[Thing] = []
-    for folder in ("Desktop", "Downloads", "Documents"):
-        root = os.path.join(home, folder)
-        if not os.path.isdir(root):
+    for folder in ("Desktop", "Downloads", "Documents", "Pictures", "Videos"):
+        root = known_folder(folder)
+        if not root or not os.path.isdir(root):
             continue
         for here, dirs, names in os.walk(root):
             depth = here[len(root) :].count(os.sep)
@@ -185,6 +346,13 @@ def verbs() -> list[Thing]:
             kind="google",
             target="",
             wants="what to search for",
+        ),
+        Thing(
+            label="Search a website and show the results",
+            kind="site_search",
+            target="",
+            wants="the site, then a colon, then what to search for, like: "
+            "youtube: rust programming. Sites: " + ", ".join(SEARCHABLE),
         ),
         Thing(
             label="Set an app's volume",
@@ -232,7 +400,11 @@ def catalog(query: str) -> list[Thing]:
             # A verb row is about the sentence's verb, never its own label
             row.score = _verb_score(query, row.kind)
         else:
-            row.score = point.score(row.label, wanted)
+            # Best score across label and aliases.
+            row.score = max(
+                [point.score(row.label, wanted)]
+                + [point.score(name, wanted) for name in row.aliases]
+            )
             if row.kind == "file":
                 # A file called file.jpe should not outrank the File Explorer for "open file explorer".
                 row.score *= 0.9
@@ -242,8 +414,28 @@ def catalog(query: str) -> list[Thing]:
 
 _PLAY = re.compile(r"\b(play|put\s+on|listen\s+to)\b", re.IGNORECASE)
 _SPOTIFY = re.compile(r"\bspotify\b", re.IGNORECASE)
-# The bare word google is not a search verb
-_SEARCH = re.compile('\\bsearch\\b|\\blook\\s+up\\b|\\bgoogle\\s+for\\b', re.IGNORECASE)
+# Tight web-search verbs. Lookahead keeps "google drive" from matching.
+_SEARCH = re.compile(
+    r"\bsearch\s+(?:for|up)\b|\blook\s+up\b"
+    r"|\bgoogle\b(?!\s+(?:drive|docs|doc|calendar|maps|photos|meet|keep|sheets|slides))",
+    re.IGNORECASE,
+)
+# Looser search verbs; only used when a searchable site is also named.
+_SITE_VERB = re.compile(
+    r"\bsearch\b|\blook\s+up\b|\bfind\s+me\b|\bgoogle\b"
+    r"|\bshow\s+me\s+(?:\w+\s+){0,3}?(?:about|for|on)\b",
+    re.IGNORECASE,
+)
+# Which site a search should land on, if the sentence names one.
+_SITE_NAMES = re.compile(
+    r"\b(" + "|".join(re.escape(name) for name in SEARCHABLE) + r")\b", re.IGNORECASE
+)
+# What is being searched for, once the site has been named.
+_SEARCH_TAIL = re.compile(
+    r"\b(?:search(?:\s+(?:for|on|in))?|look\s+up|find(?:\s+me)?"
+    r"|show\s+me(?:\s+\w+){0,3}?\s+(?:about|for|on))\s+(?P<query>.+)$",
+    re.IGNORECASE,
+)
 _VOLUME = re.compile(
     r"\bvolume\b|\b(?:louder|quieter|mute|unmute)\b"
     r"|\bturn\s+(?:\w+\s+){0,3}?(?:up|down)\b",
@@ -263,8 +455,9 @@ _OPEN_TARGET = re.compile(
     r"take\s+me\s+to|show\s+me)\b\s+(?P<target>.+)$",
     re.IGNORECASE,
 )
+# Trailing punctuation too, or "please?" never matches.
 _TRAILING_MANNERS = re.compile(
-    r"(?:\s+(?:for\s+me|please|right\s+now|now))+$", re.IGNORECASE
+    r"(?:\s+(?:for\s+me|please|right\s+now|now))+[\s,.!?]*$", re.IGNORECASE
 )
 _YOUTUBE_SUFFIX = re.compile(r"\s+(?:on|in)\s+youtube\s*$", re.IGNORECASE)
 _MEDIA_REFERENCE = {
@@ -298,8 +491,8 @@ def media_argument(query: str, argument: str) -> str | None:
 
 # The rows whose label is a sentence rather than a name.
 VERBS = (
-    "youtube", "spotify", "google", "volume", "remind", "pomodoro",
-    "pomodoro_stop",
+    "youtube", "spotify", "google", "site_search", "volume", "remind",
+    "pomodoro", "pomodoro_stop",
 )
 
 # Rows the sidecar cannot carry out on its own
@@ -315,6 +508,9 @@ def _verb_score(query: str, kind: str) -> float:
     if kind == "youtube":
         # Beaten by the spotify row when they named Spotify
         return 0.9 if (_PLAY.search(query) and not _SPOTIFY.search(query)) else 0.0
+    if kind == "site_search":
+        # Beats plain Google only when they named a site a search can land on.
+        return 0.93 if (_SITE_VERB.search(query) and _SITE_NAMES.search(query)) else 0.0
     if kind == "google":
         return 0.8 if _SEARCH.search(query) else 0.0
     if kind == "remind":
@@ -326,8 +522,34 @@ def _verb_score(query: str, kind: str) -> float:
     return 0.0
 
 
+def site_search(query: str) -> tuple[str, str] | None:
+    """("YouTube", "rust programming") out of a sentence that named both."""
+    site = _SITE_NAMES.search(query)
+    tail = _SEARCH_TAIL.search(query) if _SITE_VERB.search(query) else None
+    if not site or not tail:
+        return None
+    name = next(n for n in SEARCHABLE if n.lower() == site.group(1).lower())
+    wanted = _TRAILING_MANNERS.sub("", tail.group("query")).strip(" ,.-?!")
+    # Drop the site name if it sat inside the search tail.
+    wanted = re.sub(r"^(?:on\s+|in\s+)?" + re.escape(name) + r"\b[\s,]*", "", wanted,
+                    flags=re.IGNORECASE)
+    wanted = re.sub(r"^(?:for|about|on|in|to)\b\s*", "", wanted.strip(" ,.-?!:"),
+                    flags=re.IGNORECASE).strip(" ,.-?!:")
+    # Or trailing "... on wikipedia".
+    wanted = re.sub(r"\s*\b(?:on|at|in|using|over)\s+" + re.escape(name) + r"\s*$", "",
+                    wanted, flags=re.IGNORECASE).strip(" ,.-?!:")
+    return (name, wanted) if wanted else None
+
+
 def direct(query: str, things: list[Thing]) -> tuple[Thing, str] | None:
     """Resolve an unmistakable action without asking a model for a marker."""
+    # Site + search verb wins over play.
+    named = site_search(query)
+    if named and not _PLAY.search(query):
+        row = next((t for t in things if t.kind == "site_search"), None)
+        if row is not None:
+            return row, f"{named[0]}: {named[1]}"
+
     # "open youtube and play something" is a play request
     plays = list(_PLAY.finditer(query))
     if plays:
@@ -352,19 +574,22 @@ def direct(query: str, things: list[Thing]) -> tuple[Thing, str] | None:
     command = _OPEN_TARGET.search(query)
     if not command:
         return None
-    named = _TRAILING_MANNERS.sub("", command.group("target")).strip(" ,.-")
+    named = _TRAILING_MANNERS.sub("", command.group("target")).strip(" ,.-?!")
     normalized = _words(named)
     normalized = re.sub(r"^(?:my|the)\s+", "", normalized)
+    # "the files on my desktop" is the desktop.
+    normalized = re.sub(r"^(?:the\s+)?(?:files|folders|contents|stuff)\s+(?:on|in)\s+(?:my|the)?\s*",
+                        "", normalized)
     if not normalized or " and " in normalized:
         return None
 
     matches: list[tuple[int, int, Thing]] = []
     for thing in things:
-        if thing.kind not in ("app", "place", "site", "file"):
+        if thing.kind not in ("app", "place", "site", "file", "setting"):
             continue
         label = _words(thing.label)
-        aliases = {label}
-        if thing.kind == "place":
+        aliases = {label} | {_words(a) for a in thing.aliases}
+        if thing.kind in ("place", "setting"):
             aliases.add(label.removesuffix(" folder"))
             aliases.add(label + " folder")
         if normalized in aliases:
@@ -396,6 +621,8 @@ _WORD = {
     "youtube": "plays it straight away",
     "spotify": "opens the search, cannot press play yet",
     "google": "a web search",
+    "site_search": "opens that site's own search results",
+    "setting": "a page in Windows Settings",
     "volume": "changes one app's volume",
     "remind": "sets a reminder on Mellow, which fires out loud",
     "pomodoro": "starts a focus round on Mellow",
@@ -463,9 +690,21 @@ def run(thing: Thing, argument: str = "") -> str:
     if kind == "place":
         _launch("explorer.exe", target)
         return f"opened {thing.label}"
-    if kind in ("site", "file"):
+    if kind in ("site", "file", "setting"):
         os.startfile(target)
         return f"opened {thing.label}"
+    if kind == "site_search":
+        import urllib.parse
+
+        name, _, wanted = argument.partition(":")
+        site = next((s for s in SEARCHABLE if s.lower() == name.strip().lower()), None)
+        wanted = wanted.strip() or name.strip()
+        if site is None:
+            # Named a site with no search of its own; a web search still helps.
+            os.startfile("https://www.google.com/search?q=" + urllib.parse.quote_plus(wanted))
+            return f"searched for {wanted}"
+        os.startfile(SITES[site][1].format(urllib.parse.quote_plus(wanted)))
+        return f"searched {site} for {wanted}"
     if kind == "youtube":
         import urllib.parse
 

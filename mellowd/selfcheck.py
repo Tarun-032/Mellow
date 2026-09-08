@@ -2006,8 +2006,21 @@ async def check_act() -> None:
 
     rows = [
         act.Thing(label="Spotify", kind="app", target="Spotify.exe"),
-        act.Thing(label="File Explorer", kind="app", target="Microsoft.Windows.Explorer"),
+        act.Thing(label="File Explorer", kind="app", target="Microsoft.Windows.Explorer",
+                  aliases=act.app_aliases("File Explorer")),
+        act.Thing(label="Calculator", kind="app", target="Calc",
+                  aliases=act.app_aliases("Calculator")),
+        act.Thing(label="Command Prompt", kind="app", target="cmd",
+                  aliases=act.app_aliases("Command Prompt")),
+        act.Thing(label="Visual Studio Code", kind="app", target="Code",
+                  aliases=act.app_aliases("Visual Studio Code")),
         act.Thing(label="Downloads", kind="place", target="shell:Downloads"),
+        act.Thing(label="Desktop", kind="place", target="shell:Desktop"),
+        act.Thing(label="Recycle Bin", kind="place", target="shell:RecycleBinFolder"),
+        act.Thing(label="Local Disk (C:)", kind="place", target="C:\\",
+                  aliases=("C drive", "drive C", "C:", "C: drive", "Local Disk C")),
+        act.Thing(label="Data (D:)", kind="place", target="D:\\",
+                  aliases=("D drive", "drive D", "D:", "Data", "Data drive")),
         act.Thing(label="Google Drive", kind="site", target="https://drive.google.com"),
         act.Thing(label="YouTube", kind="site", target="https://www.youtube.com"),
         act.Thing(label="spotify-notes.txt", kind="file", target="C:\\x\\spotify-notes.txt"),
@@ -2017,12 +2030,41 @@ async def check_act() -> None:
         saved = act.apps, act.places, act.sites, act.files
         try:
             act.apps = lambda: [r for r in rows if r.kind == "app"]
-            act.places = lambda: [r for r in rows if r.kind == "place"]
+            act.places = lambda: [r for r in rows if r.kind == "place"] + act.settings()
             act.sites = lambda: [r for r in rows if r.kind == "site"]
             act.files = lambda: [r for r in rows if r.kind == "file"]
             return act.catalog(query)
         finally:
             act.apps, act.places, act.sites, act.files = saved
+
+    def resolved(query):
+        """(kind, label) of what `direct` would do, or None if it defers."""
+        found = act.direct(query, listing(query))
+        return (found[0].kind, found[0].label) if found else None
+
+    # Live drives (not the fixture) must use Explorer-style labels + letter aliases.
+    live = act.drives()
+    assert live, "no drives enumerated on this machine"
+    for drive in live:
+        letter = drive.target[0]
+        assert drive.label.endswith(f"({letter}:)"), drive.label
+        spoken = {a.lower() for a in drive.aliases}
+        assert f"{letter} drive".lower() in spoken, (drive.label, drive.aliases)
+        assert f"drive {letter}".lower() in spoken, (drive.label, drive.aliases)
+
+    # Resolve folders via Windows; ~/Desktop is wrong under OneDrive backup.
+    import os as _os
+
+    found_any = False
+    for folder in ("Desktop", "Downloads", "Documents", "Pictures", "Videos"):
+        where = act.known_folder(folder)
+        assert where and folder.lower() in where.lower(), (folder, where)
+        naive = _os.path.join(_os.path.expanduser("~"), folder)
+        if not _os.path.isdir(naive):
+            # Redirected path: Windows answer must still exist.
+            assert _os.path.isdir(where), (folder, where)
+        found_any = found_any or _os.path.isdir(where)
+    assert found_any, "not one of the user's own folders could be located"
 
     # The app beats their own note about it. A bare word is the least likely way anyone refers to a file
     top = listing("open spotify")[0]
@@ -2064,6 +2106,73 @@ async def check_act() -> None:
     assert natural and natural[0].kind == "youtube" and natural[1] == "Back in Black", natural
     assert act.media_argument("play that on youtube", "that") is None
     assert act.direct("open the file menu", listing("open the file menu")) is None
+
+    # Spoken aliases, drive letters, and settings pages.
+    for phrase, expected in [
+        ("open calc", ("app", "Calculator")),
+        ("open cmd", ("app", "Command Prompt")),
+        ("open vs code", ("app", "Visual Studio Code")),
+        ("open vsc", ("app", "Visual Studio Code")),
+        ("open explorer", ("app", "File Explorer")),
+        ("open my computer", ("app", "File Explorer")),
+        # Letter drives need aliases; scoring drops single letters.
+        ("open local disk C", ("place", "Local Disk (C:)")),
+        ("open the C drive", ("place", "Local Disk (C:)")),
+        ("open drive D", ("place", "Data (D:)")),
+        ("open the Data drive", ("place", "Data (D:)")),
+        ("open bluetooth settings", ("setting", "Bluetooth settings")),
+        ("open wifi settings", ("setting", "Wi-Fi settings")),
+        ("open night light", ("setting", "Night light settings")),
+    ]:
+        assert resolved(phrase) == expected, (phrase, resolved(phrase))
+
+    # Politeness and punctuation must not survive into the target or the query.
+    for phrase, expected in [
+        ("can you open Recycle Bin please?", ("place", "Recycle Bin")),
+        ("um can you help me open the recycle bin?", ("place", "Recycle Bin")),
+        ("show me the files on my desktop.", ("place", "Desktop")),
+        ("show me the files in my downloads", ("place", "Downloads")),
+    ]:
+        assert resolved(phrase) == expected, (phrase, resolved(phrase))
+    polite = "open amazon and search for keyboards please."
+    manners = act.direct(polite, listing(polite))
+    assert manners and manners[1] == "Amazon: keyboards", manners
+
+    # In-site search ≠ play ≠ Google.
+    for phrase, wanted in [
+        ("open youtube and search for the Fern channel", "YouTube: the Fern channel"),
+        ("can you open youtube and show me videos about rust programming",
+         "YouTube: rust programming"),
+        ("search youtube for lofi beats", "YouTube: lofi beats"),
+        ("look up python decorators on wikipedia", "Wikipedia: python decorators"),
+        ("search amazon for a mechanical keyboard", "Amazon: a mechanical keyboard"),
+    ]:
+        found = act.direct(phrase, listing(phrase))
+        assert found and found[0].kind == "site_search", (phrase, found)
+        assert found[1] == wanted, (phrase, found[1])
+    # Play still beats search when they said play.
+    play = act.direct("open youtube and play lofi", listing("open youtube and play lofi"))
+    assert play and play[0].kind == "youtube" and play[1] == "lofi", play
+    # Sites without a search URL just open.
+    assert act.site_search("open google calendar") is None
+
+    # Action gate must admit these (used to require "search for").
+    for errand in ("search youtube for lofi beats", "google the weather in Maryland",
+                   "find me a cheap flight", "look up the offside rule"):
+        assert capture.wants_action(errand), errand
+    # Where/how questions are not commands.
+    for asking in ("where is the search box", "which button opens settings",
+                   "how do I search in VS Code", "how do I open a new terminal"):
+        assert not capture.wants_action(asking), asking
+    # Wider search verbs must not force a Google row.
+    for spoken in ("search the transcript for that phrase",
+                   "find me a good name for this function",
+                   "show me the files on my desktop"):
+        top = listing(spoken)[0] if listing(spoken) else None
+        assert top is None or top.kind != "google", (spoken, top and top.label)
+    # "google drive" = site; "google the weather" = search.
+    assert listing("open google drive")[0].kind == "site"
+    assert listing("google the weather in Maryland")[0].kind == "google"
 
     # An acknowledgement is not filler on an action turn, and it survives by construction
     from mellowd import llm
@@ -2129,7 +2238,9 @@ async def check_act() -> None:
     assert main._chosen((99, ""), rows)[0] is None
     assert main._chosen(main.NONE, rows)[0] is None
     assert main._chosen(None, rows)[0] is None
-    assert main._chosen(("Downloads", ""), rows)[0] is rows[2]
+    # Lookup by label; fixture index is unstable.
+    downloads = next(r for r in rows if r.label == "Downloads")
+    assert main._chosen(("Downloads", ""), rows)[0] is downloads
     assert main._chosen(("the printer settings", ""), rows)[0] is None
 
     # A declined turn is spotted before a word of it is emitted
@@ -2170,6 +2281,29 @@ async def check_act() -> None:
     assert ran == [(exact, "")], ran
     assert partial["text"] == "Opened Downloads.", partial
     assert sent == [{"type": "reply_chunk", "text": "Opened Downloads."}], sent
+
+    # Same row, scored below the threshold: an exact name still runs, because
+    # _act asks direct() before the fuzzy score is allowed to discard it.
+    ran.clear()
+    weak = act.Thing(label="Recycle Bin", kind="place",
+                     target="shell:RecycleBinFolder", score=0.68)
+    saved = act.catalog, act.run, main._pass, sessions.record
+    try:
+        act.catalog = lambda query: [weak]
+        act.run = lambda thing, argument="": ran.append((thing, argument)) or "opened Recycle Bin"
+
+        async def no_agent(*args, **kwargs):
+            raise AssertionError("an exact request below threshold called the agent")
+
+        main._pass = no_agent
+        sessions.record = lambda *args, **kwargs: None
+        _, did = await main._act(
+            type("Session", (), {"ws": FakeWS()})(), {"llm": {}}, False,
+            {"text": ""}, "um can you help me open the recycle bin?",
+        )
+    finally:
+        act.catalog, act.run, main._pass, sessions.record = saved
+    assert did and ran == [(weak, "")], (did, ran)
 
     # The argument split for a volume request
     assert act._volume_args("spotify 50") == ("spotify", 0.5)

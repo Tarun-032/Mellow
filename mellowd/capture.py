@@ -139,7 +139,7 @@ ERRAND_DO = r"""
   | \bshow\s+me\s+(?:my|the)\b
   | \bvolume\b | \b(?:louder|quieter|mute|unmute)\b
   | \bturn\s+(?:\w+\s+){0,3}?(?:up|down)\b
-  | \bsearch\s+(?:for|up)\b | \blook\s+up\b | \bgoogle\b
+  | \bsearch\b | \blook\s+up\b | \bgoogle\b | \bfind\s+me\b
   | \bremind\b | \breminder\b | \bwake\s+me\b | \bnudge\s+me\b
   | \bpomodoro\b | \bfocus\s+(?:timer|session|round)\b | \bset\s+a\s+timer\b
 """
@@ -155,9 +155,13 @@ ASKS_WHERE = r"""
 WHERE_RE = re.compile(ASKS_WHERE, _F)
 
 
+# "How do I …" is a question, not a command.
+ASKS_HOW = re.compile(r"\bhow\s+(?:do|does|to|can|could|would|should)\b", _F)
+
+
 def wants_action(text: str) -> bool:
     """Might they be asking for something to happen, rather than be told?"""
-    if WHERE_RE.search(text):
+    if WHERE_RE.search(text) or ASKS_HOW.search(text):
         return False
     return bool(DO_RE.search(text))
 

@@ -1043,7 +1043,8 @@ async def _act(
 ) -> tuple[str, bool]:
     """Try to do what they asked."""
     things = await asyncio.to_thread(act.catalog, prompt)
-    if not things or things[0].score < act.THRESHOLD:
+    # An exact name beats the fuzzy score, so ask before the threshold throws it out.
+    if not things or (things[0].score < act.THRESHOLD and not act.direct(prompt, things)):
         log.info("act: nothing on this machine matches %r", prompt)
         return "", False
 
