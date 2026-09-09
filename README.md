@@ -11,7 +11,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/platform-Windows-5b3328?style=flat-square" alt="Windows" />
-  <img src="https://img.shields.io/badge/version-1.1.0-cb7a42?style=flat-square" alt="Version 1.1.0" />
+  <img src="https://img.shields.io/badge/version-1.2.0-cb7a42?style=flat-square" alt="Version 1.2.0" />
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-f18773?style=flat-square" alt="Apache 2.0 license" /></a>
 </p>
 
@@ -29,9 +29,12 @@ https://github.com/user-attachments/assets/8cb9e786-4c55-4077-bd6f-3200aedc5f61
 - **See when invited.** Mellow can inspect the active screen for questions such as “what is this?” without continuously recording it.
 - **Point things out.** Ask where a control is and Mellow's bone pointer moves to the relevant place on screen.
 - **Help around the desktop.** Open apps, folders, and websites, play media, or adjust one application's volume.
+- **Write for you.** Put your cursor in any text box, speak, and Mellow types it in. He never presses Enter, so nothing sends until you do.
 - **Keep you on track.** Set reminders and run configurable Pomodoro focus sessions directly from the pet.
 - **Take meeting notes.** Transcribe your microphone and meeting audio, generate structured notes with your chosen answer engine, and export the transcript or notes.
 - **Feel alive.** Pet, drag, wake, and watch Mellow react through idle, listening, thinking, talking, sleeping, peeking, and stretching animations.
+- **Look how you like.** Recolour Mellow's coat so he stays easy to see against your wallpaper.
+- **Stay up to date.** Check for new versions and install them without leaving the app.
 - **Work without AI.** Pet-only mode keeps the companion, reminders, and focus tools without downloading models or contacting an AI service.
 
 ## Mellow in action
@@ -98,6 +101,38 @@ Mellow uses available interface information, on-screen text, and screen understa
 
 Keep the relevant window visible when asking. For screenshot-based help, choose a vision-capable answer model and allow screenshot inspection under **Settings → Advanced**. Screenshots are taken when needed for your request, not continuously; cloud-based screen understanding sends them to your selected provider. Small icons, unusual layouts, or a page that changes after capture can affect pointing accuracy.
 
+## Write with your voice
+
+Talk instead of typing, anywhere on your desktop. Put your cursor where the words should go, hold `Ctrl` + `Shift` + `Space`, say what you want, and let go.
+
+Mellow handles both jobs you would expect:
+
+- **Dictate it.** Say it word for word and it lands as you said it.
+- **Or describe it.** Ask for “a reply saying I’ll be twenty minutes late” and Mellow drafts it with your chosen answer engine.
+- **Fix it.** Ask again while you have not touched the text and he revises what he wrote instead of starting over.
+
+It works in documents, email, chat apps, and terminal prompts.
+
+Because this types into other applications, it is careful by design. Mellow **never presses Enter**, so nothing sends, submits, or runs until you do it yourself. He only writes into the field you already chose, and never clicks or moves your cursor. If he cannot confirm the text landed, he hands you a draft to copy instead. Password and read-only fields are refused outright.
+
+This is off until you turn it on, under **Settings → Screen-aware writing**.
+
+## Make Mellow yours
+
+<p align="center">
+  <img src="media/features/customization.png" width="88%" alt="The Customize Mellow settings page, showing coat presets and a colour grid beside a preview of Mellow" />
+</p>
+
+Mellow sits on your wallpaper all day, and one coat does not suit every desktop. Click a part of him in the preview, then pick a colour.
+
+- **You choose three things:** the fur, the patch, and the blush.
+- **The rest is handled for you.** Shading follows your patch colour, and the eyes and nose stay dark so his face reads clearly on any coat.
+- **Seven presets to start from:** Original, Golden, Chocolate, Husky, Rose, Sky, and Lilac.
+- **Or any colour you like,** from the swatch grid or your own hex value.
+- **Nothing changes until you save,** and *Reset to original* brings back the coat he shipped with.
+
+Find it under **Settings → Customize Mellow**.
+
 ## Choose your setup
 
 Mellow does not force one AI stack on everyone. Each capability can be configured separately.
@@ -144,9 +179,11 @@ Transcripts and notes are exported separately. Saved meetings can also be rename
 ## Install on Windows
 
 1. Open the [Releases](https://github.com/Tarun-032/Mellow/releases) page.
-2. Download `Mellow-Setup-1.1.0-x64.exe` from the latest release.
+2. Download `Mellow-Setup-1.2.0-x64.exe` from the latest release.
 3. Run the installer, then follow Mellow's first-run onboarding.
 4. Choose local, cloud, agent, or pet-only options for each feature.
+
+From 1.2.0 onwards Mellow can update himself: **Settings → Updates** checks for a new release and installs it for you. Mellow 1.1.0 predates that, so it needs this one installed by hand.
 
 Already using Mellow? Quit it from the tray before running the new installer. Keep your existing app data to retain settings, downloaded models, and saved meetings; a clean uninstall is only for removing that data.
 
@@ -201,7 +238,7 @@ npm run release:windows
 The release command freezes the Python service, verifies its native audio/AI stack and security boundaries, builds the frontend and Tauri application, then produces:
 
 ```text
-src-tauri/target/release/bundle/nsis/Mellow-Setup-1.1.0-x64.exe
+src-tauri/target/release/bundle/nsis/Mellow-Setup-1.2.0-x64.exe
 ```
 
 Large model weights are deliberately excluded from the repository and installer. They are downloaded only when the user selects the corresponding local feature.
@@ -230,6 +267,7 @@ cargo test --manifest-path src-tauri\Cargo.toml --lib
 node scripts\bone.check.ts
 node scripts\peek.check.ts
 node scripts\pomodoro.check.ts
+node scripts\updater.check.ts
 ```
 
 Please never include API keys, personal screenshots, model weights, generated installers, or local cache data in a contribution.
