@@ -1173,3 +1173,118 @@ input[type="range"] {
     grid-template-columns: minmax(0, 1fr);
   }
 }
+
+/* A real checkbox wearing a switch. Keyboard and screen readers get the input. */
+.switch {
+  display: grid;
+  gap: 14px;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  cursor: pointer;
+}
+
+.switch__text {
+  display: grid;
+  gap: 3px;
+}
+
+.switch__text b {
+  color: var(--settings-text);
+  font-size: 14px;
+  font-weight: 620;
+}
+
+.switch__text small {
+  max-width: 52ch;
+  color: var(--settings-muted);
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+
+/* The input sits under the track so focus and clicks stay native. */
+.switch input {
+  grid-area: 1 / 2;
+  width: 44px;
+  height: 26px;
+  margin: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.switch__track {
+  grid-area: 1 / 2;
+  width: 44px;
+  height: 26px;
+  border-radius: 999px;
+  background: var(--settings-selected);
+  pointer-events: none;
+  transition: background-color 160ms ease;
+}
+
+.switch__track::after {
+  content: "";
+  display: block;
+  width: 20px;
+  height: 20px;
+  margin: 3px;
+  border-radius: 50%;
+  background: var(--settings-panel);
+  box-shadow: 0 1px 2px rgba(76, 41, 35, 0.35);
+  transition: translate 160ms ease;
+}
+
+.switch input:checked + .switch__track {
+  background: var(--settings-accent);
+}
+
+.switch input:checked + .switch__track::after {
+  translate: 18px 0;
+}
+
+.switch input:focus-visible + .switch__track {
+  outline: 2px solid var(--settings-accent);
+  outline-offset: 3px;
+}
+
+/* Section titles inside a panel. The empty-state h3s have their own rule. */
+.settings-group > h3 {
+  color: var(--settings-text);
+  font-size: 14px;
+  font-weight: 620;
+}
+
+/* Numbered steps and the plain-language limits list. */
+.steps,
+.limits {
+  display: grid;
+  gap: 12px;
+  margin: 0;
+  padding: 0 0 0 20px;
+}
+
+.steps li,
+.limits li {
+  color: var(--settings-muted);
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.steps li::marker {
+  color: var(--settings-accent);
+  font-weight: 700;
+}
+
+.limits li::marker {
+  color: var(--settings-accent);
+}
+
+.steps b,
+.limits b {
+  color: var(--settings-text);
+  font-weight: 620;
+}
+
+.steps span {
+  display: block;
+  margin-top: 2px;
+}

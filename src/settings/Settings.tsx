@@ -112,6 +112,7 @@ type SettingsPage =
   | "engine"
   | "stt"
   | "tts"
+  | "writing"
   | "sessions"
   | "meetings"
   | "advanced";
@@ -142,6 +143,11 @@ const SETTINGS_PAGES: Array<{
     description: "Voice and playback",
   },
   {
+    id: "writing",
+    label: "Screen-aware writing",
+    description: "Speak into any text field",
+  },
+  {
     id: "sessions",
     label: "Sessions",
     description: "Saved conversations",
@@ -150,7 +156,7 @@ const SETTINGS_PAGES: Array<{
   {
     id: "advanced",
     label: "Advanced",
-    description: "Model, vision and dictation",
+    description: "Model and vision controls",
   },
 ];
 
@@ -983,6 +989,90 @@ export default function Settings() {
             </section>
           )}
 
+          {activePage === "writing" && (
+            <section className="settings-page" aria-labelledby="writing-heading">
+              <div className="page-heading">
+                <h2 id="writing-heading">Speak into any text field</h2>
+                <p>Talk instead of typing, in any app.</p>
+              </div>
+
+              {!form.ai_enabled ? (
+                <div className="empty-state">
+                  <h3>This needs an engine</h3>
+                  <p>Choose how Mellow thinks first, then come back and turn this on.</p>
+                </div>
+              ) : (
+                <div className="settings-group">
+                  <label className="switch">
+                    <span className="switch__text">
+                      <b>Screen-aware writing</b>
+                      <small>
+                        Put your cursor in a text box, hold the shortcut, and Mellow writes
+                        in the field.
+                      </small>
+                    </span>
+                    <input
+                      type="checkbox"
+                      role="switch"
+                      checked={form.writing_enabled ?? false}
+                      onChange={(event) =>
+                        setForm((current) =>
+                          current ? { ...current, writing_enabled: event.target.checked } : current,
+                        )
+                      }
+                    />
+                    <i className="switch__track" aria-hidden="true" />
+                  </label>
+                </div>
+              )}
+
+              <div className="settings-group">
+                <h3>How it works</h3>
+                <ol className="steps">
+                  <li>
+                    <b>Click into the field you want to write in</b>
+                    <span>A chat box, a document, an email, even a terminal prompt.</span>
+                  </li>
+                  <li>
+                    <b>Hold Ctrl + Shift + Space and say what you want</b>
+                    <span>
+                      Dictate it word for word, or ask for a draft like &ldquo;reply saying
+                      I&rsquo;ll be twenty minutes late&rdquo;.
+                    </span>
+                  </li>
+                  <li>
+                    <b>Let go, and it appears</b>
+                    <span>
+                      Mellow types it into that same field. Ask again to revise the draft while
+                      you have not touched it.
+                    </span>
+                  </li>
+                </ol>
+              </div>
+
+              <div className="settings-group">
+                <h3>What it will never do</h3>
+                <ul className="limits">
+                  <li>
+                    <b>Press Enter.</b> Nothing sends and nothing runs until you do it yourself.
+                  </li>
+                  <li>
+                    <b>Move your cursor or click anything.</b> It only writes into the field you
+                    already picked.
+                  </li>
+                  <li>
+                    <b>Guess.</b> If it cannot confirm the text landed, you get a draft to copy
+                    instead of a silent mess.
+                  </li>
+                </ul>
+                <p className="field-note">
+                  Drafting from what is on screen sends that field&rsquo;s context to the provider
+                  you chose under Engine. Terminal and editor prompts get a single line.
+                </p>
+              </div>
+            </section>
+          )}
+
           {activePage === "advanced" && (
             <section className="settings-page" aria-labelledby="advanced-heading">
               <div className="page-heading">
@@ -1033,19 +1123,6 @@ export default function Settings() {
                     </div>
                   )}
                   <div className="settings-group">
-                    <label className="checkbox">
-                      <input type="checkbox" checked={form.writing_enabled ?? false}
-                        onChange={(event) => setForm((current) => current ? { ...current, writing_enabled: event.target.checked } : current)} />
-                      Screen-aware writing
-                    </label>
-                    <p className="field-note">
-                      Click an editable field, hold Ctrl + Shift + Space, and say what to write.
-                      Mellow can dictate, draft replies, and revise its last unchanged draft.
-                      Text is inserted after you release the shortcut; it is never sent automatically.
-                      Screen-based drafts use the focused app through your selected provider.
-                      Terminal and editor prompts are single-line and Mellow never presses Enter,
-                      so nothing runs until you do. Unsupported fields offer a copyable draft.
-                    </p>
                     <label>
                       Vision
                       <select value={form.llm.vision} onChange={(event) => patch("llm", { vision: event.target.value })}>
