@@ -1,10 +1,7 @@
 /**
- * Mellow's coat colours. Pure maths, no DOM and no image imports, so
- * `node scripts/coat.check.ts` can run it. The DOM half is coatApply.ts.
- *
- * SOURCE mirrors the locked palette in scripts/sprites.py:59-70 and
- * docs/design.md. The generator snaps every atlas pixel to these, which is what
- * makes an exact runtime palette swap possible in the first place.
+ * Coat colour maths. No DOM or image imports so node can run it; coatApply.ts is
+ * the DOM half. SOURCE mirrors the palette in scripts/sprites.py:59-70, which
+ * every atlas pixel is snapped to.
  */
 
 export type Role = "cream" | "tan" | "brown" | "dark" | "salmon";
@@ -20,11 +17,7 @@ export const ROLE_LABEL: Record<Role, string> = {
   salmon: "Blush",
 };
 
-/**
- * The parts a person picks. Shading follows the patch and the face is fixed,
- * because those are the two nobody chooses well - a hand-picked shading rarely
- * belongs to its patch, and a tinted face is how Mellow goes invisible.
- */
+/** The parts a person picks. Shading follows the patch; the face is fixed. */
 export const EDITABLE: Role[] = ["cream", "tan", "salmon"];
 
 export type Coat = Record<Role, string>;
@@ -94,10 +87,9 @@ export function hslToRgb([h, s, l]: Hsl): Rgb {
 const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
 
 /**
- * The shading is the step the artist already drew: measured from SOURCE at
- * module load, tan -> brown is dh -5.7, S x1.018, dl -14.7, and applying it back
- * to the shipped tan returns the shipped brown exactly. Measured rather than
- * written down so it stays true if sprites.py's palette ever moves.
+ * The tan -> brown step the palette already draws, measured rather than written
+ * down so it survives a palette change. Applied to the shipped tan it returns
+ * the shipped brown exactly.
  */
 const SHADE = (() => {
   const [th, ts, tl] = rgbToHsl(hexToRgb(SOURCE.tan));
@@ -114,32 +106,22 @@ export function shadeOf(patch: string): string {
 }
 
 /**
- * Eyes, nose and mouth, on every coat but the shipped one. A neutral near-black
- * reads against any patch hue; letting this follow the coat is what made an
- * all-blue Mellow lose its face.
- *
- * DEFAULT_COAT keeps the warmer shipped #4c2923 on purpose. This role also
- * paints the dialogue text and panel chrome (18 places in pet.css), so making it
- * universal would change how released 1.1.0 looks.
+ * Eyes, nose and mouth on every coat but the shipped one, which keeps #4c2923.
+ * A neutral near-black reads against any patch hue; letting it follow the coat
+ * is how an all-blue Mellow lost its face.
  */
 export const INK = "#2f2a28";
 
 /** Blush is pink on every cute animal, whatever colour the animal is. */
 export const DEFAULT_BLUSH = SOURCE.salmon;
 
-/**
- * The band that keeps Mellow reading as a light dog with coloured patches. The
- * floor is the shipped cream's own lightness, measured rather than picked, so
- * #f5ecdd passes through untouched by construction instead of by coincidence.
- */
+/** Keeps Mellow a light dog. The floor is the shipped cream's own lightness. */
 export const FUR_L_MIN = rgbToHsl(hexToRgb(SOURCE.cream))[2];
 export const FUR_L_MAX = 98;
 
 /**
- * Fur is the largest area on the pet, so its lightness is clamped while hue and
- * saturation pass through untouched. #f5ecdd is L91 and comes back unchanged; a
- * mid-lightness mint becomes a pale mint-white instead of a green body. That
- * difference is the whole reason the first model produced blobs.
+ * Clamps lightness only; hue and saturation pass through. A mid-lightness mint
+ * becomes a pale mint-white instead of a green body.
  */
 export function furFrom(pick: string): string {
   const [h, s, l] = rgbToHsl(hexToRgb(pick));
@@ -196,10 +178,9 @@ export function nearestSource(r: number, g: number, b: number): Role | "pencil" 
 }
 
 /**
- * Recolour one pixel: nearest palette entry, then keep its offset from that
- * entry. The offset is zero across the snapped atlas, so that path is an exact
- * swap; writing.png blends 75% palette / 25% source, and the offset is what
- * preserves its glasses, pencil and notebook detail.
+ * Nearest palette entry, then keep the pixel's offset from it. Zero across the
+ * snapped atlas, so that path is an exact swap; it is what preserves
+ * writing.png's blended detail.
  */
 export function mapPixel(r: number, g: number, b: number, coat: Coat): Rgb {
   const key = nearestSource(r, g, b);

@@ -1,10 +1,7 @@
 /**
- * Click a part of Mellow, pick a colour. The preview is a canvas rather than a
- * background-image div, which is what makes click-to-select nearly free: the
- * atlas is five known colours, so the pixel under the cursor names its own part.
- *
- * Nothing here reaches the desktop pet. The editor only edits the settings form;
- * Settings emits the coat after the save request succeeds.
+ * Click a part of Mellow, pick a colour. The preview is a canvas so the pixel
+ * under the cursor names its own part - the atlas is five known colours.
+ * Nothing reaches the desktop pet until Settings saves.
  */
 
 import { useEffect, useRef, useState, type MouseEvent } from "react";
@@ -39,11 +36,7 @@ const SWATCHES: string[] = [
 
 const same = (a: Coat, b: Coat) => ROLES.every((role) => a[role] === b[role]);
 
-/**
- * Clicking the shading selects the Patch, because the shading is derived from it
- * and the patch is the control the user actually wants. The face is fixed, so
- * clicking it selects nothing and the hint says why.
- */
+/** Shading maps to Patch, since it derives from it. The fixed face maps to nothing. */
 const SELECTS: Record<Role, Role | null> = {
   cream: "cream",
   tan: "tan",

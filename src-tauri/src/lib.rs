@@ -495,7 +495,9 @@ fn popup_pet_menu(handle: &tauri::AppHandle, speak: bool, quiet: bool, recording
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     #[allow(unused_mut)]
-    let mut builder = tauri::Builder::default().plugin(tauri_plugin_opener::init());
+    let mut builder = tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_updater::Builder::new().build());
 
     #[cfg(desktop)]
     let guide_state = cursor::GuideState::default();

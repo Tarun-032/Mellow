@@ -10,6 +10,7 @@ import { useSocket } from "./useSocket";
 import { useCoat } from "../ui/coatApply";
 import { WritingPanel } from "./WritingPanel";
 import { bonePlacement, usePetMotion, type Reaction } from "./usePetMotion";
+import { findUpdate, UPDATE_NOTICE_KEY } from "../updater";
 import "./sprites.css"; // Generated sprite indices.
 import "./pet.css";
 
@@ -27,6 +28,8 @@ const MIC_BAR_REST = 0.19;
 const MIC_BARS = [0.19, 0.34, 0.62, 1, 0.62, 0.34, 0.19];
 // Alert timeout.
 const ALERT_CAP = 120_000;
+const UPDATE_CHECK_DELAY = 8_000;
+const UPDATE_NOTICE_LENGTH = 15_000;
 
 /** Meeting badge labels. */
 const MEETING_LABEL: Record<string, string> = {
@@ -114,8 +117,10 @@ export default function Pet() {
   const [fired, setFired] = useState("");
   // Alerts queued while quiet.
   const [waiting, setWaiting] = useState<string[]>([]);
+  const [availableUpdate, setAvailableUpdate] = useState<string | null>(null);
+  const [updateNotice, setUpdateNotice] = useState("");
   const timer = usePomodoro(setFired);
-  const alert = fired || reminder;
+  const alert = fired || reminder || updateNotice;
   useEffect(() => { if (meetingActive && alert) setPanel("meeting"); }, [meetingActive, alert]);
   // Activity overrides naps.
   const holdMode: Hold =
@@ -173,8 +178,27 @@ export default function Pet() {
 
   const dismiss = useCallback(() => {
     setFired("");
+    setUpdateNotice("");
     dismissReminder();
   }, [dismissReminder]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      void findUpdate()
+        .then(async (update) => {
+          if (!update) return;
+          const version = update.version;
+          await update.close();
+          if (!cancelled) setAvailableUpdate(version);
+        })
+        .catch(() => undefined);
+    }, UPDATE_CHECK_DELAY);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, []);
 
   // Auto-dismiss alerts.
   useEffect(() => {
@@ -211,6 +235,29 @@ export default function Pet() {
   );
   // Quiet edge state.
   const { quiet, setQuiet, toggleQuiet } = motion;
+  useEffect(() => {
+    if (
+      !availableUpdate ||
+      updateNotice ||
+      quiet ||
+      meetingActive ||
+      state !== "idle" ||
+      fired ||
+      reminder
+    ) return;
+    if (localStorage.getItem(UPDATE_NOTICE_KEY) === availableUpdate) {
+      setAvailableUpdate(null);
+      return;
+    }
+    localStorage.setItem(UPDATE_NOTICE_KEY, availableUpdate);
+    setUpdateNotice(`Mellow ${availableUpdate} is ready. Open Settings → Updates.`);
+  }, [availableUpdate, updateNotice, quiet, meetingActive, state, fired, reminder]);
+
+  useEffect(() => {
+    if (!updateNotice) return;
+    const timeout = window.setTimeout(() => setUpdateNotice(""), UPDATE_NOTICE_LENGTH);
+    return () => window.clearTimeout(timeout);
+  }, [updateNotice]);
   // Release the overlay before Settings.
   const viewMeetings = useCallback(
     (id: string | null) => {

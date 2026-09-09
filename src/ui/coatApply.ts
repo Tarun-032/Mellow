@@ -1,10 +1,7 @@
 /**
- * The DOM half of the coat: recolours the generated art at runtime and pushes
- * the result into CSS variables. The colour maths lives in coat.ts.
- *
- * Nothing here touches the art on disk. scripts/sprites.py stays the only thing
- * that writes sprites.png and friends (docs/agents.md rule 5) - this recolours a
- * copy in memory on the way to the screen.
+ * Recolours the generated art at runtime into CSS variables; coat.ts has the
+ * maths. Nothing here touches the art on disk - sprites.py stays its only
+ * writer (docs/agents.md rule 5).
  */
 
 import { useEffect } from "react";
@@ -95,16 +92,13 @@ async function recolour(url: string, coat: Coat): Promise<string> {
 
 /** Blob URLs currently in use, per element, so superseded ones get revoked. */
 const live = new WeakMap<HTMLElement, string[]>();
-/** Which applyCoat call owns an element. Recolouring is async, and StrictMode
- *  runs effects twice, so two can be in flight at once - without this the slower
- *  one revokes the URLs the element is actually showing. */
+/** Which applyCoat call owns an element: two can be in flight (StrictMode runs
+ *  effects twice), and the slower one would revoke the URLs in use. */
 const turn = new WeakMap<HTMLElement, number>();
 
 /**
- * Paint a coat onto an element. Solid colours land immediately; the recoloured
- * art follows a frame or two later, and until then the CSS fallbacks show the
- * shipped art. Pass document.documentElement for the whole window, or a wrapper
- * to scope it - which is what keeps the settings preview out of the settings chrome.
+ * Solid colours land immediately, recoloured art a frame or two later. Pass
+ * document.documentElement for the whole window, or a wrapper to scope it.
  */
 export async function applyCoat(coat: Coat, el: HTMLElement): Promise<void> {
   for (const role of ROLES) el.style.setProperty(VAR[role], coat[role]);
@@ -143,9 +137,8 @@ export async function drawCell(
 }
 
 /**
- * Which part of Mellow sits at an art pixel of a cell. Asks the *source* pixels,
- * so the answer does not drift as the coat changes. null means transparent, the
- * pencil, or art not loaded yet - all of which should select nothing.
+ * The part at an art pixel. Asks the source pixels so the answer does not drift
+ * with the coat. null means transparent, pencil, or not loaded yet.
  */
 export function roleAt(cell: number, x: number, y: number): Role | null {
   const data = ready.get(spritesUrl);

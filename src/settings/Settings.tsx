@@ -18,6 +18,8 @@ import {
 } from "../ui/fields";
 import { CoatEditor } from "./CoatEditor";
 import { type Coat } from "../ui/coat";
+import Updates from "./Updates";
+import { useUpdates } from "./useUpdates";
 import "./settings.css";
 
 type SettingsData = {
@@ -115,6 +117,7 @@ type SettingsPage =
   | "writing"
   | "sessions"
   | "meetings"
+  | "updates"
   | "advanced";
 
 const SETTINGS_PAGES: Array<{
@@ -153,6 +156,11 @@ const SETTINGS_PAGES: Array<{
     description: "Saved conversations",
   },
   { id: "meetings", label: "Meetings", description: "Transcripts and meeting notes" },
+  {
+    id: "updates",
+    label: "Updates",
+    description: "Version and new releases",
+  },
   {
     id: "advanced",
     label: "Advanced",
@@ -232,6 +240,7 @@ const VISION_LABELS: Record<string, string> = {
 };
 
 export default function Settings() {
+  const updates = useUpdates();
   const [activePage, setActivePage] = useState<SettingsPage>(() => localStorage.getItem(MEETING_OPEN) ? "meetings" : "engine");
   // `visit` remounts Meetings so the sidebar always lands on the list; `deep` says
   // whether that fresh mount should jump straight to the meeting Mellow asked for.
@@ -607,7 +616,12 @@ export default function Settings() {
                 if (page.id === "meetings") setMeetingsEntry(entry => ({ visit: entry.visit + 1, deep: false }));
               }}
             >
-              <span>{page.label}</span>
+              <span className="settings-nav__title">
+                {page.label}
+                {page.id === "updates" && updates.availableVersion && (
+                  <b className="settings-nav__badge">New</b>
+                )}
+              </span>
               <small>{page.description}</small>
             </button>
           ))}
@@ -618,7 +632,7 @@ export default function Settings() {
 
       </aside>
 
-      <form className="settings-workspace" onSubmit={e => { if (activePage === "meetings") e.preventDefault(); else void submit(e); }}>
+      <form className="settings-workspace" onSubmit={e => { if (activePage === "meetings" || activePage === "updates") e.preventDefault(); else void submit(e); }}>
         <header className="settings-topbar">
           <div>
             <h1>{currentPage.label}</h1>
@@ -1165,10 +1179,11 @@ export default function Settings() {
               )}
             </section>
           )}
+          {activePage === "updates" && <Updates updates={updates} />}
         </div>
 
         {/* Meetings saves as you go; an inert Save changes bar only takes reading space. */}
-        {activePage !== "meetings" && (
+        {activePage !== "meetings" && activePage !== "updates" && (
           <footer className="settings-savebar">
             <div>
               {sectionNotice("save")}
