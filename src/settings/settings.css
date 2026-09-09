@@ -99,8 +99,7 @@ button {
   padding: 0 7px;
 }
 
-.settings-brand__pet,
-.customize-empty__mark {
+.settings-brand__pet {
   display: grid;
   place-items: center;
   flex: 0 0 auto;
@@ -282,8 +281,6 @@ button {
 .settings-group h3,
 .empty-state h3,
 .empty-state p,
-.customize-empty h3,
-.customize-empty p,
 .settings-savebar p {
   margin: 0;
 }
@@ -631,8 +628,7 @@ input[type="range"] {
   background: var(--red-tint);
 }
 
-.empty-state,
-.customize-empty {
+.empty-state {
   display: grid;
   gap: 7px;
   padding: 28px;
@@ -642,30 +638,16 @@ input[type="range"] {
   background: rgba(255, 250, 242, 0.52);
 }
 
-.empty-state h3,
-.customize-empty h3 {
+.empty-state h3 {
   color: var(--settings-text);
   font-size: 16px;
   font-weight: 610;
 }
 
-.empty-state p,
-.customize-empty p {
+.empty-state p {
   max-width: 54ch;
   font-size: 13.5px;
   line-height: 1.55;
-}
-
-.customize-empty {
-  grid-template-columns: auto 1fr;
-  gap: 16px;
-  align-items: start;
-}
-
-.customize-empty__mark {
-  width: 42px;
-  height: 42px;
-  font-size: 22px;
 }
 
 .sessions-panel {
@@ -975,5 +957,219 @@ input[type="range"] {
   *::after {
     scroll-behavior: auto !important;
     transition-duration: 0.01ms !important;
+  }
+}
+
+/* Customize Mellow: click a part on the left, colour it on the right. */
+
+.coat {
+  display: grid;
+  gap: 16px;
+}
+
+.coat-presets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.coat-preset {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  min-height: 34px;
+  padding: 5px 11px 5px 7px;
+  border: 1px solid var(--settings-border-strong);
+  border-radius: 999px;
+  color: var(--settings-text);
+  background: var(--settings-field);
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background-color 140ms ease, border-color 140ms ease;
+}
+
+.coat-preset:hover {
+  background: var(--settings-field-hover);
+}
+
+.coat-preset.is-on {
+  border-color: var(--settings-accent);
+  background: var(--settings-selected);
+}
+
+.coat-preset__chips {
+  display: flex;
+  overflow: hidden;
+  border: 1px solid var(--settings-border);
+  border-radius: 999px;
+}
+
+.coat-preset__chips i {
+  width: 7px;
+  height: 18px;
+}
+
+.coat-editor {
+  display: grid;
+  gap: 20px;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+}
+
+.coat-stage {
+  display: grid;
+  gap: 10px;
+  justify-items: center;
+}
+
+/* The pet is cream on cream, so it needs a mat to read against. */
+.coat-canvas {
+  display: block;
+  width: 224px;
+  height: 224px;
+  padding: 8px;
+  border: 1px solid var(--settings-border-strong);
+  border-radius: 12px;
+  background: var(--deep);
+  image-rendering: pixelated;
+}
+
+.coat-hint {
+  margin: 0;
+  color: var(--settings-muted);
+  font-size: 12px;
+  text-align: center;
+}
+
+/* Three across, lined up under the canvas rather than wrapping oddly. */
+.coat-parts {
+  display: grid;
+  gap: 7px;
+  grid-template-columns: repeat(3, 1fr);
+  width: 240px;
+}
+
+.coat-part {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding: 7px 12px;
+  border: 1px solid var(--settings-border);
+  border-radius: 9px;
+  background: var(--settings-field);
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background-color 140ms ease, border-color 140ms ease;
+}
+
+.coat-part:hover {
+  background: var(--settings-field-hover);
+}
+
+.coat-part.is-on {
+  border-color: var(--settings-accent);
+  background: var(--settings-selected);
+}
+
+/* The radio itself is the accessible control; the pill is what you see. */
+.coat-part input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+}
+
+.coat-part:has(input:focus-visible) {
+  outline: 2px solid var(--settings-accent);
+  outline-offset: 2px;
+}
+
+.coat-part i,
+.coat-swatch {
+  border: 1px solid var(--settings-border-strong);
+}
+
+.coat-part i {
+  width: 18px;
+  height: 18px;
+  border-radius: 5px;
+}
+
+.coat-picker {
+  display: grid;
+  gap: 12px;
+  justify-items: start;
+}
+
+.coat-picker h3 {
+  margin: 0;
+  color: var(--settings-text);
+  font-size: 15px;
+  font-weight: 620;
+}
+
+.coat-picker h3 span {
+  margin-left: 6px;
+  color: var(--settings-muted);
+  font-family: var(--panel-digits, ui-monospace, monospace);
+  font-size: 12.5px;
+  font-weight: 500;
+  text-transform: uppercase;
+}
+
+.coat-swatches {
+  display: grid;
+  gap: 6px;
+  grid-template-columns: repeat(9, 1fr);
+  width: 100%;
+  max-width: 320px;
+}
+
+.coat-swatch {
+  aspect-ratio: 1;
+  min-width: 0;
+  padding: 0;
+  border-radius: 7px;
+  cursor: pointer;
+  transition: transform 100ms ease;
+}
+
+.coat-swatch:hover {
+  transform: scale(1.12);
+}
+
+.coat-swatch.is-on {
+  box-shadow: 0 0 0 2px var(--settings-panel), 0 0 0 4px var(--settings-accent);
+}
+
+.coat-custom {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  color: var(--settings-text);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.coat-custom input {
+  width: 54px;
+  height: 32px;
+  padding: 2px;
+  border: 1px solid var(--settings-border-strong);
+  border-radius: 8px;
+  background: var(--settings-field);
+  cursor: pointer;
+}
+
+/* The shared .button disabled cursor means "busy"; here it means "already there". */
+.coat-picker .button:disabled {
+  cursor: default;
+}
+
+@media (max-width: 720px) {
+  .coat-editor {
+    grid-template-columns: minmax(0, 1fr);
   }
 }

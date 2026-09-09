@@ -47,7 +47,7 @@ body,
   border-style: solid;
   border-width: calc(5 * var(--px)) calc(8 * var(--px)) calc(7 * var(--px))
     calc(6 * var(--px));
-  border-image-source: url("./bubble.png");
+  border-image-source: var(--coat-bubble, url("./bubble.png"));
   border-image-slice: 5 8 7 6 fill;
   border-image-repeat: stretch;
   background-color: var(--paper);

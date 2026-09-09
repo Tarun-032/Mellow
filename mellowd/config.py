@@ -2,6 +2,7 @@ r"""Config lives in %APPDATA%\Mellow\config.json."""
 
 import json
 import os
+import re
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -179,6 +180,15 @@ DEFAULTS = {
     # The whole AI half, off at the master switch ([[roadmap]] step 8's "just the pet").
     "ai_enabled": True,
     "writing_enabled": False,
+    # Mellow's five-colour coat. The defaults are the palette scripts/sprites.py
+    # snaps the art to; the frontend recolours the atlas to whatever is here.
+    "coat": {
+        "cream": "#f5ecdd",
+        "tan": "#c9824a",
+        "brown": "#9b532d",
+        "dark": "#4c2923",
+        "salmon": "#f18973",
+    },
     # Empty on purpose. The rules that make Mellow sound like Mellow moved to llm.CORE
     "system_prompt": "",
 }
@@ -252,6 +262,26 @@ def _validate_agent(section: dict) -> None:
     section["model"] = model
 
 
+COAT_ROLES = ("cream", "tan", "brown", "dark", "salmon")
+HEX = re.compile(r"^#[0-9a-fA-F]{6}$")
+
+
+def validate_coat(candidate) -> dict:
+    """Exactly the five roles, each a #rrggbb colour. No partial coats."""
+    if not isinstance(candidate, dict):
+        raise ValueError("coat must be a JSON object")
+    extra = set(candidate) - set(COAT_ROLES)
+    if extra:
+        raise ValueError(f"coat has unknown parts: {', '.join(sorted(extra))}")
+    out = {}
+    for role in COAT_ROLES:
+        value = candidate.get(role)
+        if not isinstance(value, str) or not HEX.match(value):
+            raise ValueError(f"coat.{role} must be a #rrggbb colour")
+        out[role] = value.lower()
+    return out
+
+
 def validate(candidate: dict) -> dict:
     """Merge defaults and reject unsafe or unusable settings."""
     if not isinstance(candidate, dict):
@@ -260,6 +290,7 @@ def validate(candidate: dict) -> dict:
     cfg.update(candidate)
     if not isinstance(cfg.get("writing_enabled"), bool):
         raise ValueError("writing_enabled must be true or false")
+    cfg["coat"] = validate_coat(cfg.get("coat"))
     cfg["system_prompt"] = str(cfg.get("system_prompt") or "")
 
     for name in CAPABILITIES:

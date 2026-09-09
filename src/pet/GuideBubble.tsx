@@ -5,6 +5,7 @@ import {
   readGuideDialogue,
   type GuideDialogue,
 } from "./guideDialogue";
+import { useCoat } from "../ui/coatApply";
 import "./guideBubble.css";
 
 const EMPTY: GuideDialogue = {
@@ -16,6 +17,7 @@ const EMPTY: GuideDialogue = {
 
 /** Cross-monitor pointing explanation window. */
 export default function GuideBubble() {
+  useCoat();
   const [dialogue, setDialogue] = useState(() => readGuideDialogue() ?? EMPTY);
 
   useEffect(() => {

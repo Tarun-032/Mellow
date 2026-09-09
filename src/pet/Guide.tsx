@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { useEffect } from "react";
 import sprites from "./sprites.json" with { type: "json" };
+import { useCoat } from "../ui/coatApply";
 import "./guide.css";
 
 const SCALE = 2;
@@ -10,6 +11,7 @@ const TIP_X = PADDING + sprites.bone.tip.x * SCALE;
 const TIP_Y = PADDING + sprites.bone.tip.y * SCALE;
 
 export default function Guide() {
+  useCoat();
   useEffect(() => {
     const reduced = window.matchMedia("(prefers-reduced-motion: reduce)");
 

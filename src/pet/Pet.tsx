@@ -7,6 +7,7 @@ import { clock as meetingClock, useMeeting, viewMeeting } from "../meetings/useM
 import { GUIDE_DIALOGUE_KEY, type GuideDialogue } from "./guideDialogue";
 import { PHASE_LABEL, mmss, usePomodoro } from "./usePomodoro";
 import { useSocket } from "./useSocket";
+import { useCoat } from "../ui/coatApply";
 import { WritingPanel } from "./WritingPanel";
 import { bonePlacement, usePetMotion, type Reaction } from "./usePetMotion";
 import "./sprites.css"; // Generated sprite indices.
@@ -76,6 +77,7 @@ function resolvePose(
 }
 
 export default function Pet() {
+  useCoat();
   const {
     connected,
     state,

@@ -1,5 +1,5 @@
 import { useEffect, useState, type FormEvent, type ReactNode } from "react";
-import { listen } from "@tauri-apps/api/event";
+import { emit, listen } from "@tauri-apps/api/event";
 import Meetings from "../meetings/Meetings";
 import { MEETING_OPEN } from "../meetings/useMeeting";
 import {
@@ -16,6 +16,8 @@ import {
   Transport,
   type AgentInfo,
 } from "../ui/fields";
+import { CoatEditor } from "./CoatEditor";
+import { type Coat } from "../ui/coat";
 import "./settings.css";
 
 type SettingsData = {
@@ -44,6 +46,8 @@ type SettingsData = {
   /** AI enabled; false = pet-only mode. */
   ai_enabled: boolean;
   writing_enabled: boolean;
+  /** Mellow's five-colour coat. */
+  coat: Coat;
 };
 
 type Device = {
@@ -368,6 +372,8 @@ export default function Settings() {
         });
         setForm(result.settings);
         setSavedEngineKey(engineKey(result.settings));
+        // The pet window follows the saved coat, never the in-progress form.
+        emit("coat", result.settings.coat).catch(() => undefined);
         if (result.engine_changed) {
           setOpenSession(null);
           loadHistory();
@@ -619,15 +625,15 @@ export default function Settings() {
             <section className="settings-page" aria-labelledby="customize-heading">
               <div className="page-heading">
                 <h2 id="customize-heading">Make Mellow yours</h2>
-                <p>Appearance, behavior, and pet controls will live together here.</p>
+                <p>Give Mellow a coat of your own. Start from a preset, tweak it until it feels right.</p>
               </div>
-              <div className="customize-empty">
-                <span className="customize-empty__mark" aria-hidden="true">M</span>
-                <div>
-                  <h3>Coming in a future update</h3>
-                  <p>Appearance, behavior, and more ways to personalize Mellow are coming soon.</p>
-                </div>
-              </div>
+              <CoatEditor
+                coat={form.coat}
+                onChange={(coat) => {
+                  setForm((current) => (current ? { ...current, coat } : current));
+                  setNotice(null);
+                }}
+              />
             </section>
           )}
 

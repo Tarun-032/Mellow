@@ -27,7 +27,10 @@ for (const file of files) {
     violations.push(relative(root, file));
   }
 
-  // Bundled url() targets must exist; skip data/http/#.
+  // Bundled url() targets must exist; skip data/http/#. CSS only - JS builds
+  // url() at runtime (coatApply's recoloured blob URLs), so there is nothing on
+  // disk to resolve. The root-relative check above still covers every file.
+  if (extname(file) !== ".css") continue;
   for (const match of source.matchAll(/url\(\s*["']?([^"')]+)["']?\s*\)/g)) {
     const value = match[1];
     if (/^(?:data:|https?:|#)/i.test(value)) continue;

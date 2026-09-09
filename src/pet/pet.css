@@ -11,6 +11,9 @@
   --paper: #f5ecdd;
   /* Dark fur. */
   --brown: #9b532d;
+  /* The patch, and the inner ear. Overridden per coat by applyCoat. */
+  --tan: #c9824a;
+  --nose: #f18973;
   /* Timer colors. */
   --red: #b8402f;
   --green: #4f7a3a;
@@ -91,7 +94,7 @@ body,
 }
 
 .pet-sprite {
-  background-image: url("./sprites.png");
+  background-image: var(--coat-sprites, url("./sprites.png"));
   background-size: calc(var(--cell-count) * var(--cell-px)) var(--cell-px);
   background-position: calc(var(--cell) * var(--cell-px) * -1) 0;
   image-rendering: pixelated;
@@ -188,7 +191,7 @@ body,
 }
 .pet--writing .pet-sprite {
   --cell: 0;
-  background-image: url("./writing.png");
+  background-image: var(--coat-writing, url("./writing.png"));
   background-size: calc(var(--frames-writing) * var(--cell-px)) var(--cell-px);
 }
 
@@ -409,7 +412,7 @@ body,
 .pet-eyes--talking .pet-eye--left,
 .pet-eyes--angry .pet-eye--left {
   left: calc(18 * var(--px));
-  background: #f5ecdd;
+  background: var(--paper);
 }
 
 .pet-eyes--idle .pet-eye--right,
@@ -418,7 +421,7 @@ body,
 .pet-eyes--talking .pet-eye--right,
 .pet-eyes--angry .pet-eye--right {
   left: calc(32 * var(--px));
-  background: #c9824a;
+  background: var(--tan);
 }
 
 .pet-eyes--idle .pet-eye::before,
@@ -431,7 +434,7 @@ body,
   top: var(--px);
   width: calc(4 * var(--px));
   height: calc(4 * var(--px));
-  background: #4c2923;
+  background: var(--ink);
   animation: eye-blink 4.8s steps(1, end) infinite;
 }
 
@@ -445,7 +448,7 @@ body,
   top: calc(2 * var(--px));
   width: var(--px);
   height: var(--px);
-  background: #f5ecdd;
+  background: var(--paper);
   translate: var(--gaze-x) var(--gaze-y);
   animation: eye-blink 4.8s steps(1, end) infinite;
 }
@@ -458,7 +461,7 @@ body,
   top: calc(3 * var(--px));
   width: calc(4 * var(--px));
   height: calc(3 * var(--px));
-  background: #4c2923;
+  background: var(--ink);
 }
 
 .pet-eyes--angry .pet-eye::after {
@@ -467,17 +470,17 @@ body,
   top: 0;
   width: calc(2 * var(--px));
   height: var(--px);
-  background: #4c2923;
+  background: var(--ink);
 }
 
 .pet-eyes--angry .pet-eye--left::after {
   left: var(--px);
-  box-shadow: calc(2 * var(--px)) var(--px) #4c2923;
+  box-shadow: calc(2 * var(--px)) var(--px) var(--ink);
 }
 
 .pet-eyes--angry .pet-eye--right::after {
   left: calc(3 * var(--px));
-  box-shadow: calc(-2 * var(--px)) var(--px) #4c2923;
+  box-shadow: calc(-2 * var(--px)) var(--px) var(--ink);
 }
 
 /* Angry stare. */
@@ -496,7 +499,7 @@ body,
 
 .pet-eyes--hunt .pet-eye::before {
   inset: 0;
-  background: #4c2923;
+  background: var(--ink);
 }
 
 .pet-eyes--hunt .pet-eye--left {
@@ -518,7 +521,7 @@ body,
   top: var(--px);
   width: var(--px);
   height: var(--px);
-  background: #f5ecdd;
+  background: var(--paper);
   translate: var(--gaze-x) var(--gaze-y);
   animation: none;
 }
@@ -547,15 +550,15 @@ body,
   width: calc(5 * var(--px));
   height: calc(3 * var(--px));
   /* Cover the baked mouth. */
-  background: #f5ecdd;
+  background: var(--paper);
 }
 
 .pet-mouth--talking::before {
   content: "";
   position: absolute;
   inset: 0;
-  background: #4c2923;
-  border-bottom: var(--px) solid #f18973;
+  background: var(--ink);
+  border-bottom: var(--px) solid var(--nose);
   box-sizing: border-box;
   transform-origin: top;
   animation: mouth-flap 0.24s steps(2, end) infinite;
@@ -588,20 +591,20 @@ body,
   top: 48px;
   width: var(--px);
   height: var(--px);
-  background: #f18973;
+  background: var(--nose);
   box-shadow:
-    -6px -6px #f18973,
-    -3px -6px #f18973,
-    3px -6px #f18973,
-    6px -6px #f18973,
-    -6px -3px #f18973,
-    -3px -3px #f18973,
-    0 -3px #f18973,
-    3px -3px #f18973,
-    6px -3px #f18973,
-    -3px 0 #f18973,
-    3px 0 #f18973,
-    0 3px #f18973;
+    -6px -6px var(--nose),
+    -3px -6px var(--nose),
+    3px -6px var(--nose),
+    6px -6px var(--nose),
+    -6px -3px var(--nose),
+    -3px -3px var(--nose),
+    0 -3px var(--nose),
+    3px -3px var(--nose),
+    6px -3px var(--nose),
+    -3px 0 var(--nose),
+    3px 0 var(--nose),
+    0 3px var(--nose);
   animation: heart-flight 0.85s steps(7, end) both;
 }
 
@@ -655,7 +658,7 @@ body,
   top: 48px;
   width: calc(2 * var(--px));
   height: calc(3 * var(--px));
-  background: #f18973;
+  background: var(--nose);
   animation: steam-rise 0.72s steps(5, end) both;
 }
 .particles--steam i:nth-child(2) {
@@ -678,7 +681,7 @@ body,
 .particles--sleep i {
   left: 118px;
   top: 70px;
-  color: #4c2923;
+  color: var(--ink);
   font: 600 18px/1 "Pixelify Sans", monospace;
   animation: sleep-z 3.6s steps(6, end) infinite;
 }
@@ -722,12 +725,12 @@ body,
   border-style: solid;
   border-width: calc(5 * var(--px)) calc(8 * var(--px)) calc(7 * var(--px))
     calc(6 * var(--px));
-  border-image-source: url("./bubble.png");
+  border-image-source: var(--coat-bubble, url("./bubble.png"));
   border-image-slice: 5 8 7 6 fill;
   border-image-repeat: stretch;
   image-rendering: pixelated;
   /* Hide slice seams. */
-  background-color: #f5ecdd;
+  background-color: var(--paper);
   background-clip: padding-box;
   /* Head anchor. */
 }
@@ -924,12 +927,12 @@ body,
   border-style: solid;
   border-width: calc(5 * var(--px)) calc(8 * var(--px)) calc(7 * var(--px))
     calc(6 * var(--px));
-  border-image-source: url("./bubble.png");
+  border-image-source: var(--coat-bubble, url("./bubble.png"));
   border-image-slice: 5 8 7 6 fill;
   border-image-repeat: stretch;
   image-rendering: pixelated;
   /* Hide slice seams. */
-  background-color: #f5ecdd;
+  background-color: var(--paper);
   background-clip: padding-box;
   font: 400 14px/1.45 var(--panel-font);
   color: var(--ink);

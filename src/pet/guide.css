@@ -29,6 +29,6 @@ body,
   top: 6px;
   width: 24px;
   height: 24px;
-  background: url("./bone.png") 0 0 / 100% 100% no-repeat;
+  background: var(--coat-bone, url("./bone.png")) 0 0 / 100% 100% no-repeat;
   image-rendering: pixelated;
 }
