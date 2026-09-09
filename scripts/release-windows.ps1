@@ -24,9 +24,11 @@ if ($versions.Count -ne 1) {
     throw "Release versions do not match: $($versions -join ', ')"
 }
 
-$oldKeyPath = $env:TAURI_SIGNING_PRIVATE_KEY_PATH
+# The bundler reads TAURI_SIGNING_PRIVATE_KEY (the key itself). The _PATH form is
+# only understood by `tauri signer sign`, so using it here produced an unsigned build.
+$oldKey = $env:TAURI_SIGNING_PRIVATE_KEY
 $oldPassword = $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD
-$env:TAURI_SIGNING_PRIVATE_KEY_PATH = $keyPath
+$env:TAURI_SIGNING_PRIVATE_KEY = (Get-Content -LiteralPath $keyPath -Raw).Trim()
 $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = (Get-Content -LiteralPath $passwordPath -Raw).Trim()
 
 try {
@@ -43,6 +45,6 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "Publishing updater files failed." }
 }
 finally {
-    $env:TAURI_SIGNING_PRIVATE_KEY_PATH = $oldKeyPath
+    $env:TAURI_SIGNING_PRIVATE_KEY = $oldKey
     $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = $oldPassword
 }

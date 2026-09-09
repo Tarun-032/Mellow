@@ -75,6 +75,12 @@ if ($SkipUpload) {
     return
 }
 
+# gh writes to stderr on ordinary outcomes ("release not found"), and in Windows
+# PowerShell that becomes a terminating NativeCommandError under -ErrorActionPreference
+# Stop. Exit codes are checked explicitly below instead.
+$previousPreference = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
+
 if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
     throw "The GitHub CLI (gh) is not installed, so $assetName and latest.json were not uploaded. Install gh, or re-run with -SkipUpload and attach both files by hand."
 }
@@ -102,6 +108,7 @@ if ($LASTEXITCODE -eq 0) {
 if ($LASTEXITCODE -ne 0) { throw "Could not upload assets to $tag." }
 
 $url = (& gh release view $tag --json url | ConvertFrom-Json).url
+$ErrorActionPreference = $previousPreference
 Write-Output ""
 Write-Output "Uploaded $assetName and latest.json to $tag"
 Write-Output "Review and publish the draft: $url"
