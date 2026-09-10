@@ -7,7 +7,7 @@ import re
 import sys
 import threading
 import time
-from contextlib import asynccontextmanager, suppress
+from contextlib import aclosing, asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import NamedTuple
@@ -17,7 +17,7 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 from mellowd import (
-    act, agents, capture, config, errors, llm, locator, meetings, point, remind, sessions, stt, tts, writing,
+    act, agents, capture, config, errors, llm, locator, meetings, perf, point, remind, sessions, stt, transport, tts, writing,
 )
 from mellowd.version import PROTOCOL, SERVICE, VERSION
 
@@ -90,9 +90,14 @@ async def lifespan(_app: FastAPI):
 
     await asyncio.to_thread(meetings.manager.store.recover)
     task = asyncio.create_task(warm_models())
-    yield
-    await meetings.manager.shutdown()
-    task.cancel()
+    async with transport.lifespan():
+        try:
+            yield
+        finally:
+            await meetings.manager.shutdown()
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
 
 
 async def warm_models() -> None:
@@ -526,6 +531,8 @@ async def clear_history():
 
 async def send(ws: WebSocket, **msg) -> None:
     await ws.send_text(json.dumps(msg))
+    if msg.get("type") == "reply_chunk" and msg.get("text"):
+        perf.mark("first_text_emitted")
 
 
 @dataclass
@@ -786,6 +793,7 @@ def _shot(
 HIDE_TIMEOUT = 0.4
 
 
+@perf.timed("capture")
 async def _unseen_shot(
     session: Session, max_edge: int = capture.MAX_EDGE
 ) -> tuple[Shot | None, str, str]:
@@ -865,6 +873,7 @@ def _split_point(text: str, token=None) -> tuple[str, str, Pick | Deed | None]:
     return text[:cut], text[cut:], point
 
 
+@perf.timed("answer_pass")
 async def _pass(
     session: Session,
     cfg: dict,
@@ -927,21 +936,22 @@ async def _pass(
             if cfg.get("llm", {}).get("mode") == "agent"
             else llm.chat(session.history, cfg, image=image)
         )
-        async for chunk in stream:
-            if not settled:
-                held += chunk
-                text, asked = resolve(held)
-                if asked:
-                    return "", True, None
-                if token is _DO_TOKEN and _declined(held):
-                    # Respect an action veto.
-                    return "", False, NONE
-                # Hold the scan window.
-                if not (token or _POINT_TOKEN).search(held) and len(held.lstrip()) < LOOK_SCAN:
-                    continue
-                settled = True
-                chunk, held = text, ""
-            await emit(chunk)
+        async with aclosing(stream):
+            async for chunk in stream:
+                if not settled:
+                    held += chunk
+                    text, asked = resolve(held)
+                    if asked:
+                        return "", True, None
+                    if token is _DO_TOKEN and _declined(held):
+                        # Respect an action veto.
+                        return "", False, NONE
+                    # Hold the scan window.
+                    if not (token or _POINT_TOKEN).search(held) and len(held.lstrip()) < LOOK_SCAN:
+                        continue
+                    settled = True
+                    chunk, held = text, ""
+                await emit(chunk)
     except asyncio.CancelledError:
         # Preserve cancelled text.
         if held and partial is not None:
@@ -1023,6 +1033,7 @@ async def _aim(session: Session, target: point.Target) -> None:
         label=target.label,
         monitor=target.monitor,
     )
+    perf.mark("pointer_dispatched")
 
 
 def _declined(text: str) -> bool:
@@ -1073,6 +1084,7 @@ def _act_cfg(cfg: dict, things: list[act.Thing]) -> dict:
     return {**cfg, "llm": {**cfg["llm"], "doing": act.describe(things)}}
 
 
+@perf.timed("action")
 async def _act(
     session: Session, cfg: dict, speak: bool, partial: dict, prompt: str
 ) -> tuple[str, bool]:
@@ -1249,8 +1261,10 @@ async def answer(session: Session, prompt: str) -> None:
                         fresh, _, _ = await _unseen_shot(session, capture.POINT_EDGE)
                         if fresh is None:
                             log.info("could not verify the localized target; withholding the bone")
+                            perf.mark("pointer_withheld")
                             aimed = None
                         elif locator.changed_at(shot, fresh, aimed):
+                            perf.mark("target_changed_retry")
                             log.info("localized area changed; resolving once on the fresh frame")
                             shot = fresh
                             cands = await asyncio.to_thread(
@@ -1281,6 +1295,7 @@ async def answer(session: Session, prompt: str) -> None:
                                     log.info(
                                         "localized area moved twice; withholding the bone"
                                     )
+                                    perf.mark("pointer_withheld")
                                     aimed = None
                                 else:
                                     shot = verified
@@ -1351,6 +1366,7 @@ async def run_turn(session: Session, prompt: str) -> None:
         raise
     except Exception as e:
         log.exception("turn failed")
+        perf.outcome("failed")
         # Record failed turns.
         await asyncio.to_thread(
             sessions.record, "turn_failed", reason=errors.message(e)
@@ -1363,6 +1379,7 @@ async def run_turn(session: Session, prompt: str) -> None:
         await send(session.ws, type="state", state="idle")
 
 
+@perf.timed("transcription")
 def _transcribe_voice(audio, cancelled):
     # Serialize local transcription.
     with _transcription_lock:
@@ -1373,6 +1390,7 @@ async def _voice_turn(session: Session, audio) -> None:
     try:
         text = await asyncio.to_thread(_transcribe_voice, audio, session.writer.cancelled)
         if meetings.manager.active or session.writer.cancelled.is_set():
+            perf.outcome("cancelled")
             return
         if not text and session.recorder.last_stats["peak"] < stt.MIN_PEAK:
             await asyncio.to_thread(session.recorder.reopen)
@@ -1381,11 +1399,13 @@ async def _voice_turn(session: Session, audio) -> None:
             text_shown = text or "…didn't catch that"
         # Show only recognition failures.
         if not text:
+            perf.outcome("no_speech")
             await send(session.ws, type="transcript", text=text_shown)
         await run_turn(session, text)
     except asyncio.CancelledError:
         raise
     except Exception as exc:
+        perf.outcome("failed")
         await send(session.ws, type="error", message=errors.message(exc))
         await send(session.ws, type="state", state="idle")
 
@@ -1403,6 +1423,7 @@ async def _writing_start(session: Session) -> None:
 async def handle(session: Session, msg: dict) -> None:
     ws = session.ws
     kind = msg.get("type")
+    received = time.perf_counter()
     if meetings.manager.active and kind in {"ptt_start", "ptt_end", "text", "writing_retry"}:
         await send(ws, type="error", message="Meeting transcription is active. Stop the meeting before talking to Mellow.")
         return
@@ -1462,7 +1483,9 @@ async def handle(session: Session, msg: dict) -> None:
         await session.stop_meter()
         await send(ws, type="state", state="thinking")
         # Keep transcription cancellable.
-        session.turn = asyncio.create_task(_voice_turn(session, audio))
+        session.turn = asyncio.create_task(perf.run(
+            _voice_turn(session, audio), perf.Turn("voice", received)
+        ))
 
     elif kind == "text":
         await session.abort()
@@ -1477,7 +1500,7 @@ async def handle(session: Session, msg: dict) -> None:
         await send(ws, type="state", state="thinking")
         await _writing_start(session)
         session.turn = asyncio.create_task(
-            run_turn(session, msg.get("text", "").strip())
+            perf.run(run_turn(session, msg.get("text", "").strip()), perf.Turn("text", received))
         )
 
     elif kind == "cancel":
