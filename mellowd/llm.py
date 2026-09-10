@@ -1,17 +1,33 @@
 """Two adapters, not a plugin system."""
 
+import asyncio
 import json
 import logging
 import re
+from contextlib import aclosing
 from typing import AsyncIterator
 
 import httpx
 
-from mellowd import config, errors
+from mellowd import config, errors, perf, transport
 
 log = logging.getLogger("mellowd.llm")
 
 TIMEOUT = httpx.Timeout(120.0, connect=10.0)
+
+
+async def _finish_stream(lines):
+    """Consume HTTP EOF after [DONE] so a healthy socket can return to the pool.
+
+    Most providers deliver EOF in the same packet. A provider that keeps the
+    connection body open must not stall a completed answer for the read timeout.
+    """
+    try:
+        async with asyncio.timeout(0.05):
+            async for _ in lines:
+                pass
+    except (TimeoutError, httpx.HTTPError):
+        pass  # The surrounding response context closes this non-reusable socket.
 
 # A prompt is a request, not a guarantee
 _ALWAYS = (
@@ -532,6 +548,7 @@ _GEMMA_THINK_LEVEL = {
 }
 
 
+@perf.model_stream
 async def _openai(
     cfg: dict, messages: list[dict], image_b64: str | None = None
 ) -> AsyncIterator[str]:
@@ -586,7 +603,7 @@ async def _openai(
         {"Authorization": f"Bearer {cfg['api_key']}"} if cfg.get("api_key") else {}
     )
 
-    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+    async with transport.client() as client:
         async with client.stream(
             "POST",
             f"{cfg['base_url'].rstrip('/')}/chat/completions",
@@ -595,11 +612,13 @@ async def _openai(
         ) as r:
             await _raise_with_body(r, cfg)
             seen = _Stream()
-            async for line in r.aiter_lines():
+            lines = r.aiter_lines()
+            async for line in lines:
                 if not line.startswith("data:"):
                     continue
                 body = line[5:].strip()
                 if body == "[DONE]":
+                    await _finish_stream(lines)
                     break
                 if not body:
                     continue
@@ -664,6 +683,7 @@ def _with_image_anthropic(messages: list[dict], image_b64: str) -> list[dict]:
     return out
 
 
+@perf.model_stream
 async def _anthropic(
     cfg: dict, messages: list[dict], image_b64: str | None = None
 ) -> AsyncIterator[str]:
@@ -691,7 +711,7 @@ async def _anthropic(
     }
     base = cfg.get("base_url") or "https://api.anthropic.com/v1"
 
-    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+    async with transport.client() as client:
         async with client.stream(
             "POST", f"{base.rstrip('/')}/messages", json=payload, headers=headers
         ) as r:
@@ -900,8 +920,9 @@ async def chat(
         section["model"],
         " +screenshot" if image_b64 else "",
     )
-    async for chunk in adapter(section, messages, image_b64):
-        yield chunk
+    async with aclosing(adapter(section, messages, image_b64)) as stream:
+        async for chunk in stream:
+            yield chunk
 
 
 async def complete_text(prompt: str, cfg: dict, system: str, image: bytes | None = None,
@@ -917,7 +938,8 @@ async def complete_text(prompt: str, cfg: dict, system: str, image: bytes | None
     adapter = _anthropic if section["provider"] == "anthropic" else _openai
     import base64
     image_b64 = base64.b64encode(image).decode("ascii") if image else None
-    return "".join([part async for part in adapter(section, [{"role": "user", "content": prompt}], image_b64)]).strip()
+    async with aclosing(adapter(section, [{"role": "user", "content": prompt}], image_b64)) as stream:
+        return "".join([part async for part in stream]).strip()
 
 
 async def complete_vision(prompt: str, cfg: dict, image: bytes) -> str:
@@ -939,12 +961,11 @@ async def complete_vision(prompt: str, cfg: dict, image: bytes) -> str:
     image_b64 = base64.b64encode(image).decode("ascii")
     adapter = _anthropic if section["provider"] == "anthropic" else _openai
     chunks = []
-    async for chunk in adapter(
-        section, [{"role": "user", "content": prompt}], image_b64
-    ):
-        chunks.append(chunk)
-        if len("".join(chunks)) > 240:
-            break
+    async with aclosing(adapter(section, [{"role": "user", "content": prompt}], image_b64)) as stream:
+        async for chunk in stream:
+            chunks.append(chunk)
+            if len("".join(chunks)) > 240:
+                break
     return "".join(chunks).strip()
 
 
@@ -957,14 +978,15 @@ async def test(cfg: dict) -> str:
     }
     chunks = []
     # anchor=False: the identity exchanges would talk the model out of replying with one literal word
-    async for chunk in chat(
+    async with aclosing(chat(
         [{"role": "user", "content": "Reply with only the word connected."}],
         probe,
         anchor=False,
-    ):
-        chunks.append(chunk)
-        if len("".join(chunks)) >= 80:
-            break
+    )) as stream:
+        async for chunk in stream:
+            chunks.append(chunk)
+            if len("".join(chunks)) >= 80:
+                break
     answer = "".join(chunks).strip()
     if not answer:
         raise RuntimeError("provider returned an empty response")

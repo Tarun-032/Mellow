@@ -7,7 +7,7 @@ import io
 import threading
 import time
 
-from mellowd import capture
+from mellowd import capture, perf
 
 LIMIT = 20000
 _INPUT_LOCK = threading.Lock()
@@ -314,6 +314,7 @@ def resolve(seconds: float) -> Target:
     return target
 
 
+@perf.timed("writing_context")
 def context(target: Target) -> tuple[str, bytes | None]:
     """Visible, foreground-window-only context, not an offscreen document dump."""
     if not target.hwnd or _win().GetForegroundWindow() != target.hwnd:
@@ -458,6 +459,7 @@ class _Clipboard:
             self.user.DestroyWindow(self.window)
 
 
+@perf.timed("writing_insertion")
 def insert(target: Target, text: str, cancelled: threading.Event, previous: Insertion | None = None) -> Insertion:
     attempted = False
     try:

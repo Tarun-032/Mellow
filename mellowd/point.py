@@ -5,6 +5,8 @@ import re
 import time
 from dataclasses import dataclass
 
+from mellowd import perf
+
 log = logging.getLogger(__name__)
 
 # Bounds on the UIA walk.
@@ -152,6 +154,7 @@ def score(name: str, wanted: list[str]) -> float:
 # --- tier 1: the accessibility tree -----------------------------------------
 
 
+@perf.timed("uia")
 def uia_candidates(hwnd: int = 0) -> tuple[list[tuple], tuple | None]:
     """(every named visible control, where the page inside it starts)."""
     try:
@@ -212,6 +215,7 @@ def uia_candidates(hwnd: int = 0) -> tuple[list[tuple], tuple | None]:
 
 # --- tier 2: what the screen actually says ----------------------------------
 
+@perf.timed("ocr")
 async def _read(pixels) -> list[tuple]:
     """Windows' own OCR engine, over one frame."""
     import io
@@ -277,29 +281,57 @@ async def _read(pixels) -> list[tuple]:
     return out
 
 
+@dataclass
+class _OCRJob:
+    worker: object
+    done: list
+    deadline: float
+    expired: bool = False
+
+
 def ocr_candidates(pixels) -> list[tuple]:
     """Every word on screen, with its box."""
+    return _collect_ocr(_start_ocr(pixels))
+
+
+def _start_ocr(pixels):
+    """Start the existing WinRT worker; its deadline includes overlapped work."""
     if pixels is None:
-        return []
+        return None
     import asyncio
     import threading
+    from contextvars import copy_context
 
     # winsdk is async all the way down
     done: list = []
 
     def work():
         try:
-            done.append(asyncio.run(_read(pixels)))
+            rows = asyncio.run(_read(pixels))
+            done.append((time.monotonic(), rows))
         except Exception:
             log.exception("ocr failed")
 
-    worker = threading.Thread(target=work, daemon=True)
+    context = copy_context()
+    worker = threading.Thread(target=context.run, args=(work,), daemon=True)
+    deadline = time.monotonic() + OCR_BUDGET
     worker.start()
-    worker.join(OCR_BUDGET)
-    if not done:
-        log.warning("ocr gave nothing back within %.1fs", OCR_BUDGET)
+    return _OCRJob(worker, done, deadline)
+
+
+def _collect_ocr(pending) -> list[tuple]:
+    if pending is None:
         return []
-    out = done[0]
+    if pending.expired:
+        return []
+    worker, done, deadline = pending.worker, pending.done, pending.deadline
+    worker.join(max(0.0, deadline - time.monotonic()))
+    if not done or done[0][0] > deadline:
+        pending.expired = True
+        log.warning("ocr gave nothing back within %.1fs", OCR_BUDGET)
+        perf.mark("ocr_unavailable")
+        return []
+    out = done[0][1]
     log.info("ocr read %d words and lines", len(out))
     return out
 
@@ -389,6 +421,7 @@ def _covers(outer: tuple, inner: tuple, slack: float = 2.0) -> bool:
     )
 
 
+@perf.timed("screen_evidence")
 def candidates(
     query: str,
     pixels=None,
@@ -400,13 +433,14 @@ def candidates(
     mon = mon or monitor()
     if mon is None:
         return []
+    pending_ocr = _start_ocr(pixels)
     tree, page = uia_candidates(hwnd)
     # Ignore a document that belongs to another monitor.
     if page is not None and _shared(page, mon) < MIN_PAGE * mon["width"] * mon["height"]:
         log.info("point: the document is not on this screen; no split")
         page = None
     raw = []
-    for name, left, top, width, height, kind, source in tree + ocr_candidates(pixels):
+    for name, left, top, width, height, kind, source in tree + _collect_ocr(pending_ocr):
         if not name or not name.strip():
             continue
         # OCR boxes are local to the captured bitmap

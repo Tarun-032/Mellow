@@ -10,7 +10,7 @@ import httpx
 import numpy as np
 import sounddevice as sd
 
-from mellowd import config, errors, models, wav
+from mellowd import config, errors, models, perf, wav
 
 log = logging.getLogger("mellowd.tts")
 
@@ -233,6 +233,7 @@ def _kokoro_synth(text: str, section: dict) -> tuple[np.ndarray, int]:
     )
 
 
+@perf.timed("speech_synthesis")
 def synth(text: str, cfg: dict | None = None) -> tuple[np.ndarray, int]:
     """Blocking."""
     section = (cfg or config.load())["tts"]
@@ -327,4 +328,9 @@ class Speaker:
             if clip is None:
                 return
             samples, rate = clip
-            await asyncio.to_thread(sd.play, samples, rate, blocking=True)
+            await asyncio.to_thread(self._submit, samples, rate)
+
+    @staticmethod
+    def _submit(samples, rate):
+        perf.mark("first_audio_submitted")
+        sd.play(samples, rate, blocking=True)

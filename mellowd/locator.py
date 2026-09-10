@@ -11,7 +11,7 @@ from dataclasses import dataclass, replace
 
 from PIL import Image, ImageDraw, ImageFont
 
-from mellowd import agents, llm, point
+from mellowd import agents, llm, perf, point
 
 log = logging.getLogger(__name__)
 
@@ -279,7 +279,8 @@ async def _strict(cfg: dict, prompt: str, image: bytes, pattern: re.Pattern) -> 
     stage = "coarse" if pattern is _REGION else "fine"
     for attempt in range(2):
         asked = prompt if attempt == 0 else prompt + "\nYour last response was invalid. Return only the required bracketed token."
-        answer = await _call(cfg, asked, image)
+        with perf.purpose("locator_overview" if stage == "coarse" else "locator_refinement"):
+            answer = await _call(cfg, asked, image)
         choice = _bare_choice(answer, stage)
         if choice:
             return choice
@@ -317,6 +318,7 @@ def _lexical_guard(chosen: point.Target, regional: list[point.Target]) -> point.
     return best
 
 
+@perf.timed("localization")
 async def locate(
     query: str, shot, cfg: dict, candidates: list[point.Target]
 ) -> point.Target | None:
@@ -435,7 +437,8 @@ async def _agent_pick(
         )
         if attempt:
             asked += "\nThe previous selection was invalid. Choose one value from the schema enum."
-        raw = await agents.complete_grounded(asked, cfg, image, messages, schema)
+        with perf.purpose("locator_overview" if stage == "coarse" else "locator_refinement"), perf.span("agent_locator"):
+            raw = await agents.complete_grounded(asked, cfg, image, messages, schema)
         choice, answer = _grounded_fields(raw, stage, valid_set, candidates)
         if choice:
             return choice, answer
@@ -443,6 +446,7 @@ async def _agent_pick(
     return None, answer
 
 
+@perf.timed("localization_and_answer")
 async def locate_and_answer(
     query: str,
     shot,
@@ -564,6 +568,7 @@ async def locate_and_answer(
     )
 
 
+@perf.timed("target_verification")
 def changed_at(before, after, target: point.Target) -> bool:
     """Whether the localized area moved enough to make the point stale."""
     if before.monitor != after.monitor or not target.bounds:

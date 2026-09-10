@@ -9,7 +9,7 @@ import re
 import threading
 import uuid
 
-from mellowd import agents, config, llm, sessions
+from mellowd import agents, config, llm, perf, sessions
 from mellowd import writing_input as desktop
 
 log = logging.getLogger("mellowd.writing")
@@ -220,8 +220,10 @@ def field_excerpt(target: desktop.Target, limit: int = 2400) -> str:
 
 async def model(prompt: dict, cfg: dict, system: str, image=None, temperature: float = 0.2) -> str:
     backend = agents if cfg["llm"]["mode"] == "agent" else llm
-    return await backend.complete_text(json.dumps(prompt, ensure_ascii=False), cfg, system,
-                                       image=image, temperature=temperature)
+    name = "writing_router" if system == ROUTER else "writing_draft"
+    with perf.purpose(name), perf.span(name):
+        return await backend.complete_text(json.dumps(prompt, ensure_ascii=False), cfg, system,
+                                           image=image, temperature=temperature)
 
 
 # Classifying wants the same answer every time; writing for a person does not.
@@ -262,6 +264,7 @@ class Writer:
         self.finding = None
 
 
+@perf.timed("focused_field_wait")
 async def where(writer: Writer) -> desktop.Target:
     """The field the user focused, waiting on the search started at ptt_start."""
     if writer.target is not None:
@@ -305,6 +308,8 @@ async def _insert(session, send, pending):
         return
     await status(session, send, "inserting", message="Inserting your draft…")
     result = await asyncio.to_thread(desktop.insert, pending["target"], pending["text"], token, pending["previous"])
+    perf.mark("insertion_completed")
+    perf.outcome("writing_" + result.status)
     if token.is_set():
         return
     await asyncio.to_thread(sessions.record, "writing_result", status=result.status,
@@ -445,6 +450,7 @@ async def handle(session, prompt: str, send) -> bool:
         raise
     except Exception:
         log.exception("Writing request failed")
+        perf.outcome("failed")
         if not token.is_set():
             message = ("Writing stopped unexpectedly. Check the field before trying again."
                        if insertion_started else "I couldn't prepare a reliable draft. Nothing was inserted; try again.")
