@@ -552,6 +552,8 @@ class Session:
     meter: asyncio.Task | None = None
     # Push-to-talk readiness.
     mic_ready: bool = False
+    ptt_pending: asyncio.Task | None = None
+    ptt_cancelled: threading.Event = field(default_factory=threading.Event)
     # Connection lifetime.
     alive: bool = True
     reminders: asyncio.Task | None = None
@@ -573,6 +575,8 @@ class Session:
         if standby():
             self.mic_ready = False
             asyncio.create_task(self._send_mic("off"))
+            return
+        if self.mic_ready:
             return
         if self.warmup is None or self.warmup.done():
             self.warmup = asyncio.create_task(self._warm_mic())
@@ -686,9 +690,21 @@ class Session:
             except Exception:
                 log.exception("reminder tick failed")
 
+    async def cancel_ptt_start(self) -> None:
+        cancelled = getattr(self, "ptt_cancelled", None)
+        if cancelled is not None:
+            self.recorder.cancel_start(cancelled)
+        task, self.ptt_pending = self.ptt_pending, None
+        if task is not None and not task.done():
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
     async def abort(self) -> None:
         """Stop whatever the pet is doing, right now."""
         self.writer.cancel()
+        await self.cancel_ptt_start()
+        self.recorder.stop()
         await self.stop_meter()
         if self.turn and not self.turn.done():
             self.turn.cancel()
@@ -1480,6 +1496,36 @@ async def _writing_start(session: Session) -> None:
         )
 
 
+async def _listen_when_ready(session: Session) -> None:
+    """Honor this held press after wake-up without blocking key-release messages."""
+    cancelled = session.ptt_cancelled
+    try:
+        if not session.mic_ready:
+            session.wake_mic()
+            if session.warmup is not None:
+                # A release cancels this press, not the shared microphone warm-up.
+                await asyncio.shield(session.warmup)
+        if (cancelled.is_set() or not session.alive or not session.awake
+                or not session.mic_ready or meetings.manager.active or standby()):
+            return
+        await _writing_start(session)
+        await asyncio.to_thread(session.recorder.start, cancelled)
+        if cancelled.is_set():
+            return
+        await send(session.ws, type="state", state="listening")
+        session.start_meter()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        log.exception("starting push-to-talk failed")
+        session.mic_ready = False
+        session.recorder.stop()
+        session.writer.cancel()
+        await session.stop_meter()
+        await send(session.ws, type="error", message=errors.message(exc))
+        await send(session.ws, type="state", state="idle")
+
+
 async def handle(session: Session, msg: dict) -> None:
     ws = session.ws
     kind = msg.get("type")
@@ -1502,6 +1548,7 @@ async def handle(session: Session, msg: dict) -> None:
         else:
             session.awake = False
             session.mic_ready = False
+            await session.cancel_ptt_start()
             await asyncio.to_thread(session.recorder.close)
             await session._send_mic("off")
 
@@ -1522,19 +1569,14 @@ async def handle(session: Session, msg: dict) -> None:
             await send(ws, type="reply_chunk", text=PET_ONLY_LINE)
             await send(ws, type="state", state="idle")
             return
-        # Reject early presses.
-        if not session.mic_ready:
-            await session._send_mic("warming")
-            return
-        # Open the mic off-loop.
-        await asyncio.to_thread(session.recorder.start)
-        await send(ws, type="state", state="listening")
-        session.start_meter()
-        await _writing_start(session)
+        session.ptt_cancelled = threading.Event()
+        session.ptt_pending = asyncio.create_task(_listen_when_ready(session))
 
     elif kind == "ptt_end":
+        await session.cancel_ptt_start()
         # Ignore unmatched releases.
         if not session.recorder.active:
+            session.writer.cancel()
             return
         session.turn_monitor = capture.known_monitor(msg.get("monitor"))
         if msg.get("monitor") is not None and session.turn_monitor is None:

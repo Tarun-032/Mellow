@@ -9,7 +9,7 @@ import re
 import threading
 import uuid
 
-from mellowd import agents, config, llm, perf, sessions
+from mellowd import agents, config, llm, perf, sessions, tts
 from mellowd import writing_input as desktop
 
 log = logging.getLogger("mellowd.writing")
@@ -296,7 +296,11 @@ async def feedback(session, send, text: str, speak=False):
     await send(session.ws, type="reply_chunk", text=text)
     if speak and config.load()["tts"]["speak"]:
         session.speaker.begin()
-        await session.speaker.speak(text)
+        sentences = tts.SentenceBuffer()
+        for sentence in sentences.feed(text):
+            await session.speaker.speak(sentence)
+        for sentence in sentences.flush():
+            await session.speaker.speak(sentence)
         await session.speaker.finish()
     await send(session.ws, type="state", state="idle")
 
