@@ -969,6 +969,38 @@ async def complete_vision(prompt: str, cfg: dict, image: bytes) -> str:
     return "".join(chunks).strip()
 
 
+async def complete_grounded(
+    prompt: str, cfg: dict, image: bytes, messages: list[dict], schema: dict,
+) -> str:
+    """Select an annotated target and answer through either existing adapter.
+
+    The grammar is in the prompt so custom endpoints need no new API feature.
+    The locator validates the result before it can drive a pointer or speech.
+    """
+    import base64
+
+    system = persona(cfg) + (
+        "\nYou can see the attached screenshot. Ground the user's answer to its "
+        "annotations. Return only one JSON object: selection first, then answer. "
+        "The selection must be an allowed value in the schema; never invent "
+        "coordinates. The answer is your complete, concise spoken response to "
+        "the user, with no JSON, annotation IDs, or action/screen markers inside "
+        "it. Do not claim to have clicked anything. If selecting a coarse C cell, "
+        "leave answer empty: a detailed crop follows.\nSchema: " + json.dumps(schema)
+    )
+    section = {**_settings(cfg), "raw": True, "anchor": False,
+               "system_prompt": system, "temperature": 0.0,
+               "max_tokens": max(1024, cfg["llm"]["max_tokens"])}
+    history = [dict(m) for m in _drop_stale_refusals(messages)]
+    if history and history[-1].get("role") == "user":
+        history[-1]["content"] += "\n\n" + prompt
+    else:
+        history.append({"role": "user", "content": prompt})
+    adapter = _anthropic if section["provider"] == "anthropic" else _openai
+    async with aclosing(adapter(section, history, base64.b64encode(image).decode("ascii"))) as stream:
+        return "".join([part async for part in stream]).strip()
+
+
 async def test(cfg: dict) -> str:
     """Consume a tiny real completion so a saved key is never assumed valid."""
     # Was min(12, ...), which broke every reasoning model

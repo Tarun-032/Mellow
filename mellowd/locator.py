@@ -33,6 +33,10 @@ class GroundedResult:
     answer: str
 
 
+class InvalidGrounding(ValueError):
+    """The combined API response needs the original strict locator fallback."""
+
+
 def _json_result(text: str) -> dict | None:
     """A structured agent result, tolerating a surrounding code fence."""
     value = text.strip()
@@ -426,20 +430,34 @@ async def _agent_pick(
     stage: str,
     candidates: list[point.Target],
 ) -> tuple[str | None, str]:
-    """Structured agent selection, with one compatibility retry."""
+    """Structured selection; API failures fall back to the strict locator."""
     schema = _schema(valid)
     valid_set = {value.upper() for value in valid}
     answer = ""
-    for attempt in range(2):
+    agent = cfg["llm"].get("mode") == "agent"
+    for attempt in range(2 if agent else 1):
         asked = prompt + (
             "\nIn the JSON selection field use one allowed value exactly, "
             "without brackets or a REGION/TARGET prefix."
         )
         if attempt:
             asked += "\nThe previous selection was invalid. Choose one value from the schema enum."
-        with perf.purpose("locator_overview" if stage == "coarse" else "locator_refinement"), perf.span("agent_locator"):
-            raw = await agents.complete_grounded(asked, cfg, image, messages, schema)
-        choice, answer = _grounded_fields(raw, stage, valid_set, candidates)
+        with perf.purpose("locator_overview" if stage == "coarse" else "locator_refinement"), perf.span("grounded_locator"):
+            complete = agents.complete_grounded if agent else llm.complete_grounded
+            raw = await complete(asked, cfg, image, messages, schema)
+        if agent:
+            choice, answer = _grounded_fields(raw, stage, valid_set, candidates)
+        else:
+            parsed = _json_result(raw)
+            if (not parsed or not isinstance(parsed.get("selection"), str)
+                    or not isinstance(parsed.get("answer"), str)):
+                raise InvalidGrounding("missing selection or answer")
+            choice = parsed["selection"].strip().upper()
+            if choice not in valid_set:
+                raise InvalidGrounding("selection is not an offered element or cell")
+            answer = parsed["answer"].strip()
+            if re.search(r"\[(?:look|point|do|region|target)\b", answer, re.I):
+                answer = ""  # Resolve speech separately; never expose control tokens.
         if choice:
             return choice, answer
         log.info("structured agent locator output did not parse: %r", raw[:240])
@@ -454,7 +472,7 @@ async def locate_and_answer(
     candidates: list[point.Target],
     messages: list[dict],
 ) -> GroundedResult:
-    """Agent-mode grounding and the spoken answer in one CLI invocation."""
+    """Grounding and the spoken answer in one model call per image."""
     mon = shot.monitor
     coarse, overview = coarse_image(shot.pixels, candidates, mon)
     overview_list = "\n".join(
@@ -480,7 +498,7 @@ async def locate_and_answer(
         prompt, cfg, coarse, messages, coarse_valid, "coarse", overview
     )
     log.info(
-        "agent locator overview returned %s from %d measured elements",
+        "grounded locator overview returned %s from %d measured elements",
         picked,
         len(overview),
     )
@@ -491,6 +509,8 @@ async def locate_and_answer(
         if not 1 <= index <= len(overview):
             return GroundedResult(None, answer)
         chosen = _lexical_guard(overview[index - 1], overview)
+        if chosen is not overview[index - 1]:
+            answer = ""  # The explanation described a different control.
         return GroundedResult(
             replace(chosen, score=max(chosen.score, 1.0), monitor=dict(mon)),
             answer,
@@ -521,9 +541,10 @@ async def locate_and_answer(
     selected, fine_answer = await _agent_pick(
         fine_prompt, cfg, fine, messages, fine_valid, "fine", regional
     )
-    answer = fine_answer or answer
+    # A coarse-cell explanation cannot stand in for the refined target's answer.
+    answer = (fine_answer or answer) if cfg["llm"].get("mode") == "agent" else fine_answer
     log.info(
-        "agent locator fine crop returned %s from %d measured elements",
+        "grounded locator fine crop returned %s from %d measured elements",
         selected,
         len(regional),
     )
@@ -534,6 +555,8 @@ async def locate_and_answer(
         if not 1 <= index <= len(regional):
             return GroundedResult(None, answer)
         chosen = _lexical_guard(regional[index - 1], regional)
+        if chosen is not regional[index - 1]:
+            answer = ""
         return GroundedResult(
             replace(chosen, score=max(chosen.score, 1.0), monitor=dict(mon)),
             answer,

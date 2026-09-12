@@ -801,11 +801,11 @@ async def _unseen_shot(
     session.hidden.clear()
     await send(session.ws, type="capture", phase="begin")
     try:
-        await asyncio.wait_for(session.hidden.wait(), HIDE_TIMEOUT)
-    except asyncio.TimeoutError:
-        # Capture despite a hide timeout.
-        log.warning("shell did not confirm the hide in %.1fs, capturing anyway", HIDE_TIMEOUT)
-    try:
+        try:
+            await asyncio.wait_for(session.hidden.wait(), HIDE_TIMEOUT)
+        except asyncio.TimeoutError:
+            # Capture despite a hide timeout.
+            log.warning("shell did not confirm the hide in %.1fs, capturing anyway", HIDE_TIMEOUT)
         return await asyncio.to_thread(
             _shot, max_edge, getattr(session, "turn_monitor", None)
         )
@@ -815,8 +815,27 @@ async def _unseen_shot(
             await asyncio.shield(send(session.ws, type="capture", phase="end"))
 
 
-# Marker scan window.
+# Defensive scan for action replies and screen-request preambles.
 LOOK_SCAN = 64
+
+_LOOK_PREAMBLES = (
+    "sure", "let me", "let's", "i'll", "i will", "i need to",
+    "one moment", "just a moment", "give me a moment",
+)
+
+
+def _hold_look_opening(text: str) -> bool:
+    """Hold a possible screen request, but release ordinary prose immediately.
+
+    The model contract puts [look] first. Keep the old short scan for common
+    preambles as well, since some models say 'Let me look' before the marker.
+    """
+    head = text.lstrip().lower()
+    if len(head) >= LOOK_SCAN:
+        return False
+    if not head or (head.startswith("[") and "]" not in head):
+        return True
+    return any(prefix.startswith(head) or head.startswith(prefix) for prefix in _LOOK_PREAMBLES)
 
 # Screen marker.
 _LOOK_TOKEN = re.compile(re.escape(llm.LOOK) + r"(?![0-9A-Za-z])", re.IGNORECASE)
@@ -898,10 +917,10 @@ async def _pass(
     async def emit(text: str, final: bool = False) -> None:
         nonlocal reply, tail, point
         # Hide internal markers.
-        text = _LOOK_TOKEN.sub("", text)
         if not text and not final:
             return
-        text, tail, found = _split_point(tail + text, token)
+        # Combine the held tail first: [look] can arrive across several chunks.
+        text, tail, found = _split_point(_LOOK_TOKEN.sub("", tail + text), token)
         if found and point is None:
             point = found
             if on_point is not None:
@@ -946,9 +965,13 @@ async def _pass(
                     if token is _DO_TOKEN and _declined(held):
                         # Respect an action veto.
                         return "", False, NONE
-                    # Hold the scan window.
-                    if not (token or _POINT_TOKEN).search(held) and len(held.lstrip()) < LOOK_SCAN:
-                        continue
+                    if not (token or _POINT_TOKEN).search(held):
+                        if token is _DO_TOKEN or look not in ("ask", "strip"):
+                            waiting = len(held.lstrip()) < LOOK_SCAN
+                        else:
+                            waiting = look == "ask" and _hold_look_opening(held)
+                        if waiting:
+                            continue
                     settled = True
                     chunk, held = text, ""
                 await emit(chunk)
@@ -979,13 +1002,14 @@ async def _pass(
 async def _deliver(
     session: Session, text: str, speak: bool, partial: dict | None = None
 ) -> str:
-    """Deliver an already-grounded agent answer without another model call."""
+    """Deliver an already-grounded answer without another model call."""
     reply = text.strip()
     if not reply:
         reply = "I couldn't lock onto a safe target on this screen."
     if partial is not None:
         partial["text"] += reply
     await send(session.ws, type="reply_chunk", text=reply)
+    perf.mark("first_text_emitted")
     if speak:
         sentences = tts.SentenceBuffer()
         for sentence in sentences.feed(reply):
@@ -1155,7 +1179,40 @@ async def _act(
     return reply, bool(done)
 
 
-async def answer(session: Session, prompt: str) -> None:
+async def _prepare_pointing(session: Session, prompt: str):
+    """Read-only work overlapped with writing classification; never call a model."""
+    try:
+        with perf.span("point_preparation"):
+            shot, app, title = await _unseen_shot(session, capture.POINT_EDGE)
+            if shot is None:
+                return None
+            cands = await asyncio.to_thread(
+                point.candidates, prompt, shot.pixels, shot.monitor, None, shot.hwnd
+            )
+            return shot, app, title, cands
+    except Exception:
+        log.exception("early screen preparation failed; reading normally")
+        return None
+
+
+async def _discard_preparation(task) -> None:
+    if task is not None:
+        task.cancel()
+        with suppress(asyncio.CancelledError, Exception):
+            await task
+
+
+async def _resolve_point(prompt, shot, cfg, cands, history):
+    if cfg["llm"]["mode"] in ("cloud", "agent"):
+        try:
+            return await locator.locate_and_answer(prompt, shot, cfg, cands, history)
+        except locator.InvalidGrounding:
+            perf.mark("grounded_fallback")
+            log.info("combined output invalid; using the strict locator and separate answer")
+    return locator.GroundedResult(await locator.locate(prompt, shot, cfg, cands), "")
+
+
+async def answer(session: Session, prompt: str, prepared=None) -> None:
     """Stream one reply, speaking it sentence by sentence as it arrives."""
     ws = session.ws
     if not prompt:
@@ -1195,7 +1252,7 @@ async def answer(session: Session, prompt: str) -> None:
     asked = sighted and (capture.wants_screen(prompt) or pointing)
     # Selected target.
     aimed: point.Target | None = None
-    # Agent-grounded answer.
+    # Answer generated alongside target selection.
     grounded_answer = ""
     # Actions require cloud or agent mode.
     doing = cfg["llm"]["mode"] in ("cloud", "agent") and capture.wants_action(prompt)
@@ -1225,9 +1282,15 @@ async def answer(session: Session, prompt: str) -> None:
             # Show screen processing.
             await send(ws, type="state", state="looking")
             # Pointing uses a smaller frame.
-            shot, app, title = await _unseen_shot(
-                session, capture.POINT_EDGE if pointing else capture.MAX_EDGE
-            )
+            early = await prepared if pointing and prepared is not None else None
+            if early is not None:
+                shot, app, title, cands = early
+                perf.mark("point_preparation_reused")
+            else:
+                shot, app, title = await _unseen_shot(
+                    session, capture.POINT_EDGE if pointing else capture.MAX_EDGE
+                )
+                cands = []
             if shot:
                 saved = await asyncio.to_thread(capture.media_bytes, shot.data)
                 await asyncio.to_thread(
@@ -1238,31 +1301,23 @@ async def answer(session: Session, prompt: str) -> None:
                     file=saved or "",
                 )
                 log.info("screen turn: %s | %s", app or "?", title[:80])
-                cands = []
                 if pointing:
-                    cands = await asyncio.to_thread(
-                        point.candidates,
-                        prompt,
-                        shot.pixels,
-                        shot.monitor,
-                        None,
-                        shot.hwnd,
-                    )
+                    if early is None:
+                        cands = await asyncio.to_thread(
+                            point.candidates, prompt, shot.pixels,
+                            shot.monitor, None, shot.hwnd,
+                        )
 
                     # Resolve a measured target.
-                    if cfg["llm"]["mode"] == "agent":
-                        grounded = await locator.locate_and_answer(
-                            prompt, shot, cfg, cands, session.history
-                        )
-                        aimed, grounded_answer = grounded.target, grounded.answer
-                    else:
-                        aimed = await locator.locate(prompt, shot, cfg, cands)
+                    grounded = await _resolve_point(prompt, shot, cfg, cands, session.history)
+                    aimed, grounded_answer = grounded.target, grounded.answer
                     if aimed:
                         fresh, _, _ = await _unseen_shot(session, capture.POINT_EDGE)
                         if fresh is None:
                             log.info("could not verify the localized target; withholding the bone")
                             perf.mark("pointer_withheld")
                             aimed = None
+                            grounded_answer = ""
                         elif locator.changed_at(shot, fresh, aimed):
                             perf.mark("target_changed_retry")
                             log.info("localized area changed; resolving once on the fresh frame")
@@ -1275,16 +1330,8 @@ async def answer(session: Session, prompt: str) -> None:
                                 None,
                                 shot.hwnd,
                             )
-                            if cfg["llm"]["mode"] == "agent":
-                                grounded = await locator.locate_and_answer(
-                                    prompt, shot, cfg, cands, session.history
-                                )
-                                aimed, grounded_answer = (
-                                    grounded.target,
-                                    grounded.answer,
-                                )
-                            else:
-                                aimed = await locator.locate(prompt, shot, cfg, cands)
+                            grounded = await _resolve_point(prompt, shot, cfg, cands, session.history)
+                            aimed, grounded_answer = grounded.target, grounded.answer
                             if aimed:
                                 verified, _, _ = await _unseen_shot(
                                     session, capture.POINT_EDGE
@@ -1297,6 +1344,7 @@ async def answer(session: Session, prompt: str) -> None:
                                     )
                                     perf.mark("pointer_withheld")
                                     aimed = None
+                                    grounded_answer = ""
                                 else:
                                     shot = verified
                         else:
@@ -1304,7 +1352,7 @@ async def answer(session: Session, prompt: str) -> None:
                         if aimed:
                             await _aim(session, aimed)
 
-                if pointing and cfg["llm"]["mode"] == "agent":
+                if pointing and grounded_answer:
                     reply = await _deliver(
                         session, grounded_answer, speak, partial=partial
                     )
@@ -1356,12 +1404,22 @@ async def answer(session: Session, prompt: str) -> None:
 
 async def run_turn(session: Session, prompt: str) -> None:
     """A turn owns its own error handling, because as a separate task it's outside the message loop's"""
+    prepared = None
     try:
         if config.load().get("writing_enabled") and prompt:
             await _hide_point(session)
-            if await writing.handle(session, prompt, send):
+            cfg = config.load()
+            if (cfg.get("ai_enabled") and cfg["llm"]["mode"] == "cloud"
+                    and llm.vision_ok(cfg["llm"]) and capture.wants_pointing(prompt)
+                    and not capture.wants_action(prompt)):
+                prepared = asyncio.create_task(_prepare_pointing(session, prompt))
+            options = {"discard_preparation": lambda: _discard_preparation(prepared)} if prepared is not None else {}
+            if await writing.handle(session, prompt, send, **options):
                 return
-        await answer(session, prompt)
+        if prepared is None:
+            await answer(session, prompt)
+        else:
+            await answer(session, prompt, prepared=prepared)
     except asyncio.CancelledError:
         raise
     except Exception as e:
@@ -1377,6 +1435,8 @@ async def run_turn(session: Session, prompt: str) -> None:
         await session.speaker.stop()
         await send(session.ws, type="error", message=errors.message(e))
         await send(session.ws, type="state", state="idle")
+    finally:
+        await _discard_preparation(prepared)
 
 
 @perf.timed("transcription")
