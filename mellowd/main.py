@@ -37,6 +37,7 @@ TTS_PROBE = "hi, this is how mellow sounds."
 WARM_RETRY_SECONDS = 2.0
 WARM_SLOW_AFTER = 30
 WARM_SLOW_SECONDS = 10.0
+WARM_FAST_DELAYS = (0.1, 0.25, 0.5)
 
 # Reminders are set to the minute
 REMINDER_TICK_SECONDS = 20.0
@@ -629,12 +630,65 @@ class Session:
         started = time.monotonic()
         probes = 0
         refreshed = False
+        last_error: Exception | None = None
+
+        def opened(label: str) -> bool:
+            if not self.awake:
+                # Sleep may win while PortAudio is inside stream.start().
+                self.recorder.close(immediate=True)
+                return False
+            log.info(
+                "microphone %s in %.0fms",
+                label,
+                (time.monotonic() - started) * 1000,
+            )
+            return True
+
+        # Normal sleep wake-up: reopen only the last working microphone. If
+        # PortAudio kept stale state, refresh once and retry the current primary
+        # before falling back to the exhaustive compatibility path.
+        try:
+            route = self.recorder.open_preferred(quiet=True)
+        except Exception as exc:
+            last_error = exc
+        else:
+            return opened(f"{route} reopen")
+
+        if self.awake and not standby() and not meetings.manager.active:
+            refreshed = stt.refresh_devices()
+            if refreshed:
+                log.info("refreshed portaudio device list after fast reopen failed")
+            try:
+                route = self.recorder.open_preferred(
+                    quiet=True, prefer_cached=not refreshed
+                )
+            except Exception as exc:
+                last_error = exc
+            else:
+                return opened("refreshed reopen")
+
+        for delay in WARM_FAST_DELAYS:
+            if not self.awake:
+                return False
+            time.sleep(delay)
+            try:
+                route = self.recorder.open_preferred(
+                    quiet=True, prefer_cached=False
+                )
+            except Exception as exc:
+                last_error = exc
+                continue
+            return opened("short-retry reopen")
+
+        log.info("fast microphone reopen failed (%s); using device fallback", last_error)
         while self.awake:
             # Recheck config while probing.
             if standby() or meetings.manager.active:
                 return False
             try:
-                self.recorder.open(quiet=True)
+                # Retry scheduling belongs here; do not multiply it by the
+                # recorder's general-purpose retry loop.
+                self.recorder.open(quiet=True, attempts=1)
             except Exception as e:
                 probes += 1
                 if probes == 1:
@@ -647,7 +701,7 @@ class Session:
                     log.warning(
                         "microphone still refusing after %d tries (%s)", probes, e
                     )
-                if probes >= 2 and not refreshed and stt.refresh_devices():
+                if not refreshed and stt.refresh_devices():
                     # Refresh a stale device cache once.
                     refreshed = True
                     log.info("refreshed portaudio device list")
@@ -658,7 +712,7 @@ class Session:
                 continue
             if not self.awake:
                 # Close after a mid-open nap.
-                self.recorder.close()
+                self.recorder.close(immediate=True)
             elif probes:
                 log.info("microphone ready after %.1fs", time.monotonic() - started)
             return self.awake
@@ -1549,7 +1603,7 @@ async def handle(session: Session, msg: dict) -> None:
             session.awake = False
             session.mic_ready = False
             await session.cancel_ptt_start()
-            await asyncio.to_thread(session.recorder.close)
+            await asyncio.to_thread(session.recorder.close, immediate=True)
             await session._send_mic("off")
 
     elif kind == "set_speak":
@@ -1561,7 +1615,9 @@ async def handle(session: Session, msg: dict) -> None:
         await send(ws, type="speak", value=cfg["tts"]["speak"])
 
     elif kind == "ptt_start":
-        # Stop current speech first.
+        # Start hardware wake-up before cancelling the previous turn so both
+        # operations overlap instead of adding their latency.
+        session.wake_mic()
         await session.abort()
         session.turn_monitor = None
         # Pet-only mode cannot listen.

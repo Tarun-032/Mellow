@@ -6,6 +6,7 @@ import threading
 import time
 from collections import deque
 from pathlib import Path
+from typing import NamedTuple
 
 import numpy as np
 import sounddevice as sd
@@ -48,6 +49,16 @@ MAX_SECONDS = 25.0
 
 PARAKEET = "parakeet-tdt-0.6b-v2"
 PARAKEET_REPO = "nemo-parakeet-tdt-0.6b-v2"
+
+
+class _InputProfile(NamedTuple):
+    """A microphone configuration that successfully started in this process."""
+
+    requested: str | None
+    index: int
+    name: str
+    samplerate: int
+    channels: int
 
 
 def resample(x: np.ndarray, src: int, dst: int) -> np.ndarray:
@@ -361,6 +372,9 @@ class Recorder:
         self._lock = threading.Lock()
         self._stream: sd.InputStream | None = None
         self._device: str | None = None
+        # Keep the last working device after close so sleep wake-up can bypass
+        # broad device discovery without keeping the microphone open.
+        self._last_input: _InputProfile | None = None
         # Device I/O lock.
         self._io = threading.RLock()
         self._rate = SAMPLE_RATE
@@ -414,7 +428,7 @@ class Recorder:
             while self._ring_samples - len(self._ring[0]) >= self._preroll:
                 self._ring_samples -= len(self._ring.popleft())
 
-    def open(self, quiet: bool = False) -> None:
+    def open(self, quiet: bool = False, attempts: int = OPEN_RETRIES) -> None:
         """Begin filling the pre-roll ring."""
         cfg = self._cfg or config.load()
         name = cfg["stt"].get("input_device")
@@ -425,13 +439,13 @@ class Recorder:
             self.close()
 
             failure = None
-            for attempt in range(OPEN_RETRIES):
+            for attempt in range(attempts):
                 if attempt:
                     time.sleep(OPEN_RETRY_DELAY)
                 # Refresh candidates each round.
                 for device in _resolve_all(name):
                     try:
-                        self._start(device)
+                        self._start(device, name)
                     except sd.PortAudioError as e:
                         # Skip stale indices.
                         (log.debug if quiet else log.warning)(
@@ -446,16 +460,72 @@ class Recorder:
             "the microphone refused to start. try again in a moment"
         ) from failure
 
-    def _start(self, device: int | None) -> None:
+    def open_preferred(self, quiet: bool = False, prefer_cached: bool = True) -> str:
+        """Try only the last working or configured/default microphone once."""
+        cfg = self._cfg or config.load()
+        requested = cfg["stt"].get("input_device")
+        with self._io:
+            if self._stream is not None and requested == self._device:
+                return "open"
+            self.close(immediate=True)
+
+            profile = self._last_input if prefer_cached else None
+            if profile is not None and profile.requested == requested:
+                try:
+                    current = sd.query_devices(profile.index, kind="input")
+                    valid = (
+                        str(current["name"]) == profile.name
+                        and int(current["max_input_channels"]) >= profile.channels
+                        and int(current["default_samplerate"]) == profile.samplerate
+                    )
+                except (sd.PortAudioError, ValueError):
+                    valid = False
+                if valid:
+                    try:
+                        self._start(profile.index, requested, profile)
+                    except sd.PortAudioError as exc:
+                        (log.debug if quiet else log.warning)(
+                            "cached microphone %s refused to start: %s",
+                            profile.index,
+                            exc,
+                        )
+                        raise RuntimeError(
+                            "the microphone refused to start. try again in a moment"
+                        ) from exc
+                    self._device = requested
+                    return "cached"
+
+            device = _resolve(requested)
+            if device is None:
+                raise RuntimeError("no microphone is available")
+            try:
+                self._start(device, requested)
+            except sd.PortAudioError as exc:
+                (log.debug if quiet else log.warning)(
+                    "preferred microphone %s refused to start: %s", device, exc
+                )
+                raise RuntimeError(
+                    "the microphone refused to start. try again in a moment"
+                ) from exc
+            self._device = requested
+            return "primary"
+
+    def _start(
+        self,
+        device: int,
+        requested: str | None,
+        profile: _InputProfile | None = None,
+    ) -> None:
         dev = sd.query_devices(device, kind="input")
-        self._rate = int(dev["default_samplerate"])
+        self._rate = profile.samplerate if profile else int(dev["default_samplerate"])
+        channels = profile.channels if profile else int(dev["max_input_channels"])
         self._preroll = int(self._rate * PREROLL_SECONDS)
 
         # Use the default buffer.
         stream = sd.InputStream(
             device=device,
             samplerate=self._rate,
-            channels=int(dev["max_input_channels"]),
+            channels=channels,
             dtype="float32",
             callback=self._capture,
         )
@@ -466,6 +536,13 @@ class Recorder:
             stream.close()
             raise
         self._stream = stream
+        self._last_input = _InputProfile(
+            requested,
+            int(device),
+            str(dev["name"]),
+            self._rate,
+            channels,
+        )
         self._opened_at = time.monotonic()
         self._takes = 0
 
@@ -474,7 +551,7 @@ class Recorder:
             "microphone open: %s at %dHz x%d, %.0fms pre-roll",
             dev["name"],
             self._rate,
-            int(dev["max_input_channels"]),
+            channels,
             PREROLL_SECONDS * 1000,
         )
 
@@ -490,7 +567,7 @@ class Recorder:
             # The next press retries.
             log.warning("reopen failed, staying closed: %s", e)
 
-    def close(self) -> None:
+    def close(self, immediate: bool = False) -> None:
         """Release the microphone. Windows stops showing the in-use indicator."""
         with self._io:
             stream, self._stream = self._stream, None
@@ -502,8 +579,13 @@ class Recorder:
                 self._ring.clear()
                 self._ring_samples = 0
             if stream is not None:
-                stream.stop()
-                stream.close()
+                try:
+                    if immediate:
+                        stream.abort()
+                    else:
+                        stream.stop()
+                finally:
+                    stream.close()
                 log.info("microphone closed")
 
     def cancel_start(self, cancelled: threading.Event) -> None:
