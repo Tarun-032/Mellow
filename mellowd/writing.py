@@ -348,7 +348,7 @@ async def _insert(session, send, pending):
     await feedback(session, send, spoken, True)
 
 
-async def handle(session, prompt: str, send) -> bool:
+async def handle(session, prompt: str, send, *, discard_preparation=None) -> bool:
     cfg = config.load()
     writer = session.writer
     if not cfg.get("writing_enabled") or not cfg.get("ai_enabled") or not prompt:
@@ -364,6 +364,9 @@ async def handle(session, prompt: str, send) -> bool:
             return True
         if route["intent"] == "conversation" and explicit_composition(prompt):
             route = {**route, "intent": "composition"}
+        if route["intent"] != "conversation" and discard_preparation is not None:
+            # Restore the capture UI before writing can capture or insert anything.
+            await discard_preparation()
         await asyncio.to_thread(sessions.record, "writing_route", intent=route["intent"],
                                 app=target.app, editable=not bool(target.error),
                                 field_error=target.error)

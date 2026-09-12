@@ -479,19 +479,23 @@ def candidates(
 
     # Same words in the same place from both tiers
     merged: list[tuple] = []
+    by_text: dict[str, list[tuple]] = {}
     for row in sorted(keep, key=lambda r: (r[6] != "uia", not r[5], r[3] * r[4])):
         text = squash(row[0])
+        matching = by_text.setdefault(text, [])
         if any(
-            squash(other[0]) == text and (_covers(other, row) or _covers(row, other))
-            for other in merged
+            _covers(other, row) or _covers(row, other)
+            for other in matching
         ):
             continue
         merged.append(row)
+        matching.append(row)
 
     wanted = terms(query)
+    scores = {name: score(name, wanted) for name in dict.fromkeys(r[0] for r in merged)}
     # Relevance first, and being a real control only breaks ties.
     def rank(rows):
-        return sorted(rows, key=lambda r: (-score(r[0], wanted), not r[5], r[3] * r[4]))
+        return sorted(rows, key=lambda r: (-scores[r[0]], not r[5], r[3] * r[4]))
 
     inside = rank([r for r in merged if not furniture(r)])
     around = rank([r for r in merged if furniture(r)])
@@ -513,7 +517,7 @@ def candidates(
             ny=(top + height / 2 - mon["top"]) / mon["height"],
             label=name[:MAX_CHARS],
             source=source,
-            score=score(name, wanted),
+            score=scores[name],
             kind=kind,
             chrome=furniture(row),
             bounds=(left, top, width, height),
