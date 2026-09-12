@@ -379,8 +379,7 @@ export default function Pet() {
   useEffect(() => {
     const stop = listen<boolean>("ptt", ({ payload: down }) => {
       if (meetingActive) return;
-      // Ignore mic warm-up.
-      if (down && microphone === "warming") return;
+      // The sidecar keeps this press pending while the microphone wakes.
       if (!down && !held.current) return;
       // Ignore key-repeat.
       if (down === held.current) return;
@@ -399,7 +398,7 @@ export default function Pet() {
     return () => {
       stop.then((off) => off()).catch(() => {});
     };
-  }, [send, wake, clear, setQuiet, microphone, meetingActive]);
+  }, [send, wake, clear, setQuiet, meetingActive]);
 
   // Keep the mic ready while awake.
   const listening = !meetingActive && nap !== "sleeping" && !quiet;

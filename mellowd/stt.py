@@ -506,10 +506,20 @@ class Recorder:
                 stream.close()
                 log.info("microphone closed")
 
-    def start(self) -> None:
+    def cancel_start(self, cancelled: threading.Event) -> None:
+        """Cancel pending arming atomically with start's final readiness check."""
+        with self._lock:
+            cancelled.set()
+
+    def start(self, cancelled: threading.Event | None = None) -> None:
         """Arm. The take begins PREROLL_SECONDS *before* this call."""
+        if cancelled is not None and cancelled.is_set():
+            return
         self.open()
         with self._lock:
+            # A release can arrive while Windows is still opening the device.
+            if cancelled is not None and cancelled.is_set():
+                return
             self._frames = list(self._ring)
             self._live_peak = 0.0
             self._armed = True

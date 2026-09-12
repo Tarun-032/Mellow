@@ -3,6 +3,7 @@
 import logging
 import re
 import time
+from collections import deque
 from dataclasses import dataclass
 
 from mellowd import perf
@@ -154,6 +155,69 @@ def score(name: str, wanted: list[str]) -> float:
 # --- tier 1: the accessibility tree -----------------------------------------
 
 
+class _CachedControl:
+    """One-turn raw-view property snapshot, with live fallbacks per operation."""
+
+    def __init__(self, element, request, auto):
+        self.element, self.request, self.auto = element, request, auto
+
+    def _property(self, name):
+        try:
+            return getattr(self.element, "Cached" + name)
+        except Exception:
+            return getattr(self.element, "Current" + name)
+
+    @property
+    def Name(self):
+        return self._property("Name")
+
+    @property
+    def ControlTypeName(self):
+        return self.auto.ControlTypeNames[self._property("ControlType")]
+
+    @property
+    def BoundingRectangle(self):
+        box = self._property("BoundingRectangle")
+        return self.auto.Rect(box.left, box.top, box.right, box.bottom)
+
+    @property
+    def AutomationId(self):
+        return self._property("AutomationId")
+
+    @property
+    def HelpText(self):
+        return self._property("HelpText")
+
+    def GetChildren(self):
+        try:
+            # One parent and its immediate children, never an unbounded subtree.
+            snapshot = self.element.BuildUpdatedCache(self.request)
+            children = snapshot.GetCachedChildren()
+            return [
+                _CachedControl(children.GetElement(i), self.request, self.auto)
+                for i in range(children.Length)
+            ] if children else []
+        except Exception:
+            return self.auto.Control(element=self.element).GetChildren()
+
+
+def _cache_root(root, auto):
+    try:
+        # Keep the package-private native accessor isolated behind a fallback.
+        from uiautomation.uiautomation import _AutomationClient
+        client = _AutomationClient.instance().IUIAutomation
+        request = client.CreateCacheRequest()
+        request.TreeScope = 3  # TreeScope_Element | TreeScope_Children
+        request.TreeFilter = client.RawViewCondition
+        for name in ("Name", "ControlType", "BoundingRectangle", "AutomationId", "HelpText"):
+            request.AddProperty(getattr(auto.PropertyId, name + "Property"))
+        # Full references (the default) permit refreshing children and live fallback.
+        return _CachedControl(root.Element, request, auto)
+    except Exception:
+        log.debug("UIA caching unavailable; using live property reads", exc_info=True)
+        return root
+
+
 @perf.timed("uia")
 def uia_candidates(hwnd: int = 0) -> tuple[list[tuple], tuple | None]:
     """(every named visible control, where the page inside it starts)."""
@@ -171,9 +235,9 @@ def uia_candidates(hwnd: int = 0) -> tuple[list[tuple], tuple | None]:
             if root is None:
                 return [], None
             deadline = time.monotonic() + UIA_BUDGET
-            queue, seen = [(root, 0)], 0
+            queue, seen = deque([(_cache_root(root, auto), 0)]), 0
             while queue and seen < MAX_NODES and time.monotonic() < deadline:
-                node, depth = queue.pop(0)
+                node, depth = queue.popleft()
                 seen += 1
                 try:
                     name, kind, box = node.Name, node.ControlTypeName, node.BoundingRectangle
