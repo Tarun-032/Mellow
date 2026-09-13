@@ -1273,7 +1273,24 @@ async def _discard_preparation(task) -> None:
 
 
 async def _resolve_point(prompt, shot, cfg, cands, history):
-    if cfg["llm"]["mode"] in ("cloud", "agent"):
+    if cfg["llm"]["mode"] == "agent":
+        try:
+            result = await locator.locate_and_answer(
+                prompt, shot, cfg, cands, history
+            )
+        except agents.AgentTimeout:
+            perf.mark("locator_timeout")
+            log.info("agent locator timed out; withholding the bone")
+            return locator.GroundedResult(
+                None, "I couldn't lock onto that control quickly enough."
+            )
+        if result.target is None and not result.answer:
+            perf.mark("pointer_withheld")
+            return locator.GroundedResult(
+                None, "I couldn't lock onto that control safely."
+            )
+        return result
+    if cfg["llm"]["mode"] == "cloud":
         try:
             return await locator.locate_and_answer(prompt, shot, cfg, cands, history)
         except locator.InvalidGrounding:
@@ -1318,14 +1335,19 @@ async def answer(session: Session, prompt: str, prepared=None) -> None:
     await asyncio.to_thread(llm.check_fit, cfg["llm"])
     sighted = llm.vision_ok(cfg["llm"])
     # Route screen requests.
-    pointing = sighted and capture.wants_pointing(prompt)
+    wants_pointer = capture.wants_pointing(prompt)
+    pointing = sighted and wants_pointer
     asked = sighted and (capture.wants_screen(prompt) or pointing)
     # Selected target.
     aimed: point.Target | None = None
     # Answer generated alongside target selection.
     grounded_answer = ""
     # Actions require cloud or agent mode.
-    doing = cfg["llm"]["mode"] in ("cloud", "agent") and capture.wants_action(prompt)
+    doing = (
+        cfg["llm"]["mode"] in ("cloud", "agent")
+        and not wants_pointer
+        and capture.wants_action(prompt)
+    )
     try:
         if doing:
             reply, did = await _act(session, cfg, speak, partial, prompt)
@@ -1378,16 +1400,34 @@ async def answer(session: Session, prompt: str, prepared=None) -> None:
                             shot.monitor, None, shot.hwnd,
                         )
 
-                    # Resolve a measured target.
-                    grounded = await _resolve_point(prompt, shot, cfg, cands, session.history)
-                    aimed, grounded_answer = grounded.target, grounded.answer
+                    # Exact accessible controls do not need a coding-agent
+                    # process. Keep the stricter threshold and ambiguity checks
+                    # exclusive to subscription-agent mode.
+                    aimed = (
+                        point.confident_match(cands)
+                        if cfg["llm"]["mode"] == "agent"
+                        else None
+                    )
+                    if aimed is not None:
+                        perf.mark("pointer_local_match")
+                        log.info("local pointer chose %r without an agent call", aimed.label)
+                        grounded_answer = f"Right here — {aimed.label}."
+                    else:
+                        grounded = await _resolve_point(
+                            prompt, shot, cfg, cands, session.history
+                        )
+                        aimed, grounded_answer = grounded.target, grounded.answer
                     if aimed:
                         fresh, _, _ = await _unseen_shot(session, capture.POINT_EDGE)
                         if fresh is None:
                             log.info("could not verify the localized target; withholding the bone")
                             perf.mark("pointer_withheld")
                             aimed = None
-                            grounded_answer = ""
+                            grounded_answer = (
+                                "I couldn't verify that control on the fresh screen."
+                                if cfg["llm"]["mode"] == "agent"
+                                else ""
+                            )
                         elif locator.changed_at(shot, fresh, aimed):
                             perf.mark("target_changed_retry")
                             log.info("localized area changed; resolving once on the fresh frame")
@@ -1400,8 +1440,23 @@ async def answer(session: Session, prompt: str, prepared=None) -> None:
                                 None,
                                 shot.hwnd,
                             )
-                            grounded = await _resolve_point(prompt, shot, cfg, cands, session.history)
-                            aimed, grounded_answer = grounded.target, grounded.answer
+                            if cfg["llm"]["mode"] == "agent":
+                                aimed = point.confident_match(cands)
+                                grounded_answer = (
+                                    f"Right here — {aimed.label}." if aimed else ""
+                                )
+                                if aimed is None:
+                                    log.info(
+                                        "fresh frame had no unique accessible target; "
+                                        "withholding the bone"
+                                    )
+                                    perf.mark("pointer_withheld")
+                                    grounded_answer = "The screen changed before I could verify that control."
+                            else:
+                                grounded = await _resolve_point(
+                                    prompt, shot, cfg, cands, session.history
+                                )
+                                aimed, grounded_answer = grounded.target, grounded.answer
                             if aimed:
                                 verified, _, _ = await _unseen_shot(
                                     session, capture.POINT_EDGE
@@ -1414,7 +1469,12 @@ async def answer(session: Session, prompt: str, prepared=None) -> None:
                                     )
                                     perf.mark("pointer_withheld")
                                     aimed = None
-                                    grounded_answer = ""
+                                    grounded_answer = (
+                                        "The screen changed before I could verify "
+                                        "that control."
+                                        if cfg["llm"]["mode"] == "agent"
+                                        else ""
+                                    )
                                 else:
                                     shot = verified
                         else:
@@ -1479,9 +1539,8 @@ async def run_turn(session: Session, prompt: str) -> None:
         if config.load().get("writing_enabled") and prompt:
             await _hide_point(session)
             cfg = config.load()
-            if (cfg.get("ai_enabled") and cfg["llm"]["mode"] == "cloud"
-                    and llm.vision_ok(cfg["llm"]) and capture.wants_pointing(prompt)
-                    and not capture.wants_action(prompt)):
+            if (cfg.get("ai_enabled") and cfg["llm"]["mode"] in ("cloud", "agent")
+                    and llm.vision_ok(cfg["llm"]) and capture.wants_pointing(prompt)):
                 prepared = asyncio.create_task(_prepare_pointing(session, prompt))
             options = {"discard_preparation": lambda: _discard_preparation(prepared)} if prepared is not None else {}
             if await writing.handle(session, prompt, send, **options):
@@ -1540,14 +1599,17 @@ async def _voice_turn(session: Session, audio) -> None:
         await send(session.ws, type="state", state="idle")
 
 
-async def _writing_start(session: Session) -> None:
+async def _writing_start(session: Session, finding=None) -> None:
     session.writer.begin()
-    await writing.status(session, send, "idle")
     if config.load().get("writing_enabled"):
-        # Resolve the writing target.
-        session.writer.finding = asyncio.create_task(
+        # Resolve the destination before any later microphone wait or UI update
+        # can allow a transient Windows surface to replace the focused field.
+        session.writer.finding = finding or asyncio.create_task(
             asyncio.to_thread(writing.desktop.resolve, writing.FIND_SECONDS)
         )
+    else:
+        log.info("writing target capture skipped: screen-aware writing is off")
+    await writing.status(session, send, "idle")
 
 
 async def _listen_when_ready(session: Session) -> None:
@@ -1562,7 +1624,6 @@ async def _listen_when_ready(session: Session) -> None:
         if (cancelled.is_set() or not session.alive or not session.awake
                 or not session.mic_ready or meetings.manager.active or standby()):
             return
-        await _writing_start(session)
         await asyncio.to_thread(session.recorder.start, cancelled)
         if cancelled.is_set():
             return
@@ -1618,13 +1679,27 @@ async def handle(session: Session, msg: dict) -> None:
         # Start hardware wake-up before cancelling the previous turn so both
         # operations overlap instead of adding their latency.
         session.wake_mic()
+        # Snapshot the focused field at the same moment as microphone wake-up.
+        # Keep this task detached until abort() has cancelled the prior writer.
+        writing_finding = (
+            asyncio.create_task(
+                asyncio.to_thread(writing.desktop.resolve, writing.FIND_SECONDS)
+            )
+            if config.load().get("writing_enabled")
+            else None
+        )
         await session.abort()
         session.turn_monitor = None
         # Pet-only mode cannot listen.
         if standby():
+            if writing_finding is not None:
+                writing_finding.cancel()
             await send(ws, type="reply_chunk", text=PET_ONLY_LINE)
             await send(ws, type="state", state="idle")
             return
+        # Field capture starts immediately after cancellation has settled. It
+        # now overlaps microphone readiness instead of waiting behind it.
+        await _writing_start(session, writing_finding)
         session.ptt_cancelled = threading.Event()
         session.ptt_pending = asyncio.create_task(_listen_when_ready(session))
 

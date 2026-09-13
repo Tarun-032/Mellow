@@ -75,37 +75,15 @@ def _bare_choice(text: str, stage: str) -> str | None:
     return value
 
 
-def _recover_label(text: str, candidates: list[point.Target]) -> str | None:
-    """Recover an exact measured E target explicitly named in prose."""
-    body = point.squash(text)
-    mentions = []
-    for i, candidate in enumerate(candidates, 1):
-        label = point.squash(candidate.label)
-        if len(label) >= 3 and label in body:
-            mentions.append((len(label), label, i))
-    if not mentions:
-        return None
-    mentions.sort(reverse=True)
-    longest = mentions[0][0]
-    best = [mention for mention in mentions if mention[0] == longest]
-    # UIA and OCR commonly expose the exact same control twice.
-    if len({mention[1] for mention in best}) > 1:
-        return None
-    return f"E{min(mention[2] for mention in best)}"
-
-
 def _grounded_fields(
     raw: str,
     stage: str,
     valid: set[str],
-    candidates: list[point.Target],
 ) -> tuple[str | None, str]:
     parsed = _json_result(raw)
     selection_raw = str(parsed.get("selection", "")) if parsed else raw
     answer = str(parsed.get("answer", "")).strip() if parsed else raw.strip()
     choice = _bare_choice(selection_raw, stage)
-    if choice not in valid:
-        choice = _recover_label(answer or raw, candidates)
     if choice not in valid:
         return None, answer
     return choice, answer
@@ -428,14 +406,16 @@ async def _agent_pick(
     messages: list[dict],
     valid: list[str],
     stage: str,
-    candidates: list[point.Target],
 ) -> tuple[str | None, str]:
     """Structured selection; API failures fall back to the strict locator."""
     schema = _schema(valid)
     valid_set = {value.upper() for value in valid}
     answer = ""
     agent = cfg["llm"].get("mode") == "agent"
-    for attempt in range(2 if agent else 1):
+    # Subscription CLIs have high process startup cost. Structured schema output
+    # gets one attempt; invalid output is withheld instead of paying for another
+    # process and risking a guessed target.
+    for attempt in range(1):
         asked = prompt + (
             "\nIn the JSON selection field use one allowed value exactly, "
             "without brackets or a REGION/TARGET prefix."
@@ -446,7 +426,7 @@ async def _agent_pick(
             complete = agents.complete_grounded if agent else llm.complete_grounded
             raw = await complete(asked, cfg, image, messages, schema)
         if agent:
-            choice, answer = _grounded_fields(raw, stage, valid_set, candidates)
+            choice, answer = _grounded_fields(raw, stage, valid_set)
         else:
             parsed = _json_result(raw)
             if (not parsed or not isinstance(parsed.get("selection"), str)
@@ -461,7 +441,7 @@ async def _agent_pick(
         if choice:
             return choice, answer
         log.info("structured agent locator output did not parse: %r", raw[:240])
-    return None, answer
+    return None, "" if agent else answer
 
 
 @perf.timed("localization_and_answer")
@@ -495,7 +475,7 @@ async def locate_and_answer(
         f"C{i}" for i in range(1, COARSE_COLS * COARSE_ROWS + 1)
     ]
     picked, answer = await _agent_pick(
-        prompt, cfg, coarse, messages, coarse_valid, "coarse", overview
+        prompt, cfg, coarse, messages, coarse_valid, "coarse"
     )
     log.info(
         "grounded locator overview returned %s from %d measured elements",
@@ -521,6 +501,24 @@ async def locate_and_answer(
     if not 1 <= cell <= COARSE_COLS * COARSE_ROWS:
         return GroundedResult(None, answer)
     crop = _crop_for_cell(width, height, cell)
+    if cfg["llm"].get("mode") == "agent":
+        # The one vision call already narrowed the screen to this region. Use a
+        # measured box only when the remaining local evidence is independently
+        # safe; otherwise withhold instead of launching a refinement process.
+        regional = [
+            candidate
+            for candidate in candidates
+            if candidate.bounds and _intersects(candidate.bounds, crop, mon)
+        ]
+        chosen = point.confident_match(regional)
+        if chosen is None:
+            log.info("agent locator region %d had no unique accessible target", cell)
+            return GroundedResult(None, "")
+        log.info("agent locator region %d resolved locally to %r", cell, chosen.label)
+        return GroundedResult(
+            replace(chosen, score=max(chosen.score, 1.0), monitor=dict(mon)),
+            answer,
+        )
     fine, regional = fine_image(shot.pixels, crop, candidates, mon)
     listing = "\n".join(
         f"E{i}: {c.label} ({c.kind or c.source}; "
@@ -539,7 +537,7 @@ async def locate_and_answer(
         f"G{i}" for i in range(1, FINE_COLS * FINE_ROWS + 1)
     ]
     selected, fine_answer = await _agent_pick(
-        fine_prompt, cfg, fine, messages, fine_valid, "fine", regional
+        fine_prompt, cfg, fine, messages, fine_valid, "fine"
     )
     # A coarse-cell explanation cannot stand in for the refined target's answer.
     answer = (fine_answer or answer) if cfg["llm"].get("mode") == "agent" else fine_answer

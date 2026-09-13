@@ -52,6 +52,11 @@ INTERACTIVE = {
 # A match has to clear this to become a bone.
 THRESHOLD = 0.65
 
+# A model-free pointer must be substantially more certain than the ordinary
+# candidate ladder because there is no vision pass to resolve ambiguity.
+FAST_SCORE = 0.75
+FAST_MARGIN = 0.20
+
 # A control whose box is most of the screen is the window
 MAX_SPAN = (0.6, 0.4)
 
@@ -150,6 +155,26 @@ def score(name: str, wanted: list[str]) -> float:
         )
     )
     return hit / len(parts) * 0.8
+
+
+def semantic_score(name: str, query: str) -> float:
+    """Small, deterministic UI vocabulary for common differently-named controls."""
+    label = squash(name)
+    spoken = _ALNUM.sub(" ", query.lower())
+    if re.search(
+        r"\b(?:new|write|compose|start)\b.*\b(?:email|mail)\b"
+        r"|\bopen\b.*\bnew\b.*\b(?:email|mail)\b",
+        spoken,
+    ):
+        if label in {"compose", "newmessage", "composemail"}:
+            return 1.0
+    if re.search(r"\b(?:new|start)\b.*\b(?:chat|conversation)\b", spoken):
+        if label in {"new", "newchat", "newconversation", "startnewchat"}:
+            return 1.0
+    if re.search(r"\b(?:profile|account|avatar)\b", spoken):
+        if any(word in label for word in ("profile", "account", "avatar")):
+            return 0.92
+    return 0.0
 
 
 # --- tier 1: the accessibility tree -----------------------------------------
@@ -556,7 +581,10 @@ def candidates(
         matching.append(row)
 
     wanted = terms(query)
-    scores = {name: score(name, wanted) for name in dict.fromkeys(r[0] for r in merged)}
+    scores = {
+        name: max(score(name, wanted), semantic_score(name, query))
+        for name in dict.fromkeys(r[0] for r in merged)
+    }
     # Relevance first, and being a real control only breaks ties.
     def rank(rows):
         return sorted(rows, key=lambda r: (-scores[r[0]], not r[5], r[3] * r[4]))
@@ -590,6 +618,73 @@ def candidates(
         for row in ranked
         for name, left, top, width, height, kind, source in [row]
     ]
+
+
+def _same_place(a: Target, b: Target) -> bool:
+    """Whether two accessibility/OCR rows describe the same physical hitbox."""
+    if not a.bounds or not b.bounds:
+        return False
+    al, at, aw, ah = a.bounds
+    bl, bt, bw, bh = b.bounds
+    left, top = max(al, bl), max(at, bt)
+    right, bottom = min(al + aw, bl + bw), min(at + ah, bt + bh)
+    shared = max(0.0, right - left) * max(0.0, bottom - top)
+    smaller = min(aw * ah, bw * bh)
+    if smaller > 0 and shared / smaller >= 0.55:
+        return True
+    ac = (al + aw / 2, at + ah / 2)
+    bc = (bl + bw / 2, bt + bh / 2)
+    return abs(ac[0] - bc[0]) <= 4 and abs(ac[1] - bc[1]) <= 4
+
+
+def confident_match(cands: list[Target]) -> Target | None:
+    """Return one safe, spatially unique accessible match without a model call."""
+    interactive = set(INTERACTIVE.values())
+    eligible = [
+        candidate
+        for candidate in cands
+        if not candidate.chrome
+        and (
+            (candidate.source == "uia" and candidate.kind in interactive)
+            # A bone is only visual guidance, so the center of one exact,
+            # unique OCR label is also a safe target without a UIA hitbox.
+            or (candidate.source == "ocr" and candidate.score >= 0.92)
+        )
+        and candidate.bounds is not None
+        and candidate.score >= FAST_SCORE
+    ]
+    if not eligible:
+        return None
+    eligible.sort(key=lambda candidate: candidate.score, reverse=True)
+    best = eligible[0]
+
+    # Repeated labels such as two "View" buttons need vision or user context.
+    label = squash(best.label)
+    if any(
+        other is not best
+        and squash(other.label) == label
+        and not _same_place(best, other)
+        for other in cands
+    ):
+        return None
+
+    # A close lexical runner-up means the words alone do not identify one box.
+    alternatives = sorted(
+        (
+            other
+            for other in cands
+            if other is not best
+            and not other.chrome
+            and other.bounds is not None
+            and not _same_place(best, other)
+        ),
+        key=lambda candidate: candidate.score,
+        reverse=True,
+    )
+    runner_up = alternatives[0] if alternatives else None
+    if runner_up is not None and best.score - runner_up.score < FAST_MARGIN:
+        return None
+    return best
 
 
 def describe(cands: list[Target]) -> str:

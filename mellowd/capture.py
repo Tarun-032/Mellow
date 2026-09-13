@@ -288,7 +288,10 @@ def window_on_monitor(monitor: dict) -> tuple[int, str, str]:
             pid = ctypes.wintypes.DWORD()
             user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
             app = _process_name(pid.value or 0)
-            if app.casefold() == "mellow.exe":
+            if app.casefold() in {"mellow.exe", "textinputhost.exe"}:
+                # Windows Input Experience can briefly sit above the real app
+                # after a global hotkey. Its one-node UIA tree caused pointing
+                # to ground against unrelated OCR from the monitor.
                 return True
             found.append((int(hwnd or 0), app, title))
             return False
