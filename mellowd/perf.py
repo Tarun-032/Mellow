@@ -25,6 +25,8 @@ class Turn:
         self.source = source
         self.started = time.perf_counter() if started is None else started
         self.stages = []
+        self.agent_calls = []
+        self.pointer = []
         self.marks = {}
         self.outcome = "completed"
         self.closed = False
@@ -47,9 +49,11 @@ class Turn:
     def snapshot(self):
         with self.lock:
             self.closed = True
-            return {"v": 1, "turn": self.id, "source": self.source, "outcome": self.outcome,
+            return {"v": 2, "turn": self.id, "source": self.source, "outcome": self.outcome,
                     "duration_ms": round((time.perf_counter() - self.started) * 1000, 3),
-                    "marks_ms": dict(self.marks), "stages": list(self.stages)}
+                    "marks_ms": dict(self.marks), "stages": list(self.stages),
+                    "agent_calls": list(self.agent_calls),
+                    "pointer": list(self.pointer)}
 
 
 def mark(name):
@@ -62,6 +66,65 @@ def outcome(value):
         with turn.lock:
             if not turn.closed:
                 turn.outcome = value
+
+
+def record_agent(*, provider, purpose, transport, prompt_bytes, image_bytes,
+                 schema_bytes, usage, accepted, started, first_event=None,
+                 first_text=None, input_sent=None):
+    """Attach metadata-only provider timing; user content never enters the log."""
+    turn = _current.get()
+    if not turn:
+        return
+    detail = usage.get("output_tokens_details") if isinstance(usage, dict) else {}
+    if not isinstance(detail, dict):
+        detail = {}
+    call = {
+        "provider": provider,
+        "purpose": purpose,
+        "transport": transport,
+        "duration_ms": round((time.perf_counter() - started) * 1000, 3),
+        "prompt_bytes": prompt_bytes,
+        "image_bytes": image_bytes,
+        "schema_bytes": schema_bytes,
+        "accepted": bool(accepted),
+        "input_tokens": usage.get("input_tokens", 0) if isinstance(usage, dict) else 0,
+        "cached_tokens": (
+            usage.get("cache_read_input_tokens", usage.get("cached_input_tokens", 0))
+            if isinstance(usage, dict) else 0
+        ),
+        "output_tokens": usage.get("output_tokens", 0) if isinstance(usage, dict) else 0,
+        "reasoning_tokens": (
+            detail.get("thinking_tokens", usage.get("reasoning_output_tokens", 0))
+            if isinstance(usage, dict) else 0
+        ),
+    }
+    if first_event is not None:
+        call["first_event_ms"] = round((first_event - started) * 1000, 3)
+    if first_text is not None:
+        call["first_text_ms"] = round((first_text - started) * 1000, 3)
+    if input_sent is not None:
+        call["local_handoff_ms"] = round((input_sent - started) * 1000, 3)
+    with turn.lock:
+        if not turn.closed:
+            turn.agent_calls.append(call)
+
+
+def record_pointer(*, outcome: str, candidates: int = 0, measured: int = 0,
+                   source: str = "") -> None:
+    """Attach target-selection metadata without screen text or coordinates."""
+    turn = _current.get()
+    if not turn:
+        return
+    row = {
+        "outcome": outcome,
+        "candidates": int(candidates),
+        "measured": int(measured),
+    }
+    if source:
+        row["source"] = source
+    with turn.lock:
+        if not turn.closed:
+            turn.pointer.append(row)
 
 
 @contextmanager

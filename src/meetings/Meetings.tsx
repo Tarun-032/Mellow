@@ -40,7 +40,7 @@ const PencilIcon = () =>
   <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20h4L19 9a2.8 2.8 0 0 0-4-4L4 16v4Z" /><path d="M14 6l4 4" /></svg>;
 
 /** Native <dialog>: Escape, focus trap and the top layer come from the platform. */
-function Confirm({ heading, body, confirmLabel, onConfirm, onCancel, busy }: {
+export function Confirm({ heading, body, confirmLabel, onConfirm, onCancel, busy }: {
   heading: string; body: string; confirmLabel: string;
   onConfirm: () => void; onCancel: () => void; busy: boolean;
 }) {

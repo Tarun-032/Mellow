@@ -99,6 +99,8 @@ async def lifespan(_app: FastAPI):
             task.cancel()
             with suppress(asyncio.CancelledError):
                 await task
+            await agents.stop()
+            point.stop_ocr()
 
 
 async def warm_models() -> None:
@@ -108,6 +110,10 @@ async def warm_models() -> None:
         log.info("no brain configured; skipping model warm-up")
         return
     cfg = config.load()
+    point.warm_ocr()
+    agent_task = None
+    if cfg["llm"].get("mode") == "agent":
+        agent_task = asyncio.create_task(agents.warm(cfg))
     # Warm local engines only.
     for name, loader in (("stt", stt.load), ("tts", tts.load)):
         if cfg[name]["mode"] != "local":
@@ -118,6 +124,11 @@ async def warm_models() -> None:
         except Exception:
             # First use retries.
             log.exception("%s warm-up failed", name)
+    if agent_task is not None:
+        try:
+            await agent_task
+        except Exception:
+            log.exception("agent runtime warm-up failed")
 
 
 app = FastAPI(title="mellowd", lifespan=lifespan)
@@ -151,6 +162,71 @@ def _merge_section(name: str, current: dict, submitted: dict) -> dict:
     """Merge one capability's form without leaking its key to a different host."""
     merged = {**current, **submitted}
     merged.pop("has_api_key", None)
+    if name == "llm":
+        # One set of active transport fields serves both API and agent modes.
+        # Preserve each non-secret destination separately so changing modes
+        # cannot combine `mode=cloud` with provider `codex` or `claude`.
+        current_mode = current.get("mode")
+        if current_mode == "cloud":
+            merged.update(
+                api_provider=current.get("provider", ""),
+                api_base_url=current.get("base_url", ""),
+                api_model=current.get("model", ""),
+            )
+        elif current_mode == "agent":
+            merged.update(
+                agent_provider=current.get("provider", ""),
+                agent_model=current.get("model", ""),
+            )
+
+        mode = merged.get("mode")
+        provider = str(merged.get("provider") or "").strip().lower()
+        if mode == "cloud" and (
+            provider not in config.LLM_PRESETS
+            or config.LLM_PRESETS[provider].get("local")
+        ):
+            remembered = str(merged.get("api_provider") or "").strip().lower()
+            if remembered in config.LLM_PRESETS and not config.LLM_PRESETS[remembered].get("local"):
+                provider = remembered
+                merged["base_url"] = merged.get("api_base_url") or merged.get("base_url")
+                merged["model"] = merged.get("api_model") or merged.get("model")
+            else:
+                base = str(merged.get("base_url") or "").strip()
+                provider = next(
+                    (
+                        key for key, preset in config.LLM_PRESETS.items()
+                        if base
+                        and not preset.get("local")
+                        and preset.get("base_url")
+                        and config.normalize_base_url(base) == config.normalize_base_url(preset["base_url"])
+                    ),
+                    "custom" if base else "openai",
+                )
+            merged["provider"] = provider
+        if mode == "local" and (
+            provider not in config.LLM_PRESETS
+            or not config.LLM_PRESETS[provider].get("local")
+        ):
+            merged.update(
+                provider="ollama",
+                base_url=config.LLM_PRESETS["ollama"]["base_url"],
+            )
+        if mode == "agent" and provider not in config.AGENT_PRESETS:
+            remembered = str(merged.get("agent_provider") or "").strip().lower()
+            merged["provider"] = remembered if remembered in config.AGENT_PRESETS else "claude"
+            merged["model"] = merged.get("agent_model") or ""
+
+        if mode == "cloud":
+            merged.update(
+                api_provider=merged.get("provider", ""),
+                api_base_url=merged.get("base_url", ""),
+                api_model=merged.get("model", ""),
+            )
+        elif mode == "agent":
+            merged.update(
+                agent_provider=merged.get("provider", ""),
+                agent_model=merged.get("model", ""),
+            )
     # Agent mode has no HTTP destination.
     if merged.get("mode") == "agent" or current.get("mode") == "agent":
         # Keep a saved key when blank.
@@ -197,6 +273,8 @@ def _engine_signature(cfg: dict) -> tuple[str, ...]:
             "agent",
             str(section.get("provider", "")),
             str(section.get("model", "")),
+            str(section.get("agent_speed", "fast")),
+            str(cfg.get("system_prompt", "")),
         )
     return (
         "ai",
@@ -774,6 +852,8 @@ _engine_revision = 0
 
 
 async def _meeting_started():
+    await agents.stop()
+    point.stop_ocr()
     for session in list(_active_sessions.values()):
         session.awake = False
         session.mic_ready = False
@@ -789,6 +869,11 @@ async def _meeting_started():
 
 
 async def _meeting_stopped():
+    cfg = config.load()
+    if cfg.get("ai_enabled"):
+        point.warm_ocr()
+    if cfg.get("ai_enabled") and cfg["llm"].get("mode") == "agent":
+        asyncio.create_task(agents.warm(cfg))
     for session in list(_active_sessions.values()):
         if session.alive and not meetings.manager.active:
             session.wake_mic()
@@ -802,6 +887,8 @@ async def _reset_for_engine_change() -> None:
     """End the current conversation after a committed engine change."""
     global _engine_revision
     _engine_revision += 1
+    await agents.stop()
+    point.stop_ocr()
     for session in list(_active_sessions.values()):
         try:
             await session.abort()
@@ -817,6 +904,11 @@ async def _reset_for_engine_change() -> None:
         except (WebSocketDisconnect, RuntimeError):
             pass
     await asyncio.to_thread(sessions.close, reason="engine_changed")
+    cfg = config.load()
+    if cfg.get("ai_enabled") and cfg["llm"].get("mode") == "agent":
+        asyncio.create_task(agents.warm(cfg))
+    if cfg.get("ai_enabled"):
+        point.warm_ocr()
     log.info("engine changed; current conversation closed")
 
 
@@ -844,6 +936,8 @@ class Shot(NamedTuple):
     monitor: dict
     # Source window.
     hwnd: int
+    # Physical source-window bounds; optional for old fixtures/headless runs.
+    window: tuple[int, int, int, int] | None = None
 
 
 def _shot(
@@ -853,7 +947,10 @@ def _shot(
     monitor = capture.known_monitor(monitor) or capture.active_monitor()
     hwnd, app, title = capture.window_on_monitor(monitor) if monitor else (0, "", "")
     grabbed = capture.grab(max_edge, monitor)
-    shot = Shot(*grabbed, monitor, hwnd) if grabbed and monitor else None
+    shot = (
+        Shot(*grabbed, monitor, hwnd, capture.window_rect(hwnd))
+        if grabbed and monitor else None
+    )
     if not app and not title:
         app, title = capture.foreground()
     return shot, app, title
@@ -1253,11 +1350,54 @@ async def _prepare_pointing(session: Session, prompt: str):
     """Read-only work overlapped with writing classification; never call a model."""
     try:
         with perf.span("point_preparation"):
-            shot, app, title = await _unseen_shot(session, capture.POINT_EDGE)
+            session.hidden.clear()
+            await send(session.ws, type="capture", phase="begin")
+            try:
+                with suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(session.hidden.wait(), HIDE_TIMEOUT)
+                monitor = capture.known_monitor(getattr(session, "turn_monitor", None)) or capture.active_monitor()
+                hwnd, app, title = capture.window_on_monitor(monitor) if monitor else (0, "", "")
+                # Capture native pixels once. UIA, OCR and JPEG encoding then
+                # proceed together over the same requested screen state.
+                uia_task = asyncio.create_task(asyncio.to_thread(point.uia_candidates, hwnd))
+                captured = await asyncio.to_thread(capture.frame, monitor)
+                if captured is None or monitor is None:
+                    await uia_task
+                    return None
+                image, pixels, _chosen = captured
+                cached = await asyncio.to_thread(
+                    point.cached_evidence, hwnd, monitor, pixels
+                )
+                encode_task = asyncio.create_task(
+                    asyncio.to_thread(capture.encode, image, capture.POINT_EDGE)
+                )
+                if cached is None:
+                    pending_ocr = point.start_ocr(pixels)
+                    ocr_task = asyncio.create_task(
+                        asyncio.to_thread(point.collect_ocr, pending_ocr)
+                    )
+                    encoded, accessible, ocr_rows = await asyncio.gather(
+                        encode_task, uia_task, ocr_task
+                    )
+                    await asyncio.to_thread(
+                        point.remember_evidence,
+                        hwnd, monitor, pixels, accessible, ocr_rows,
+                    )
+                else:
+                    accessible, ocr_rows = cached
+                    encoded = await encode_task
+                    uia_task.cancel()
+                    with suppress(asyncio.CancelledError, Exception):
+                        await uia_task
+                shot = Shot(*encoded, pixels, monitor, hwnd, capture.window_rect(hwnd))
+            finally:
+                with suppress(Exception, asyncio.CancelledError):
+                    await asyncio.shield(send(session.ws, type="capture", phase="end"))
             if shot is None:
                 return None
             cands = await asyncio.to_thread(
-                point.candidates, prompt, shot.pixels, shot.monitor, None, shot.hwnd
+                point.candidates, prompt, shot.pixels, shot.monitor, None, shot.hwnd,
+                accessible, ocr_rows,
             )
             return shot, app, title, cands
     except Exception:
@@ -1272,11 +1412,48 @@ async def _discard_preparation(task) -> None:
             await task
 
 
-async def _resolve_point(prompt, shot, cfg, cands, history):
+def _same_control(local, aimed) -> bool:
+    """True when the measured rectangle is the control the model chose."""
+    monitor = aimed.monitor or local.monitor
+    if local.bounds is None or not monitor:
+        return False
+    # nx/ny are normalized within the owning monitor; bounds are desktop pixels
+    # as (left, top, width, height). Half a control of slack, so a near-miss on
+    # a small button still counts as the same control.
+    slack = max(local.bounds[2], local.bounds[3]) / 2
+    return locator._inside(
+        local.bounds,
+        monitor["left"] + aimed.nx * monitor["width"],
+        monitor["top"] + aimed.ny * monitor["height"],
+        slack,
+    )
+
+
+async def _aim_early(session, shot, target, local_fallback):
+    """Verify and show the model's choice while it is still writing its sentence.
+
+    The same checks as after a finished reply: prefer an identical measured
+    rectangle, capture a fresh frame, and show nothing if the control moved.
+    Returns (aimed, fresh) once the bone is up, or None to leave the target to
+    the normal path, which can track or re-resolve a moved control.
+    """
+    aimed = target
+    if local_fallback is not None and _same_control(local_fallback, target):
+        aimed = local_fallback
+        perf.mark("pointer_local_precision")
+    fresh, _, _ = await _unseen_shot(session, capture.POINT_EDGE)
+    if fresh is None or locator.changed_at(shot, fresh, aimed):
+        return None
+    await _aim(session, aimed)
+    perf.mark("pointer_early")
+    return aimed, fresh
+
+
+async def _resolve_point(prompt, shot, cfg, cands, history, on_choice=None):
     if cfg["llm"]["mode"] == "agent":
         try:
             result = await locator.locate_and_answer(
-                prompt, shot, cfg, cands, history
+                prompt, shot, cfg, cands, history, on_choice=on_choice
             )
         except agents.AgentTimeout:
             perf.mark("locator_timeout")
@@ -1400,24 +1577,70 @@ async def answer(session: Session, prompt: str, prepared=None) -> None:
                             shot.monitor, None, shot.hwnd,
                         )
 
-                    # Exact accessible controls do not need a coding-agent
-                    # process. Keep the stricter threshold and ambiguity checks
-                    # exclusive to subscription-agent mode.
-                    aimed = (
+                    # Keep a high-confidence measured result as a safety net,
+                    # but let the agent write the normal answer and validate the
+                    # same visual request as API mode. This removes canned speech.
+                    local_fallback = (
                         point.confident_match(cands)
                         if cfg["llm"]["mode"] == "agent"
                         else None
                     )
-                    if aimed is not None:
-                        perf.mark("pointer_local_match")
-                        log.info("local pointer chose %r without an agent call", aimed.label)
-                        grounded_answer = f"Right here — {aimed.label}."
-                    else:
-                        grounded = await _resolve_point(
-                            prompt, shot, cfg, cands, session.history
+                    early: dict = {}
+
+                    def on_choice(target, shot=shot, local_fallback=local_fallback):
+                        early["target"] = target
+                        early["task"] = asyncio.create_task(
+                            _aim_early(session, shot, target, local_fallback)
                         )
-                        aimed, grounded_answer = grounded.target, grounded.answer
-                    if aimed:
+
+                    try:
+                        grounded = await _resolve_point(
+                            prompt, shot, cfg, cands, session.history,
+                            on_choice=on_choice if cfg["llm"]["mode"] == "agent" else None,
+                        )
+                    except BaseException:
+                        # A barge-in must not leave a bone arriving after it.
+                        if "task" in early:
+                            early["task"].cancel()
+                            with suppress(BaseException):
+                                await early["task"]
+                        raise
+                    shown = None
+                    if "task" in early:
+                        try:
+                            shown = await early["task"]
+                        except Exception:
+                            log.exception("early pointer failed; verifying normally")
+                    aimed, grounded_answer = grounded.target, grounded.answer
+                    already_shown = shown is not None and (
+                        aimed is None or point._same_place(aimed, early["target"])
+                    )
+                    if already_shown:
+                        # Already verified on a fresh frame and on screen.
+                        aimed, shot = shown
+                        if grounded.target is None:
+                            grounded_answer = locator.pointer_reply(aimed)
+                    elif local_fallback is not None and aimed is not None:
+                        # A unique, high-confidence UIA rectangle is more precise
+                        # than a model-copied E index — but only when it is the
+                        # same control. Swapping in a lexical match that landed
+                        # elsewhere is the phrase-gate veto again, wearing the
+                        # word "precision": it points at one control while the
+                        # spoken answer describes another.
+                        if _same_control(local_fallback, aimed):
+                            aimed = local_fallback
+                            perf.mark("pointer_local_precision")
+                    elif aimed is None and local_fallback is not None:
+                        aimed = local_fallback
+                        grounded_answer = locator.pointer_reply(aimed)
+                        perf.mark("pointer_local_fallback")
+                        perf.record_pointer(
+                            outcome="local_fallback",
+                            candidates=len(cands),
+                            source=aimed.source,
+                        )
+                        log.info("agent failed; using verified local target %r", aimed.label)
+                    if aimed and not already_shown:
                         fresh, _, _ = await _unseen_shot(session, capture.POINT_EDGE)
                         if fresh is None:
                             log.info("could not verify the localized target; withholding the bone")
@@ -1429,54 +1652,64 @@ async def answer(session: Session, prompt: str, prepared=None) -> None:
                                 else ""
                             )
                         elif locator.changed_at(shot, fresh, aimed):
-                            perf.mark("target_changed_retry")
-                            log.info("localized area changed; resolving once on the fresh frame")
-                            shot = fresh
-                            cands = await asyncio.to_thread(
-                                point.candidates,
-                                prompt,
-                                shot.pixels,
-                                shot.monitor,
-                                None,
-                                shot.hwnd,
+                            tracked = await asyncio.to_thread(
+                                locator.relocate_target, shot, fresh, aimed
                             )
-                            if cfg["llm"]["mode"] == "agent":
-                                aimed = point.confident_match(cands)
-                                grounded_answer = (
-                                    f"Right here — {aimed.label}." if aimed else ""
-                                )
-                                if aimed is None:
-                                    log.info(
-                                        "fresh frame had no unique accessible target; "
-                                        "withholding the bone"
-                                    )
-                                    perf.mark("pointer_withheld")
-                                    grounded_answer = "The screen changed before I could verify that control."
+                            if tracked is not None:
+                                aimed, shot = tracked, fresh
+                                log.info("tracked the localized control on the fresh frame")
                             else:
-                                grounded = await _resolve_point(
-                                    prompt, shot, cfg, cands, session.history
+                                perf.mark("target_changed_retry")
+                                log.info("localized area changed; resolving once on the fresh frame")
+                                shot = fresh
+                                cands = await asyncio.to_thread(
+                                    point.candidates,
+                                    prompt,
+                                    shot.pixels,
+                                    shot.monitor,
+                                    None,
+                                    shot.hwnd,
                                 )
-                                aimed, grounded_answer = grounded.target, grounded.answer
-                            if aimed:
-                                verified, _, _ = await _unseen_shot(
-                                    session, capture.POINT_EDGE
-                                )
-                                if verified is None or locator.changed_at(
-                                    shot, verified, aimed
-                                ):
-                                    log.info(
-                                        "localized area moved twice; withholding the bone"
+                                if cfg["llm"]["mode"] == "agent":
+                                    local_fallback = point.confident_match(cands)
+                                    grounded = await _resolve_point(
+                                        prompt, shot, cfg, cands, session.history
                                     )
-                                    perf.mark("pointer_withheld")
-                                    aimed = None
-                                    grounded_answer = (
-                                        "The screen changed before I could verify "
-                                        "that control."
-                                        if cfg["llm"]["mode"] == "agent"
-                                        else ""
-                                    )
+                                    aimed, grounded_answer = grounded.target, grounded.answer
+                                    if aimed is None and local_fallback is not None:
+                                        aimed = local_fallback
+                                        grounded_answer = locator.pointer_reply(aimed)
+                                        perf.mark("pointer_local_fallback")
                                 else:
-                                    shot = verified
+                                    grounded = await _resolve_point(
+                                        prompt, shot, cfg, cands, session.history
+                                    )
+                                    aimed, grounded_answer = grounded.target, grounded.answer
+                                if aimed:
+                                    verified, _, _ = await _unseen_shot(
+                                        session, capture.POINT_EDGE
+                                    )
+                                    moved = (
+                                        verified is not None
+                                        and locator.changed_at(shot, verified, aimed)
+                                    )
+                                    if moved:
+                                        aimed = await asyncio.to_thread(
+                                            locator.relocate_target, shot, verified, aimed
+                                        )
+                                    if verified is None or aimed is None:
+                                        log.info(
+                                            "localized area moved twice; withholding the bone"
+                                        )
+                                        perf.mark("pointer_withheld")
+                                        grounded_answer = (
+                                            "The screen changed before I could verify "
+                                            "that control."
+                                            if cfg["llm"]["mode"] == "agent"
+                                            else ""
+                                        )
+                                    else:
+                                        shot = verified
                         else:
                             shot = fresh
                         if aimed:
@@ -1536,12 +1769,14 @@ async def run_turn(session: Session, prompt: str) -> None:
     """A turn owns its own error handling, because as a separate task it's outside the message loop's"""
     prepared = None
     try:
-        if config.load().get("writing_enabled") and prompt:
+        cfg = config.load()
+        if prompt and (cfg.get("ai_enabled") and cfg["llm"]["mode"] in ("cloud", "agent")
+                and llm.vision_ok(cfg["llm"]) and capture.wants_pointing(prompt)):
             await _hide_point(session)
-            cfg = config.load()
-            if (cfg.get("ai_enabled") and cfg["llm"]["mode"] in ("cloud", "agent")
-                    and llm.vision_ok(cfg["llm"]) and capture.wants_pointing(prompt)):
-                prepared = asyncio.create_task(_prepare_pointing(session, prompt))
+            prepared = asyncio.create_task(_prepare_pointing(session, prompt))
+        if cfg.get("writing_enabled") and prompt:
+            if prepared is None:
+                await _hide_point(session)
             options = {"discard_preparation": lambda: _discard_preparation(prepared)} if prepared is not None else {}
             if await writing.handle(session, prompt, send, **options):
                 return
@@ -1660,12 +1895,19 @@ async def handle(session: Session, msg: dict) -> None:
         # Wake the mic keeper.
         if msg.get("value"):
             session.wake_mic()
+            cfg = config.load()
+            if cfg.get("ai_enabled"):
+                point.warm_ocr()
+            if cfg.get("ai_enabled") and cfg["llm"].get("mode") == "agent":
+                asyncio.create_task(agents.warm(cfg))
         else:
             session.awake = False
             session.mic_ready = False
             await session.cancel_ptt_start()
             await asyncio.to_thread(session.recorder.close, immediate=True)
             await session._send_mic("off")
+            await agents.stop()
+            point.stop_ocr()
 
     elif kind == "set_speak":
         cfg = config.load()
@@ -1679,13 +1921,20 @@ async def handle(session: Session, msg: dict) -> None:
         # Start hardware wake-up before cancelling the previous turn so both
         # operations overlap instead of adding their latency.
         session.wake_mic()
+        cfg = config.load()
+        if cfg.get("ai_enabled"):
+            point.warm_ocr()
+        if cfg.get("ai_enabled") and cfg["llm"].get("mode") == "agent":
+            # Idempotent when already ready. On a wake hotkey this overlaps mic,
+            # field discovery, cancellation and the user's speech.
+            asyncio.create_task(agents.warm(cfg))
         # Snapshot the focused field at the same moment as microphone wake-up.
         # Keep this task detached until abort() has cancelled the prior writer.
         writing_finding = (
             asyncio.create_task(
                 asyncio.to_thread(writing.desktop.resolve, writing.FIND_SECONDS)
             )
-            if config.load().get("writing_enabled")
+            if cfg.get("writing_enabled")
             else None
         )
         await session.abort()

@@ -55,12 +55,16 @@ AGENT_PRESETS = {
         "install": "npm install -g @anthropic-ai/claude-code",
         "vision": True,
         "models_cmd": (),
+        # Labels are measured, not marketing. On a locator turn Haiku spent
+        # 392-948 output tokens on the same object Sonnet answered in ~90, and
+        # took 4.6-9.8s against Sonnet's 1.5-2.1s.
         "models": {
-            "sonnet": "Sonnet, balanced",
+            "sonnet": "Sonnet, recommended",
             "opus": "Opus, most capable",
-            "haiku": "Haiku, fastest",
+            "haiku": "Haiku, fast replies but poor at pointing",
             "fable": "Fable",
         },
+        "default_model": "sonnet",
     },
     "codex": {
         "label": "Codex",
@@ -152,6 +156,13 @@ DEFAULTS = {
         "temperature": 0.3,
         # Can the model read a screenshot?
         "vision": "auto",
+        # Non-secret per-mode destinations survive switching to an agent and
+        # reopening Settings. The active fields above remain the runtime truth.
+        "api_provider": "",
+        "api_base_url": "",
+        "api_model": "",
+        "agent_provider": "",
+        "agent_model": "",
     },
     "stt": {
         "mode": "local",
@@ -330,6 +341,11 @@ def validate(candidate: dict) -> dict:
     if vision not in VISION_MODES:
         raise ValueError(f"vision must be one of {', '.join(VISION_MODES)}")
     llm["vision"] = vision
+    for key in ("api_provider", "api_base_url", "api_model", "agent_provider", "agent_model"):
+        value = str(llm.get(key) or "").strip()
+        if len(value) > 500:
+            raise ValueError(f"{key.replace('_', ' ')} is too long")
+        llm[key] = value
 
     stt = cfg["stt"]
     local_model = str(stt.get("local_model", "")).strip()
@@ -497,14 +513,21 @@ MOVED = {
 
 
 def _retire_agents(cfg: dict) -> None:
-    """Move anyone parked on a coding-agent CLI that no longer ships."""
+    """Move anyone parked on a coding-agent CLI or model that no longer ships."""
     llm = cfg.get("llm")
     if not isinstance(llm, dict) or llm.get("mode") != "agent":
         return
-    if str(llm.get("provider", "")).strip().lower() in AGENT_PRESETS:
-        return
-    llm["provider"] = "claude"
-    llm["model"] = ""
+    provider = str(llm.get("provider", "")).strip().lower()
+    if provider not in AGENT_PRESETS:
+        llm["provider"] = provider = "claude"
+        llm["model"] = ""
+    # Haiku could not do pointing: 9 of 13 measured locator turns returned
+    # nothing before the deadline, against 0 of 21 on the other engine. Move
+    # anyone parked on it once, the way a retired provider is moved.
+    default = AGENT_PRESETS[provider].get("default_model", "")
+    for field in ("model", "agent_model"):
+        if str(llm.get(field, "")).strip().lower() == "haiku":
+            llm[field] = default
 
 
 def migrate(cfg: dict) -> dict:

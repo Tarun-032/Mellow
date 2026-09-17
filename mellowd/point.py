@@ -2,13 +2,23 @@
 
 import logging
 import re
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from collections import deque
 from dataclasses import dataclass
 
 from mellowd import perf
 
 log = logging.getLogger(__name__)
+
+_OCR_LOCK = threading.Lock()
+_OCR_POOL: ThreadPoolExecutor | None = None
+_OCR_LOCAL = threading.local()
+_OCR_MISSING = object()
+_EVIDENCE_LOCK = threading.Lock()
+_EVIDENCE_CACHE = None
+EVIDENCE_TTL = 20.0
 
 # Bounds on the UIA walk.
 MAX_NODES = 3000
@@ -95,6 +105,11 @@ class Target:
     bounds: tuple[float, float, float, float] | None = None
     # Physical monitor containing this target.
     monitor: dict | None = None
+    # Accessibility state. OCR rows use the safe visible/enabled defaults.
+    enabled: bool = True
+    visible: bool = True
+    # A collapsed expander: opening it reveals controls not on screen yet.
+    expands: bool = False
 
 
 # OCR whitespace is unreliable, so matching uses alphanumerics only.
@@ -213,6 +228,20 @@ class _CachedControl:
     def HelpText(self):
         return self._property("HelpText")
 
+    @property
+    def IsEnabled(self):
+        return self._property("IsEnabled")
+
+    @property
+    def IsOffscreen(self):
+        return self._property("IsOffscreen")
+
+    def value(self, property_id):
+        try:
+            return self.element.GetCachedPropertyValue(property_id)
+        except Exception:
+            return self.element.GetCurrentPropertyValue(property_id)
+
     def GetChildren(self):
         try:
             # One parent and its immediate children, never an unbounded subtree.
@@ -234,13 +263,34 @@ def _cache_root(root, auto):
         request = client.CreateCacheRequest()
         request.TreeScope = 3  # TreeScope_Element | TreeScope_Children
         request.TreeFilter = client.RawViewCondition
-        for name in ("Name", "ControlType", "BoundingRectangle", "AutomationId", "HelpText"):
+        for name in (
+            "Name", "ControlType", "BoundingRectangle", "AutomationId",
+            "HelpText", "IsEnabled", "IsOffscreen",
+            # Whether a control reveals more when opened ("More", a tree node).
+            "IsExpandCollapsePatternAvailable", "ExpandCollapseExpandCollapseState",
+        ):
             request.AddProperty(getattr(auto.PropertyId, name + "Property"))
         # Full references (the default) permit refreshing children and live fallback.
         return _CachedControl(root.Element, request, auto)
     except Exception:
         log.debug("UIA caching unavailable; using live property reads", exc_info=True)
         return root
+
+
+# ExpandCollapseState values that mean "opening this shows more".
+_REVEALS = (0, 2)  # Collapsed, PartiallyExpanded
+
+
+def _expands(node, auto) -> bool:
+    """A collapsed expander, which is where a hidden requested item lives."""
+    try:
+        ids = auto.PropertyId
+        read = node.value if isinstance(node, _CachedControl) else node.Element.GetCurrentPropertyValue
+        return bool(read(ids.IsExpandCollapsePatternAvailableProperty)) and (
+            read(ids.ExpandCollapseExpandCollapseStateProperty) in _REVEALS
+        )
+    except Exception:
+        return False
 
 
 @perf.timed("uia")
@@ -269,8 +319,16 @@ def uia_candidates(hwnd: int = 0) -> tuple[list[tuple], tuple | None]:
                 except Exception:
                     continue
                 role = INTERACTIVE.get(kind, "")
+                try:
+                    enabled = bool(node.IsEnabled)
+                except Exception:
+                    enabled = True
+                try:
+                    visible = not bool(node.IsOffscreen)
+                except Exception:
+                    visible = True
                 # Icon-only controls are exactly the things OCR cannot save.
-                if box.width() > 0 and (name or role):
+                if box.width() > 0 and visible and (name or role):
                     automation = ""
                     help_text = ""
                     if not name:
@@ -284,7 +342,10 @@ def uia_candidates(hwnd: int = 0) -> tuple[list[tuple], tuple | None]:
                             pass
                     label = str(name or help_text or automation or role)
                     out.append(
-                        (label, box.left, box.top, box.width(), box.height(), role, "uia")
+                        (
+                            label, box.left, box.top, box.width(), box.height(),
+                            role, "uia", enabled, visible, _expands(node, auto),
+                        )
                     )
                 # The biggest document in the tree is the page being read.
                 if kind == "DocumentControl" and box.width() > 0:
@@ -329,9 +390,12 @@ async def _read(pixels) -> list[tuple]:
     decoder = await BitmapDecoder.create_async(stream)
     bitmap = await decoder.get_software_bitmap_async()
 
-    engine = OcrEngine.try_create_from_language(
-        Language("en-US")
-    ) or OcrEngine.try_create_from_user_profile_languages()
+    engine = getattr(_OCR_LOCAL, "engine", None)
+    if engine is None:
+        engine = OcrEngine.try_create_from_language(
+            Language("en-US")
+        ) or OcrEngine.try_create_from_user_profile_languages()
+        _OCR_LOCAL.engine = engine
     if engine is None:
         log.warning("no OCR language pack installed; the text tier is off")
         return []
@@ -378,9 +442,25 @@ class _OCRJob:
     expired: bool = False
 
 
+@dataclass
+class _PoolWorker:
+    future: object
+
+    def join(self, timeout: float) -> None:
+        try:
+            self.future.result(timeout=timeout)
+        except FutureTimeout:
+            pass
+
+
 def ocr_candidates(pixels) -> list[tuple]:
     """Every word on screen, with its box."""
     return _collect_ocr(_start_ocr(pixels))
+
+
+def start_ocr(pixels):
+    """Begin OCR so callers can overlap it with unrelated evidence work."""
+    return _start_ocr(pixels)
 
 
 def _start_ocr(pixels):
@@ -388,7 +468,6 @@ def _start_ocr(pixels):
     if pixels is None:
         return None
     import asyncio
-    import threading
     from contextvars import copy_context
 
     # winsdk is async all the way down
@@ -402,15 +481,16 @@ def _start_ocr(pixels):
             log.exception("ocr failed")
 
     context = copy_context()
-    worker = threading.Thread(target=context.run, args=(work,), daemon=True)
+    worker = _PoolWorker(_ocr_executor().submit(context.run, work))
     deadline = time.monotonic() + OCR_BUDGET
-    worker.start()
     return _OCRJob(worker, done, deadline)
 
 
 def _collect_ocr(pending) -> list[tuple]:
     if pending is None:
         return []
+    if isinstance(pending, list):
+        return pending
     if pending.expired:
         return []
     worker, done, deadline = pending.worker, pending.done, pending.deadline
@@ -423,6 +503,86 @@ def _collect_ocr(pending) -> list[tuple]:
     out = done[0][1]
     log.info("ocr read %d words and lines", len(out))
     return out
+
+
+def collect_ocr(pending) -> list[tuple]:
+    """Finish a prestarted OCR read so its rows can be reused safely."""
+    return _collect_ocr(pending)
+
+
+def _screen_fingerprint(pixels):
+    """Small visual signature used only to reject stale in-memory evidence."""
+    import numpy as np
+    from PIL import Image
+
+    gray = Image.fromarray(pixels).convert("L").resize((96, 54), Image.Resampling.BILINEAR)
+    return np.asarray(gray, dtype=np.int16)
+
+
+def cached_evidence(hwnd: int, mon: dict, pixels):
+    """Return UIA/OCR rows only for the same recent, visually unchanged window."""
+    import numpy as np
+
+    key = (hwnd, mon["left"], mon["top"], mon["width"], mon["height"])
+    fingerprint = _screen_fingerprint(pixels)
+    with _EVIDENCE_LOCK:
+        cached = _EVIDENCE_CACHE
+        if cached is None or cached[0] != key or time.monotonic() - cached[1] > EVIDENCE_TTL:
+            return None
+        moved = np.abs(fingerprint - cached[2]) > 12
+        # At this resolution even a small label/state change affects several
+        # samples. Cursor movement may forfeit the cache, which is preferable
+        # to reusing stale target evidence.
+        if moved.mean() > 0.0004:
+            return None
+        perf.mark("point_evidence_cache_hit")
+        return cached[3], list(cached[4])
+
+
+def remember_evidence(hwnd: int, mon: dict, pixels, accessible, ocr_rows) -> None:
+    """Keep one metadata-and-text evidence snapshot in memory, never on disk."""
+    global _EVIDENCE_CACHE
+    key = (hwnd, mon["left"], mon["top"], mon["width"], mon["height"])
+    value = (key, time.monotonic(), _screen_fingerprint(pixels), accessible, list(ocr_rows))
+    with _EVIDENCE_LOCK:
+        _EVIDENCE_CACHE = value
+
+
+def _ocr_executor() -> ThreadPoolExecutor:
+    global _OCR_POOL
+    with _OCR_LOCK:
+        if _OCR_POOL is None:
+            _OCR_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mellow-ocr")
+        return _OCR_POOL
+
+
+def _warm_ocr_thread() -> None:
+    """Initialize WinRT OCR on its long-lived thread without reading a screen."""
+    try:
+        from winsdk.windows.globalization import Language
+        from winsdk.windows.media.ocr import OcrEngine
+
+        if getattr(_OCR_LOCAL, "engine", None) is None:
+            _OCR_LOCAL.engine = OcrEngine.try_create_from_language(
+                Language("en-US")
+            ) or OcrEngine.try_create_from_user_profile_languages()
+    except Exception:
+        log.debug("OCR warm-up unavailable", exc_info=True)
+
+
+def warm_ocr() -> None:
+    """Prepare only the OCR engine; never capture or inspect the display."""
+    _ocr_executor().submit(_warm_ocr_thread)
+
+
+def stop_ocr() -> None:
+    global _OCR_POOL, _EVIDENCE_CACHE
+    with _OCR_LOCK:
+        pool, _OCR_POOL = _OCR_POOL, None
+    with _EVIDENCE_LOCK:
+        _EVIDENCE_CACHE = None
+    if pool is not None:
+        pool.shutdown(wait=False, cancel_futures=True)
 
 
 # --- the ladder -------------------------------------------------------------
@@ -517,26 +677,39 @@ def candidates(
     mon: dict | None = None,
     limit: int | None = MAX_ITEMS,
     hwnd: int = 0,
+    accessible: tuple[list[tuple], tuple | None] | None = None,
+    pending_ocr=_OCR_MISSING,
 ) -> list[Target]:
     """Everything on screen worth offering, best guesses first."""
     mon = mon or monitor()
     if mon is None:
         return []
-    pending_ocr = _start_ocr(pixels)
-    tree, page = uia_candidates(hwnd)
+    if pending_ocr is _OCR_MISSING:
+        pending_ocr = _start_ocr(pixels)
+    tree, page = accessible if accessible is not None else uia_candidates(hwnd)
     # Ignore a document that belongs to another monitor.
     if page is not None and _shared(page, mon) < MIN_PAGE * mon["width"] * mon["height"]:
         log.info("point: the document is not on this screen; no split")
         page = None
     raw = []
-    for name, left, top, width, height, kind, source in tree + _collect_ocr(pending_ocr):
+    rows = tree + _collect_ocr(pending_ocr)
+    for row in rows:
+        name, left, top, width, height, kind, source = row[:7]
+        enabled = bool(row[7]) if len(row) > 7 else True
+        visible = bool(row[8]) if len(row) > 8 else True
+        expands = bool(row[9]) if len(row) > 9 else False
         if not name or not name.strip():
             continue
         # OCR boxes are local to the captured bitmap
         if source == "ocr":
             left += mon["left"]
             top += mon["top"]
-        raw.append((_display(name, source), left, top, width, height, kind, source))
+        raw.append(
+            (
+                _display(name, source), left, top, width, height, kind, source,
+                enabled, visible, expands,
+            )
+        )
 
     def furniture(row) -> bool:
         """Is this the browser around the page rather than the page itself?"""
@@ -551,7 +724,7 @@ def candidates(
 
     keep = []
     for row in raw:
-        name, left, top, width, height, _, _ = row
+        name, left, top, width, height, _, _ = row[:7]
         if width <= 0 or height <= 0 or not _fit(name, row[5], row[6]):
             continue
         if width > mon["width"] * MAX_SPAN[0] and height > mon["height"] * MAX_SPAN[1]:
@@ -614,9 +787,12 @@ def candidates(
             chrome=furniture(row),
             bounds=(left, top, width, height),
             monitor=dict(mon),
+            enabled=enabled,
+            visible=visible,
+            expands=expands,
         )
         for row in ranked
-        for name, left, top, width, height, kind, source in [row]
+        for name, left, top, width, height, kind, source, enabled, visible, expands in [row]
     ]
 
 
@@ -637,13 +813,20 @@ def _same_place(a: Target, b: Target) -> bool:
     return abs(ac[0] - bc[0]) <= 4 and abs(ac[1] - bc[1]) <= 4
 
 
-def confident_match(cands: list[Target]) -> Target | None:
-    """Return one safe, spatially unique accessible match without a model call."""
+def confident_match(cands: list[Target], hidden: tuple[str, ...] = ()) -> Target | None:
+    """Return one safe, spatially unique accessible match without a model call.
+
+    `hidden` names controls that exist on the page but are not visible. A visible
+    row carrying one of those names is a decoy - the word "Spam" in a subject
+    line while the Spam folder sits behind "More" - so no model-free bone.
+    """
     interactive = set(INTERACTIVE.values())
     eligible = [
         candidate
         for candidate in cands
         if not candidate.chrome
+        and candidate.enabled
+        and candidate.visible
         and (
             (candidate.source == "uia" and candidate.kind in interactive)
             # A bone is only visual guidance, so the center of one exact,
@@ -660,6 +843,8 @@ def confident_match(cands: list[Target]) -> Target | None:
 
     # Repeated labels such as two "View" buttons need vision or user context.
     label = squash(best.label)
+    if label in {squash(name) for name in hidden}:
+        return None
     if any(
         other is not best
         and squash(other.label) == label

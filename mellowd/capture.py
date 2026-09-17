@@ -258,6 +258,8 @@ def window_on_monitor(monitor: dict) -> tuple[int, str, str]:
             ctypes.POINTER(ctypes.wintypes.DWORD),
         ]
         user32.GetWindowThreadProcessId.restype = ctypes.wintypes.DWORD
+        user32.GetAncestor.argtypes = [hwnd_t, ctypes.wintypes.UINT]
+        user32.GetAncestor.restype = hwnd_t
 
         callback_t = ctypes.WINFUNCTYPE(
             ctypes.wintypes.BOOL, hwnd_t, ctypes.wintypes.LPARAM
@@ -287,12 +289,34 @@ def window_on_monitor(monitor: dict) -> tuple[int, str, str]:
                 return True
             pid = ctypes.wintypes.DWORD()
             user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-            app = _process_name(pid.value or 0)
+            source_pid = pid.value or 0
+            # Menus and combo boxes can be separate top-level popup windows.
+            # Ground the request in their owning application window so a valid
+            # menu-bar target is not rejected as outside a tiny popup rectangle.
+            root = user32.GetAncestor(hwnd, 3) or hwnd  # GA_ROOTOWNER
+            root_pid = ctypes.wintypes.DWORD()
+            user32.GetWindowThreadProcessId(root, ctypes.byref(root_pid))
+            if root_pid.value != source_pid or not user32.IsWindowVisible(root):
+                root = hwnd
+            root_rect = ctypes.wintypes.RECT()
+            if not user32.GetWindowRect(root, ctypes.byref(root_rect)):
+                root = hwnd
+            root_box = (root_rect.left, root_rect.top, root_rect.right, root_rect.bottom)
+            if _intersection(monitor, root_box) <= 0:
+                root = hwnd
+            root_length = user32.GetWindowTextLengthW(root)
+            if root_length > 0:
+                root_title = ctypes.create_unicode_buffer(root_length + 1)
+                user32.GetWindowTextW(root, root_title, root_length + 1)
+                title = root_title.value.strip() or title
+            app = _process_name(source_pid)
             if app.casefold() in {"mellow.exe", "textinputhost.exe"}:
                 # Windows Input Experience can briefly sit above the real app
                 # after a global hotkey. Its one-node UIA tree caused pointing
                 # to ground against unrelated OCR from the monitor.
                 return True
+            # Keep UIA rooted at the visible popup/dialog. window_rect() expands
+            # safety bounds to its owning application separately.
             found.append((int(hwnd or 0), app, title))
             return False
 
@@ -305,13 +329,44 @@ def window_on_monitor(monitor: dict) -> tuple[int, str, str]:
         return 0, "", ""
 
 
-def grab(
-    max_edge: int = MAX_EDGE, monitor: dict | None = None
-) -> tuple[bytes, int, int, "object"] | None:
-    """One screenshot: (JPEG bytes, width, height, full-resolution pixels)."""
+def window_rect(hwnd: int) -> tuple[int, int, int, int] | None:
+    """Physical bounds of a visible window and its same-process root owner."""
+    if not hwnd:
+        return None
     try:
-        import io
+        import ctypes.wintypes
 
+        rect = ctypes.wintypes.RECT()
+        user32 = ctypes.windll.user32
+        user32.GetWindowRect.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.wintypes.RECT)]
+        user32.GetWindowRect.restype = ctypes.wintypes.BOOL
+        if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            return None
+        left, top, right, bottom = rect.left, rect.top, rect.right, rect.bottom
+        user32.GetAncestor.argtypes = [ctypes.c_void_p, ctypes.wintypes.UINT]
+        user32.GetAncestor.restype = ctypes.c_void_p
+        user32.GetWindowThreadProcessId.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ctypes.wintypes.DWORD),
+        ]
+        user32.GetWindowThreadProcessId.restype = ctypes.wintypes.DWORD
+        root = user32.GetAncestor(hwnd, 3) or hwnd  # GA_ROOTOWNER
+        source_pid, root_pid = ctypes.wintypes.DWORD(), ctypes.wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(source_pid))
+        user32.GetWindowThreadProcessId(root, ctypes.byref(root_pid))
+        if root != hwnd and source_pid.value == root_pid.value:
+            owner = ctypes.wintypes.RECT()
+            if user32.GetWindowRect(root, ctypes.byref(owner)):
+                left, top = min(left, owner.left), min(top, owner.top)
+                right, bottom = max(right, owner.right), max(bottom, owner.bottom)
+        width, height = right - left, bottom - top
+        return (left, top, width, height) if width > 0 and height > 0 else None
+    except Exception:
+        return None
+
+
+def frame(monitor: dict | None = None):
+    """Capture one native frame before any provider encoding."""
+    try:
         import mss
         from PIL import Image
 
@@ -323,25 +378,49 @@ def grab(
         import numpy as np
 
         pixels = np.asarray(image)
-        long_edge = max(image.size)
-        if long_edge > max_edge:
-            scale = max_edge / long_edge
-            image = image.resize(
-                (round(image.width * scale), round(image.height * scale)),
-                Image.LANCZOS,
-            )
-        out = io.BytesIO()
-        image.save(out, format="JPEG", quality=JPEG_QUALITY)
-        data = out.getvalue()
+        return image, pixels, chosen
+    except Exception:
+        log.exception("screen capture failed")
+        return None
+
+
+def encode(image, max_edge: int = MAX_EDGE) -> tuple[bytes, int, int]:
+    """Encode a captured image without touching its native OCR pixels."""
+    import io
+
+    from PIL import Image
+
+    long_edge = max(image.size)
+    if long_edge > max_edge:
+        scale = max_edge / long_edge
+        image = image.resize(
+            (round(image.width * scale), round(image.height * scale)),
+            Image.LANCZOS,
+        )
+    out = io.BytesIO()
+    image.save(out, format="JPEG", quality=JPEG_QUALITY)
+    return out.getvalue(), image.width, image.height
+
+
+def grab(
+    max_edge: int = MAX_EDGE, monitor: dict | None = None
+) -> tuple[bytes, int, int, "object"] | None:
+    """One screenshot: (JPEG bytes, width, height, full-resolution pixels)."""
+    captured = frame(monitor)
+    if captured is None:
+        return None
+    image, pixels, chosen = captured
+    try:
+        data, width, height = encode(image, max_edge)
         log.info(
             "captured %dx%d at %d,%d -> %d bytes",
-            image.width,
-            image.height,
+            width,
+            height,
             chosen["left"],
             chosen["top"],
             len(data),
         )
-        return data, image.width, image.height, pixels
+        return data, width, height, pixels
     except Exception:
         # Deliberately broad: a headless session
         log.exception("screen capture failed")

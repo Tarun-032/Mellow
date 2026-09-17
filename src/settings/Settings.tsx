@@ -1,6 +1,6 @@
-import { useEffect, useState, type FormEvent, type ReactNode } from "react";
+import { useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { emit, listen } from "@tauri-apps/api/event";
-import Meetings from "../meetings/Meetings";
+import Meetings, { Confirm } from "../meetings/Meetings";
 import { MEETING_OPEN } from "../meetings/useMeeting";
 import {
   Action,
@@ -30,6 +30,11 @@ type SettingsData = {
     temperature: number;
     /** auto guesses from the model name; on/off override the guess. */
     vision: string;
+    api_provider?: string;
+    api_base_url?: string;
+    api_model?: string;
+    agent_provider?: string;
+    agent_model?: string;
   };
   stt: Transport & {
     /** Device name, or null for the Windows default (not an index). */
@@ -94,9 +99,9 @@ function engineBaseUrl(value: string): string {
 /** Fields that define the conversation engine (see _engine_signature). */
 function engineKey(settings: SettingsData): string {
   if (!settings.ai_enabled) return JSON.stringify(["pet"]);
-  const { mode, provider, base_url, model } = settings.llm;
+  const { mode, provider, base_url, model, agent_speed } = settings.llm;
   if (mode === "agent") {
-    return JSON.stringify(["ai", mode, provider.trim(), model.trim()]);
+    return JSON.stringify(["ai", mode, provider.trim(), model.trim(), agent_speed]);
   }
   return JSON.stringify([
     "ai",
@@ -257,6 +262,7 @@ export default function Settings() {
   const [navQuery, setNavQuery] = useState("");
   const [form, setForm] = useState<SettingsData | null>(null);
   const [savedEngineKey, setSavedEngineKey] = useState<string | null>(null);
+  const engineDrafts = useRef<Partial<Record<Mode, SettingsData["llm"]>>>({});
   const [pendingEngineAction, setPendingEngineAction] =
     useState<EngineSaveAction | null>(null);
   const [presets, setPresets] = useState<Record<Capability, Record<string, Preset>> | null>(null);
@@ -284,6 +290,7 @@ export default function Settings() {
     events: SessionEvent[];
   } | null>(null);
   const [historyBusy, setHistoryBusy] = useState(false);
+  const [confirmClear, setConfirmClear] = useState(false);
 
   const loadHistory = () => {
     setHistoryBusy(true);
@@ -306,7 +313,7 @@ export default function Settings() {
   };
 
   const clearHistory = async () => {
-    if (!window.confirm("Delete every saved conversation? This cannot be undone.")) return;
+    setConfirmClear(false);
     setHistoryBusy(true);
     try {
       await request("/history/clear", { method: "POST" });
@@ -325,6 +332,7 @@ export default function Settings() {
       request<{ devices: Device[] }>("/audio/devices"),
     ])
       .then(([config, audio]) => {
+        engineDrafts.current[config.settings.llm.mode] = { ...config.settings.llm };
         setForm(config.settings);
         setSavedEngineKey(engineKey(config.settings));
         setPresets(config.presets);
@@ -386,6 +394,7 @@ export default function Settings() {
           body: JSON.stringify(current),
         });
         setForm(result.settings);
+        engineDrafts.current[result.settings.llm.mode] = { ...result.settings.llm };
         setSavedEngineKey(engineKey(result.settings));
         // The pet window follows the saved coat, never the in-progress form.
         emit("coat", result.settings.coat).catch(() => undefined);
@@ -537,16 +546,65 @@ export default function Settings() {
       setNotice(null);
       return;
     }
-    if (name === "llm" && !form.ai_enabled) {
-      setForm((current) => (current ? { ...current, ai_enabled: true } : current));
-    }
-    // Agent mode keeps credentials; only ensures a real agent provider.
-    if (name === "llm" && mode === "agent") {
-      if (!agents.some((item) => item.id === form.llm.provider)) {
-        const first = agents.find((item) => item.installed) ?? agents[0];
-        if (first) patch("llm", { provider: first.id });
-      }
-      patch(name, { mode });
+    if (name === "llm") {
+      setForm((current) => {
+        if (!current || mode === "pet") return current;
+        engineDrafts.current[current.llm.mode] = { ...current.llm };
+        const remembered = engineDrafts.current[mode];
+        if (remembered) {
+          return { ...current, ai_enabled: true, llm: { ...remembered, mode } };
+        }
+        if (mode === "agent") {
+          const first = agents.find((item) => item.installed) ?? agents[0];
+          const provider =
+            current.llm.agent_provider && agents.some((item) => item.id === current.llm.agent_provider)
+              ? current.llm.agent_provider
+              : first?.id ?? "claude";
+          return {
+            ...current,
+            ai_enabled: true,
+            llm: {
+              ...current.llm,
+              mode,
+              provider,
+              model: current.llm.agent_model ?? "",
+            },
+          };
+        }
+        const options = Object.entries(presets.llm).filter(
+          ([, item]) => Boolean(item.local) === (mode === "local"),
+        );
+        const rememberedProvider = mode === "cloud" ? current.llm.api_provider : "";
+        const byUrl = options.find(
+          ([, item]) =>
+            item.base_url && engineBaseUrl(item.base_url) === engineBaseUrl(current.llm.base_url),
+        );
+        const provider =
+          options.some(([key]) => key === rememberedProvider)
+            ? rememberedProvider!
+            : byUrl?.[0] ?? (mode === "cloud" && current.llm.base_url ? "custom" : options[0]?.[0]);
+        const preset = provider ? presets.llm[provider] : undefined;
+        return {
+          ...current,
+          ai_enabled: true,
+          llm: {
+            ...current.llm,
+            mode,
+            provider: provider ?? current.llm.provider,
+            base_url:
+              mode === "cloud" && current.llm.api_base_url
+                ? current.llm.api_base_url
+                : provider === "custom"
+                  ? current.llm.base_url
+                  : preset?.base_url ?? current.llm.base_url,
+            model:
+              mode === "cloud" && current.llm.api_model
+                ? current.llm.api_model
+                : current.llm.model,
+          },
+        };
+      });
+      setNotice(null);
       return;
     }
     const wantLocal = mode === "local";
@@ -945,12 +1003,22 @@ export default function Settings() {
                         className="button button--quiet button--danger"
                         type="button"
                         disabled={historyBusy || !history?.length}
-                        onClick={() => void clearHistory()}
+                        onClick={() => setConfirmClear(true)}
                       >
                         Clear all
                       </button>
                     </div>
                   </div>
+                  {confirmClear && (
+                    <Confirm
+                      busy={historyBusy}
+                      heading="Delete every saved conversation?"
+                      body={`${history?.length === 1 ? "This conversation goes" : `All ${history?.length ?? 0} conversations go`} for good. This cannot be undone.`}
+                      confirmLabel="Delete permanently"
+                      onCancel={() => setConfirmClear(false)}
+                      onConfirm={() => void clearHistory()}
+                    />
+                  )}
                   {history === null ? (
                     <div className="empty-state"><p>Loading sessions...</p></div>
                   ) : history.length === 0 ? (
