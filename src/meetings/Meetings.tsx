@@ -232,9 +232,9 @@ export default function Meetings({ openLast = false }: { openLast?: boolean }) {
   </>;
 
   if (!selected) return <section className="meetings">
-    <p className="meetings-intro">Right-click Mellow and choose Transcribe meeting. Your transcript and notes stay here until you delete them, independently of saved conversations.</p>
     {banner}
     {speakerSettings && <div className="meeting-speaker-setting">
+      <h3>Speaker recognition</h3>
       <label className="switch">
         <span className="switch__text">
           <b>Label remote speakers (experimental)</b>
@@ -250,7 +250,7 @@ export default function Meetings({ openLast = false }: { openLast?: boolean }) {
         : speakerSettings.ready ? "Models downloaded. Ready for the next meeting." : "Models are not ready; recording will use source labels.")}</small>}
     </div>}
     <div className="meetings-toolbar">
-      <label className="meetings-find">Find a meeting<input type="search" value={query} onChange={e => setQuery(e.target.value)} placeholder="Search titles" /></label>
+      <label className="meetings-find"><span className="meetings-find__title">Find a meeting</span><input type="search" value={query} onChange={e => setQuery(e.target.value)} placeholder="Search titles" /></label>
       <span className="meetings-toolbar__count">{selecting ? `${picked.size} selected` : `${items.length} meeting${items.length === 1 ? "" : "s"}`}</span>
       {selecting ? <>
         <button type="button" className="button button--secondary button--danger" disabled={busy || !picked.size}
