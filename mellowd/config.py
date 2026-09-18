@@ -188,6 +188,7 @@ DEFAULTS = {
     },
     # Master switch for the session event log ([[roadmap]] step 12).
     "remember_conversations": True,
+    "meeting_speakers_enabled": False,  # Experimental until real-meeting accuracy gates pass.
     # The whole AI half, off at the master switch ([[roadmap]] step 8's "just the pet").
     "ai_enabled": True,
     "writing_enabled": False,
@@ -299,6 +300,8 @@ def validate(candidate: dict) -> dict:
         raise ValueError("settings must be a JSON object")
     cfg = dict(DEFAULTS)
     cfg.update(candidate)
+    if not isinstance(cfg.get("meeting_speakers_enabled"), bool):
+        raise ValueError("meeting_speakers_enabled must be true or false")
     if not isinstance(cfg.get("writing_enabled"), bool):
         raise ValueError("writing_enabled must be true or false")
     cfg["coat"] = validate_coat(cfg.get("coat"))

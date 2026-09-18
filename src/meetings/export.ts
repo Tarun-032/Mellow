@@ -15,7 +15,7 @@ export type Content = "transcript" | "notes";
 export type Format = "md" | "txt" | "json";
 
 export type Meeting = { id: string; title: string; created: string; engine: string; notes: string };
-export type Turn = { speaker: string; text: string };
+export type Turn = { speaker: string; speaker_key?: string; text: string };
 
 const MIME: Record<Format, string> = {
   md: "text/markdown;charset=utf-8",

@@ -21,6 +21,8 @@ class Chunk:
     end: float
     audio: np.ndarray
     overlap: bool = False
+    owned_start: float | None = None
+    owned_end: float | None = None
 
 
 def _library():
@@ -56,6 +58,8 @@ def mono16(raw: bytes, channels: int, rate: int, target: int = RATE) -> np.ndarr
 class Capture:
     def __init__(self, on_chunk, on_error, origin: float, offset: float = 0):
         self.on_chunk = on_chunk
+        self.on_audio = None
+        self.contextual = False
         self.on_error = on_error
         self.origin = origin
         self.offset = offset
@@ -127,7 +131,7 @@ class Capture:
         watermarks = {who: 0 for who in frames}
         next_slot = 0
         last_mic = time.monotonic()
-        chunks = {who: ChunkBuffer(who, self.on_chunk) for who in frames}
+        chunks = {who: ChunkBuffer(who, self.on_chunk, contextual=self.contextual) for who in frames}
         silence = np.zeros(AEC_SAMPLES, dtype=np.float32)
         try:
             while not self.stopped.is_set() or not self.pending.empty() or any(frames.values()):
@@ -181,7 +185,10 @@ class Capture:
                         self.levels[who] = float(np.max(np.abs(audio)))
                         # 24kHz -> 16kHz, preserving the common recording clock.
                         pcm = (np.clip(audio[:valid], -1, 32767 / 32768) * 32768).astype("<i2").tobytes()
-                        chunks[who].append(mono16(pcm, 1, AEC_RATE), begin)
+                        data = mono16(pcm, 1, AEC_RATE)
+                        if self.on_audio:
+                            self.on_audio(who, data, begin)
+                        chunks[who].append(data, begin)
                     next_slot += 1
         except Exception as exc:
             self.fail(str(exc) if isinstance(exc, RuntimeError) else "Audio capture failed. Check your devices, then resume.")
@@ -221,9 +228,11 @@ class Capture:
 
 
 class ChunkBuffer:
-    def __init__(self, speaker, emit):
+    def __init__(self, speaker, emit, *, contextual=False):
         self.speaker, self.emit = speaker, emit
         self.parts, self.size, self.begin, self.overlap = [], 0, 0.0, False
+        self.contextual = contextual
+        self.owned_start = None
 
     def append(self, data, begin):
         if not self.parts:
@@ -232,13 +241,62 @@ class ChunkBuffer:
         self.size += len(data)
         if self.size >= CHUNK_SECONDS * RATE:
             joined = np.concatenate(self.parts)
-            self.emit(Chunk(self.speaker, self.begin, self.begin + self.size / RATE, joined, self.overlap))
-            tail = joined[-round(OVERLAP_SECONDS * RATE):].copy()
-            self.begin += (self.size - len(tail)) / RATE
+            if self.contextual:
+                self.emit_context(joined)
+                return
+            # Text-only engines retain their established fixed windows.
+            cut = len(joined)
+            self.emit(Chunk(self.speaker, self.begin, self.begin + cut / RATE, joined[:cut], self.overlap))
+            consumed = cut - round(OVERLAP_SECONDS * RATE)
+            tail = joined[consumed:].copy()
+            self.begin += consumed / RATE
             self.parts, self.size, self.overlap = [tail], len(tail), True
 
+    def emit_context(self, joined):
+        cut = quiet_boundary(joined)
+        if cut is None and len(joined) < 12 * RATE:
+            return  # No sustained pause yet; wait at most four more seconds.
+        hard = cut is None
+        cut = len(joined) if hard else cut
+        # At a forced boundary, each decoder sees context on both sides of a
+        # shared ownership boundary. Edge predictions are never both published.
+        owned_end = self.begin + cut / RATE - (.8 if hard else 0)
+        self.emit(Chunk(self.speaker, self.begin, self.begin + cut / RATE, joined[:cut],
+                        self.overlap, self.owned_start if self.owned_start is not None else self.begin, owned_end))
+        consumed = cut - (round(1.6 * RATE) if hard else 0)
+        tail = joined[consumed:].copy()
+        self.begin += consumed / RATE
+        self.owned_start = owned_end
+        self.parts, self.size, self.overlap = ([tail] if len(tail) else []), len(tail), hard
+
     def flush(self):
+        if self.contextual:
+            end = self.begin + self.size / RATE
+            start = self.owned_start if self.owned_start is not None else self.begin
+            if self.size and end > start:
+                self.emit(Chunk(self.speaker, self.begin, end, np.concatenate(self.parts),
+                                self.overlap, start, end))
+            self.parts, self.size, self.owned_start = [], 0, None
+            return
         if self.size > (OVERLAP_SECONDS * RATE if self.overlap else RATE * 0.3):
             self.emit(Chunk(self.speaker, self.begin, self.begin + self.size / RATE,
                             np.concatenate(self.parts), self.overlap))
         self.parts, self.size = [], 0
+
+
+def quiet_boundary(audio):
+    """Return the middle of a sustained pause, never an 80ms gap inside a word."""
+    frame = RATE // 50
+    n = len(audio) // frame
+    if n < 20:
+        return None
+    rms = np.sqrt(np.mean(audio[:n * frame].reshape(n, frame) ** 2, axis=1))
+    ceiling = float(np.max(rms)) * .03
+    if ceiling < 1e-7:
+        return len(audio)  # All silence needs no overlapping decoder context.
+    quiet = rms < ceiling
+    # Preserve at least 200ms of silence on either side and useful phrase context.
+    for end in range(n, 170, -1):
+        if quiet[end - 20:end].all():
+            return (end - 10) * frame
+    return None

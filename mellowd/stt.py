@@ -671,12 +671,53 @@ def transcribe_meeting_segments(audio: np.ndarray, cfg: dict | None = None) -> l
     from faster_whisper.vad import VadOptions, get_speech_timestamps
 
     with _inference_lock:
+        cfg = cfg or config.load()
+        peak, _ = levels(audio)
+        if audio.size < SAMPLE_RATE * MIN_SECONDS or peak < .001:
+            return []
+        # Use the existing bounded meeting gain for detection too. Previously VAD
+        # discarded quiet words before the recognizer ever received conditioned audio.
+        conditioned = audio * min(2., TARGET_PEAK / peak) if peak < TARGET_PEAK else audio
         regions = get_speech_timestamps(audio, VadOptions(
             min_speech_duration_ms=120, min_silence_duration_ms=450, speech_pad_ms=0,
         ))
+        if not regions:
+            regions = get_speech_timestamps(conditioned, VadOptions(
+                min_speech_duration_ms=120, min_silence_duration_ms=450, speech_pad_ms=0,
+            )) if conditioned is not audio else []
+        if not regions:
+            return []
+        if cfg["stt"]["mode"] == "local":
+            model = load(cfg)
+            if cfg["stt"]["local_model"] == PARAKEET and hasattr(model, "with_timestamps"):
+                # VAD gates an empty window; it no longer chops one sentence into
+                # unrelated ASR requests. Timing is emitted by the same decoder pass.
+                result = model.with_timestamps().recognize(conditioned, sample_rate=SAMPLE_RATE)
+                parts = timestamped_words(result, len(audio) / SAMPLE_RATE)
+                log.info("meeting recognition: context=%.2fs words=%d calls=1", len(audio) / SAMPLE_RATE, len(parts))
+                return parts
+            if cfg["stt"]["local_model"] != PARAKEET:
+                segments, _ = model.transcribe(conditioned, language="en", beam_size=5,
+                    vad_filter=False, condition_on_previous_text=False, word_timestamps=True)
+                parts = []
+                for segment in segments:
+                    if segment.words:
+                        parts.extend({"start": w.start, "end": w.end, "text": w.word.strip(), "timed": True}
+                                     for w in segment.words if w.word.strip())
+                    elif segment.text.strip():
+                        parts.append({"start": segment.start, "end": segment.end, "text": segment.text.strip()})
+                return parts
+        # Providers without word timing retain source/VAD rows, but adjoining pads
+        # must not decode the same syllables twice.
+        merged = []
+        for region in regions:
+            if merged and region["start"] - merged[-1]["end"] <= round(SAMPLE_RATE * .6):
+                merged[-1]["end"] = region["end"]
+            else:
+                merged.append(dict(region))
         result = []
         padding = round(SAMPLE_RATE * .3)
-        for region in regions:
+        for region in merged:
             # Pad edge syllables.
             first = max(0, region["start"] - padding)
             last = min(len(audio), region["end"] + padding)
@@ -685,6 +726,35 @@ def transcribe_meeting_segments(audio: np.ndarray, cfg: dict | None = None) -> l
                 result.append({"start": region["start"] / SAMPLE_RATE,
                                "end": region["end"] / SAMPLE_RATE, "text": text})
         return result
+
+
+def timestamped_words(result, duration: float) -> list[dict]:
+    """Map the decoder's exact text to token emission times, without estimating words.
+
+    An incompatible tokenizer loses timing precision, never text or a second call.
+    """
+    text = result.text.strip()
+    fallback = [{"start": 0., "end": duration, "text": text}] if text else []
+    tokens, times = result.tokens, result.timestamps
+    if not tokens or times is None or len(tokens) != len(times):
+        return fallback
+    characters, clocks = [], []
+    for token, when in zip(tokens, times):
+        if not math.isfinite(when) or when < 0 or when > duration + .16:
+            return fallback
+        for char in token.replace("\u2581", " "):
+            if not char.isspace():
+                characters.append(char); clocks.append(min(when, duration))
+    words = text.split()
+    if "".join(characters) != "".join(words) or any(b < a for a, b in zip(clocks, clocks[1:])):
+        return fallback
+    parts, cursor = [], 0
+    for word in words:
+        start, last = clocks[cursor], clocks[cursor + len(word) - 1]
+        parts.append({"start": max(0., start - .08), "end": min(duration, last + .08),
+                      "text": word, "timed": True})
+        cursor += len(word)
+    return parts
 
 
 def _transcribe(audio: np.ndarray, cfg: dict | None = None, *, meeting: bool = False) -> str:

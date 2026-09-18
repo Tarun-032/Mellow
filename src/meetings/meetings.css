@@ -165,3 +165,7 @@
 .meeting-dialog h2 { margin: 0; font-size: 20px; font-weight: 650; letter-spacing: -0.02em; }
 .meeting-dialog p { margin: 10px 0 0; color: var(--settings-muted); font-size: 14px; line-height: 1.55; }
 .meeting-dialog__actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 22px; }
+.meeting-speaker-setting { margin: 1rem 0; padding: 1rem; border: 1px solid var(--border, #d4c8b8); border-radius: 12px; }
+.meeting-speaker-setting p, .meeting-speaker-editor p { font-size: .875rem; line-height: 1.5; }
+.meeting-speaker-editor label { display: grid; gap: .4rem; margin: 1rem 0; }
+.meeting-speaker-editor input, .meeting-speaker-editor select { width: 100%; }

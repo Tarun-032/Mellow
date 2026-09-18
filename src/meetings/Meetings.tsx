@@ -3,23 +3,25 @@ import { request } from "../ui/fields";
 import { clock, MEETING_SELECTION, useMeeting } from "./useMeeting";
 import { inlineSpans, parseNotes } from "./notes";
 import { buildExport, type Content, type Format } from "./export";
+import { canonical, speakerLabel, type Speakers } from "./speakers";
 import "./meetings.css";
 
 type Summary = { id: string; title: string; created: string; duration: number; status: string; warning: string; notes_status: string };
 type Segment = { id: number; start: number; end: number; speaker: string; text: string };
 type Detail = Summary & {
   segments: Segment[];
+  speakers?: Speakers;
   notes: string; notes_status: string; notes_error: string; notes_progress: string; engine: string;
 };
 const live = (status: string) => ["starting", "recording", "paused", "finalizing"].includes(status);
-const speakerLabel = (speaker: string) => speaker === "Other participants" ? "Other participant" : speaker;
 /** `warning` also carries pause disclosure (mellowd/meetings.py). That is normal, not a problem. */
 const PAUSE_NOTE = "This meeting includes pauses.";
 const EXPORT_MENU = "meeting-export-menu";
 
-function conversationTurns(segments: Segment[]): Segment[] {
+function conversationTurns(segments: Segment[], speakers: Speakers = {}): Segment[] {
   const turns: Segment[] = [];
-  for (const segment of [...segments].sort((a, b) => a.start - b.start || a.id - b.id)) {
+  for (const raw of [...segments].sort((a, b) => a.start - b.start || a.id - b.id)) {
+    const segment = { ...raw, speaker: canonical(raw.speaker, speakers) };
     const previous = turns[turns.length - 1];
     if (previous?.speaker === segment.speaker) {
       previous.text += ` ${segment.text}`;
@@ -38,6 +40,36 @@ const spans = (text: string) => inlineSpans(text).map((span, i) =>
 
 const PencilIcon = () =>
   <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20h4L19 9a2.8 2.8 0 0 0-4-4L4 16v4Z" /><path d="M14 6l4 4" /></svg>;
+
+type SpeakerSettings = { enabled: boolean; ready: boolean; preparing: boolean; error: string };
+
+function SpeakerEditor({ speaker, speakers, busy, save, merge, close }: {
+  speaker: string; speakers: Speakers; busy: boolean; close: () => void;
+  save: (name: string) => void; merge: (target: string | null) => void;
+}) {
+  const ref = useRef<HTMLDialogElement>(null);
+  const [name, setName] = useState(speakers[speaker]?.name || "");
+  const [target, setTarget] = useState("");
+  useEffect(() => { ref.current?.showModal(); }, []);
+  return <dialog ref={ref} className="meeting-dialog meeting-speaker-editor" onCancel={e => { e.preventDefault(); close(); }}>
+    <h2>{speaker}</h2>
+    <label>Name<input autoFocus maxLength={80} value={name} onChange={e => setName(e.target.value)} placeholder={speaker} /></label>
+    <button type="button" className="button button--secondary" disabled={busy} onClick={() => save(name)}>Save name</button>
+    {speakers[speaker]?.merged_into ? <>
+      <p>Combined with {speakerLabel(speakers[speaker].merged_into!, speakers)}.</p>
+      <button type="button" className="button button--secondary" disabled={busy} onClick={() => merge(null)}>Separate this speaker</button>
+    </> : <>
+      <label>Same person as…<select value={target} onChange={e => setTarget(e.target.value)}>
+        <option value="">Choose a speaker</option>
+        {Object.keys(speakers).filter(k => canonical(k, speakers) === k && k !== canonical(speaker, speakers)).map(k =>
+          <option key={k} value={k}>{speakerLabel(k, speakers)}</option>)}
+      </select></label>
+      <button type="button" className="button button--secondary" disabled={busy || !target} onClick={() => merge(target)}>Combine speakers</button>
+    </>}
+    <p>Names do not combine people. Combining is reversible. Regenerate existing notes after changes.</p>
+    <button type="button" className="button button--quiet" onClick={close}>Close</button>
+  </dialog>;
+}
 
 /** Native <dialog>: Escape, focus trap and the top layer come from the platform. */
 export function Confirm({ heading, body, confirmLabel, onConfirm, onCancel, busy }: {
@@ -87,6 +119,8 @@ export default function Meetings({ openLast = false }: { openLast?: boolean }) {
   const [confirmBulk, setConfirmBulk] = useState(false);
   const [pick, setPick] = useState<Content | null>(null);
   const [regenerating, setRegenerating] = useState(false);
+  const [speakerSettings, setSpeakerSettings] = useState<SpeakerSettings | null>(null);
+  const [editingSpeaker, setEditingSpeaker] = useState<string | null>(null);
   const meeting = useMeeting();
   const headingRef = useRef<HTMLInputElement>(null);
   const current = useRef(selected);
@@ -94,6 +128,7 @@ export default function Meetings({ openLast = false }: { openLast?: boolean }) {
   const refresh = useCallback(async () => {
     const list = await request<{ meetings: Summary[] }>("/meetings");
     setItems(list.meetings); setLoaded(true);
+    setSpeakerSettings(await request<SpeakerSettings>("/meetings/speaker-settings"));
     const id = current.current;
     if (id) {
       const next = await request<Detail>(`/meetings/${id}`);
@@ -109,6 +144,7 @@ export default function Meetings({ openLast = false }: { openLast?: boolean }) {
       if (alive) timer = window.setTimeout(poll, 2000);
     };
     void poll();
+    request("/meetings/prepare-speakers", { method: "POST", body: "{}" }).catch(e => { if (alive) setError(e.message); });
     request<{ settings: { ai_enabled: boolean; llm: { mode: string; provider: string; model: string } } }>("/config").then(({ settings }) => {
       const llm = settings.llm;
       setEngine({
@@ -121,6 +157,7 @@ export default function Meetings({ openLast = false }: { openLast?: boolean }) {
 
   useEffect(() => {
     setDetail(null); setConfirmDelete(false); setError(""); setNotice("");
+    setEditingSpeaker(null);
     if (!selected) return;
     localStorage.setItem(MEETING_SELECTION, selected);
     let alive = true;
@@ -140,7 +177,7 @@ export default function Meetings({ openLast = false }: { openLast?: boolean }) {
   const closeMenu = () => { document.getElementById(EXPORT_MENU)?.togglePopover(false); setPick(null); };
   const saveFile = (content: Content, format: Format) => {
     if (!detail) return;
-    const { text, filename, mime } = buildExport(detail, turns.map(t => ({ speaker: speakerLabel(t.speaker), text: t.text })), content, format);
+    const { text, filename, mime } = buildExport(detail, turns.map(t => ({ speaker: speakerLabel(t.speaker, detail.speakers), speaker_key: t.speaker, text: t.text })), content, format);
     const url = URL.createObjectURL(new Blob([text], { type: mime }));
     const link = document.createElement("a"); link.href = url; link.download = filename;
     document.body.appendChild(link); link.click(); link.remove(); setTimeout(() => URL.revokeObjectURL(url), 1000);
@@ -148,7 +185,7 @@ export default function Meetings({ openLast = false }: { openLast?: boolean }) {
   };
   const copyOut = (content: Content) => {
     if (!detail) return;
-    const { text } = buildExport(detail, turns.map(t => ({ speaker: speakerLabel(t.speaker), text: t.text })), content, "txt");
+    const { text } = buildExport(detail, turns.map(t => ({ speaker: speakerLabel(t.speaker, detail.speakers), speaker_key: t.speaker, text: t.text })), content, "txt");
     closeMenu();
     void act(() => navigator.clipboard.writeText(text), `${content === "notes" ? "Notes" : "Transcript"} copied to clipboard.`);
   };
@@ -181,7 +218,7 @@ export default function Meetings({ openLast = false }: { openLast?: boolean }) {
     if (kept.length) setError(`Deleted ${gone}. ${kept.length} could not be deleted. Stop recording and let notes generation finish first.`);
   };
   const filtered = items.filter(item => item.title.toLocaleLowerCase().includes(query.toLocaleLowerCase()));
-  const turns = conversationTurns(detail?.segments ?? []);
+  const turns = conversationTurns(detail?.segments ?? [], detail?.speakers);
 
   const banner = <>
     {meeting.status?.active && <div className="meetings-live" role="status">
@@ -197,6 +234,15 @@ export default function Meetings({ openLast = false }: { openLast?: boolean }) {
   if (!selected) return <section className="meetings">
     <p className="meetings-intro">Right-click Mellow and choose Transcribe meeting. Your transcript and notes stay here until you delete them, independently of saved conversations.</p>
     {banner}
+    {speakerSettings && <div className="meeting-speaker-setting">
+      <label><input type="checkbox" checked={speakerSettings.enabled} disabled={busy || !!meeting.status?.active}
+        onChange={e => { const enabled = e.target.checked; void act(() => request("/meetings/speaker-settings", {
+          method: "POST", body: JSON.stringify({ enabled }),
+        })); }} /> Label remote speakers (experimental)</label>
+      <p>Local processing; voice data is discarded when the meeting ends. Mixed speech may remain unassigned. Rename speakers after recording.</p>
+      {speakerSettings.enabled && <small role="status">{speakerSettings.error || (speakerSettings.preparing ? "Preparing speaker models…"
+        : speakerSettings.ready ? "Models downloaded. Ready for the next meeting." : "Models are not ready; recording will use source labels.")}</small>}
+    </div>}
     <div className="meetings-toolbar">
       <label className="meetings-find">Find a meeting<input type="search" value={query} onChange={e => setQuery(e.target.value)} placeholder="Search titles" /></label>
       <span className="meetings-toolbar__count">{selecting ? `${picked.size} selected` : `${items.length} meeting${items.length === 1 ? "" : "s"}`}</span>
@@ -286,7 +332,11 @@ export default function Meetings({ openLast = false }: { openLast?: boolean }) {
           <div className="meeting-transcript">
             {!turns.length ? <p>{live(detail.status) ? "Listening. Your conversation appears here as speech is processed." : "No speech was transcribed. Check your microphone, meeting output and speech-to-text settings before recording again."}</p> :
               turns.map(segment => <section key={segment.id}>
-                <div><strong>{speakerLabel(segment.speaker)}</strong></div><p>{segment.text}</p>
+                <div><strong>{speakerLabel(segment.speaker, detail.speakers)}</strong>
+                  {detail.status === "complete" && detail.speakers?.[segment.speaker] && <button type="button" className="meeting-title__edit"
+                    disabled={busy || writing} aria-label={`Edit ${speakerLabel(segment.speaker, detail.speakers)}`}
+                    onClick={() => setEditingSpeaker(segment.speaker)}><PencilIcon /></button>}
+                </div><p>{segment.text}</p>
               </section>)}
           </div>
         </> : <>
@@ -313,8 +363,25 @@ export default function Meetings({ openLast = false }: { openLast?: boolean }) {
               </div>}
         </>}
         <div className="meeting-actions">
+          {detail.status === "complete" && Object.keys(detail.speakers || {}).length > 0 && <details>
+            <summary>Manage speakers</summary>
+            {Object.keys(detail.speakers || {}).map(key => <button key={key} type="button" className="button button--quiet"
+              disabled={busy || writing} onClick={() => setEditingSpeaker(key)}>{key}{detail.speakers?.[key].merged_into ? " (combined)" : ""}</button>)}
+          </details>}
           <button type="button" className="button button--quiet button--danger meeting-actions__delete" disabled={busy || live(detail.status) || detail.notes_status === "generating"} onClick={() => setConfirmDelete(true)}>Delete meeting</button>
         </div>
+        {editingSpeaker && detail.speakers?.[editingSpeaker] && <SpeakerEditor key={editingSpeaker} speaker={editingSpeaker}
+          speakers={detail.speakers} busy={busy} close={() => setEditingSpeaker(null)}
+          save={name => void act(async () => {
+            await request(`/meetings/${selected}`, { method: "PUT", body: JSON.stringify({ speakers: { [editingSpeaker]: name } }) });
+            setEditingSpeaker(null);
+          })}
+          merge={target => void act(async () => {
+            await request(`/meetings/${selected}/speakers/${target === null ? "unmerge" : "merge"}`, {
+              method: "POST", body: JSON.stringify(target === null ? { key: editingSpeaker } : { source: editingSpeaker, target }),
+            });
+            setEditingSpeaker(null);
+          })} />}
         {confirmDelete && <Confirm busy={busy}
           heading="Delete this meeting?"
           body="Its transcript and notes go with it. This cannot be undone. Export a copy first if you need one."

@@ -4,13 +4,15 @@ import asyncio
 import logging
 import re
 import time
+import threading
+from bisect import bisect_left, bisect_right
 from collections import deque
 from contextlib import suppress
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from mellowd import config, errors, meeting_audio, meeting_notes, stt
+from mellowd import config, errors, meeting_audio, meeting_notes, meeting_speakers, models, stt
 from mellowd.meeting_store import Store, export
 
 log = logging.getLogger("mellowd.meetings")
@@ -24,6 +26,20 @@ def deduplicate(previous: str, current: str) -> str:
     for count in range(min(12, len(before), len(after)), 1, -1):
         if normalize(before[-count:]) == normalize(after[:count]):
             return " ".join(after[count:])
+    return current
+
+
+def trim_word_overlap(previous, current, begin):
+    """Remove only a matching timed word sequence in the shared capture audio."""
+    if not previous or not current or not all(p.get("timed") for p in current):
+        return current
+    normalize = lambda s: re.sub(r"\W+", "", s).casefold()
+    for count in range(min(len(previous), len(current), 12), 0, -1):
+        old, new = previous[-count:], current[:count]
+        if all(normalize(a["text"]) == normalize(b["text"]) and normalize(a["text"])
+               and min(a["end"], begin + b["end"]) > max(a["start"], begin + b["start"])
+               for a, b in zip(old, new)):
+            return current[count:]
     return current
 
 
@@ -51,9 +67,82 @@ class Manager:
         self.selection = (None, None)
         self.previous = {}
         self.previous_end = {}
+        self.previous_words = {}
         self.before_start = None
         self.after_stop = None
         self.busy = False
+        self.speakers = None
+        self.speaker_rows = {}
+        self.speaker_labels = {}
+        self.timed_rows = set()
+        self.preparation = None
+        self.preparation_cancel = threading.Event()
+        self.preparation_error = ""
+
+    def prepare_speakers(self):
+        if self.active or (self.preparation and not self.preparation.done()):
+            return
+        self.preparation_cancel.clear()
+        self.preparation_error = ""
+        async def run():
+            try:
+                for name in models.SPEAKER_MODELS:
+                    await asyncio.to_thread(models.ensure, name, cancelled=self.preparation_cancel.is_set)
+            except InterruptedError:
+                pass
+            except Exception:
+                log.exception("Speaker model preparation failed")
+                self.preparation_error = "Could not prepare speaker models. Reopen Meetings to retry."
+        self.preparation = asyncio.create_task(run())
+
+    async def stop_preparation(self):
+        self.preparation_cancel.set()
+        if self.preparation:
+            await self.preparation
+            self.preparation = None
+
+    def speaker_failure(self, message):
+        self.warning = " ".join(filter(None, (self.warning, message)))
+        self.persist()
+
+    def update_speaker_rows(self, turns=None, final=False):
+        # A labelling/storage failure must not retry already-transcribed audio.
+        try:
+            self._update_speaker_rows(turns, final)
+        except Exception:
+            log.exception("Could not save speaker labels; transcript remains intact")
+            if self.speakers:
+                self.speakers.failed.set()
+            self.warning = " ".join(filter(None, (self.warning,
+                "Speaker labels could not be updated. Saved transcription is intact.")))
+
+    def _update_speaker_rows(self, turns=None, final=False):
+        if turns is None:
+            if not self.speakers or self.speakers.failed.is_set():
+                return
+            frontier, turns = self.speakers.snapshot()
+        else:
+            frontier = float("inf")
+        labels = {}
+        starts = [turn.start for turn in turns]
+        ends = [turn.end for turn in turns]
+        for row, (start, end) in self.speaker_rows.items():
+            # Pooled live evidence spans at most ten seconds. Older saved labels
+            # cannot change until final clustering; avoid rescoring every old word.
+            if not final and row in self.speaker_labels and end < frontier - 12:
+                continue
+            if end <= frontier:
+                # Token emission clocks can precede a short word's acoustic
+                # onset. Only borrow a nearby identity when row_label finds no
+                # competing/unknown/overlapping speech within this collar.
+                tolerance = .5 if row in self.timed_rows else 0.
+                nearby = turns[bisect_right(ends, start - tolerance):bisect_left(starts, end + tolerance)]
+                key = meeting_speakers.row_label(start, end, nearby, timing_tolerance=tolerance)
+                if final or self.speaker_labels.get(row) != key:
+                    labels[row] = key
+        if labels or final:
+            self.store.relabel(self.id, labels, final=final)
+            self.speaker_labels.update(labels)
 
     @property
     def active(self):
@@ -105,6 +194,9 @@ class Manager:
             lambda chunk: loop.call_soon_threadsafe(self.enqueue, chunk),
             lambda message: loop.call_soon_threadsafe(self.schedule_pause, message), self.origin)
         self.capture = capture
+        capture.contextual = self.cfg["stt"]["mode"] == "local"
+        if self.speakers:
+            capture.on_audio = self.speakers.feed
         try:
             await asyncio.to_thread(capture.start, *self.selection, self.cfg["stt"].get("input_device"))
         except Exception:
@@ -115,6 +207,8 @@ class Manager:
         async with self.lock:
             if self.active:
                 raise RuntimeError("A meeting is already active. Stop it before starting another.")
+            # Join the download before opening any capture device: no network competition.
+            await self.stop_preparation()
             self.cfg = config.load()
             self.selection = (microphone, output)
             self.id = self.store.create(title)
@@ -123,17 +217,32 @@ class Manager:
             self.pending.clear()
             self.previous.clear()
             self.previous_end.clear()
+            self.previous_words.clear()
+            self.speaker_rows.clear()
+            self.speaker_labels.clear()
+            self.timed_rows.clear()
             self.retry.set()
             try:
                 if self.before_start:
                     await self.before_start()
                 if self.cfg["stt"]["mode"] == "local":
                     await asyncio.to_thread(stt.load)
+                if self.cfg.get("meeting_speakers_enabled", False):
+                    try:
+                        loop = asyncio.get_running_loop()
+                        self.speakers = await asyncio.to_thread(meeting_speakers.Worker,
+                            on_failure=lambda message: loop.call_soon_threadsafe(self.speaker_failure, message))
+                    except Exception:
+                        log.exception("Speaker models unavailable; using source labels")
+                        self.warning = "Speaker models are unavailable. This meeting uses You and Other participants."
                 await self.open_capture()
                 self.state = "recording"
                 self.persist()
                 self.worker = asyncio.create_task(self.consume())
             except Exception as exc:
+                if self.speakers:
+                    await asyncio.to_thread(self.speakers.close)
+                    self.speakers = None
                 if self.capture:
                     await asyncio.to_thread(self.capture.close)
                     self.capture = None
@@ -157,6 +266,8 @@ class Manager:
             if self.capture:
                 await asyncio.to_thread(self.capture.close)
                 self.capture = None
+            if self.speakers:
+                self.speakers.boundary()  # Pauses compress meeting time, so gaps need an explicit marker.
             self.persist()
             return self.status()
 
@@ -200,6 +311,11 @@ class Manager:
         try:
             if self.worker:
                 await self.worker
+            if self.speakers:
+                turns = await asyncio.to_thread(self.speakers.close, True)
+                if not self.speakers.failed.is_set():
+                    self.update_speaker_rows(turns, final=True)
+                self.speakers = None
             self.state = "complete"
             self.persist()
         except Exception:
@@ -208,8 +324,16 @@ class Manager:
             self.warning = "Meeting finalization failed. Previously saved transcript is available in Meetings."
             self.persist()
         finally:
+            if self.speakers:
+                await asyncio.to_thread(self.speakers.close)
+                self.speakers = None
+            self.speaker_rows.clear()
+            self.speaker_labels.clear()
+            self.timed_rows.clear()
             if self.after_stop:
                 await self.after_stop()
+            if self.cfg and self.cfg.get("meeting_speakers_enabled", False):
+                self.prepare_speakers()
 
     async def consume(self):
         while self.active:
@@ -221,6 +345,7 @@ class Manager:
                 try:
                     await asyncio.wait_for(self.changed.wait(), 1)
                 except asyncio.TimeoutError:
+                    self.update_speaker_rows()
                     if self.state == "recording" and self.capture and not self.capture.healthy():
                         self.schedule_pause("An audio device disconnected. Check your devices and resume.")
                     self.persist()
@@ -228,10 +353,15 @@ class Manager:
             chunk = self.pending.popleft()
             self.busy = True
             try:
-                # A single consumer serializes model inference; eight seconds is below Parakeet's cap.
+                # A single consumer serializes inference; capture bounds local windows to 12 seconds.
                 parts = await asyncio.to_thread(self.transcribe, chunk.audio, self.cfg)
                 if isinstance(parts, str):
                     parts = [{"start": 0, "end": chunk.end - chunk.start, "text": parts}]
+                if chunk.owned_start is not None and all(p.get("timed") for p in parts):
+                    # Text from the overlap is context, not another contribution.
+                    parts = [p for p in parts if chunk.owned_start <= chunk.start + (p["start"] + p["end"]) / 2 < chunk.owned_end]
+                elif chunk.overlap:
+                    parts = trim_word_overlap(self.previous_words.get(chunk.speaker, []), parts, chunk.start)
                 previous = self.previous.get(chunk.speaker, "")
                 previous_end = self.previous_end.get(chunk.speaker, -1)
                 rows = []
@@ -239,15 +369,23 @@ class Manager:
                     start = chunk.start + part["start"]
                     end = min(chunk.end, chunk.start + part["end"])
                     text = part["text"].strip()
-                    if chunk.overlap and start < previous_end:
+                    if chunk.overlap and start < previous_end and not part.get("timed"):
                         text = deduplicate(previous, text)
                     if text:
-                        rows.append({"start": start, "end": end, "speaker": chunk.speaker, "text": text})
+                        rows.append({"start": start, "end": end, "speaker": chunk.speaker, "text": text,
+                                     "timed": bool(part.get("timed"))})
                         previous, previous_end = text, end
                 if rows:
-                    self.store.append_segments(self.id, rows)
+                    ids = self.store.append_segments(self.id, rows)
+                    if self.speakers and chunk.speaker == meeting_speakers.UNKNOWN:
+                        self.speaker_rows.update({row_id: (row["start"], row["end"]) for row_id, row in zip(ids, rows)})
+                        self.timed_rows.update(row_id for row_id, row in zip(ids, rows) if row["timed"])
+                        self.update_speaker_rows()
                     self.previous[chunk.speaker] = previous
                     self.previous_end[chunk.speaker] = previous_end
+                    self.previous_words[chunk.speaker] = [
+                        {"start": chunk.start + p["start"], "end": chunk.start + p["end"], "text": p["text"]}
+                        for p in parts if p.get("timed")][-12:]
             except Exception as exc:
                 if self.state == "finalizing":
                     self.warning = "Some queued audio could not be transcribed. This transcript is incomplete. " + errors.message(exc)
@@ -261,6 +399,7 @@ class Manager:
                 self.busy = False
 
     async def shutdown(self):
+        await self.stop_preparation()
         if self.capture:
             await asyncio.to_thread(self.capture.close)
             self.capture = None
@@ -275,6 +414,14 @@ class Manager:
                 with suppress(asyncio.CancelledError):
                     await task
         self.pending.clear()
+        self.previous_words.clear()
+        if self.speakers:
+            await asyncio.to_thread(self.speakers.close)
+            self.speakers = None
+        self.speaker_rows.clear()
+        self.speaker_labels.clear()
+        self.timed_rows.clear()
+        await self.stop_preparation()
 
     async def notes(self, mid):
         meeting = self.store.get(mid)
@@ -323,6 +470,40 @@ class Start(BaseModel):
     title: str = Field(default="", max_length=160)
     microphone: int | None = Field(default=None, ge=0)
     output: int | None = Field(default=None, ge=0)
+
+
+class SpeakerSetting(BaseModel):
+    enabled: bool
+
+
+@router.get("/speaker-settings")
+async def speaker_settings():
+    return {"enabled": config.load().get("meeting_speakers_enabled", False),
+            "ready": all(models.available(n) for n in models.SPEAKER_MODELS),
+            "preparing": bool(manager.preparation and not manager.preparation.done()),
+            "error": manager.preparation_error}
+
+
+@router.post("/speaker-settings")
+async def set_speaker_settings(body: SpeakerSetting):
+    async with manager.lock:
+        if manager.active:
+            raise HTTPException(409, "Change speaker labelling between meetings.")
+        cfg = config.load()
+        cfg["meeting_speakers_enabled"] = body.enabled
+        config.save(cfg)
+        if body.enabled:
+            manager.prepare_speakers()
+        else:
+            await manager.stop_preparation()
+    return await speaker_settings()
+
+
+@router.post("/prepare-speakers")
+async def prepare_speakers():
+    if config.load().get("meeting_speakers_enabled", False):
+        manager.prepare_speakers()
+    return await speaker_settings()
 
 
 @router.get("/devices")
@@ -406,15 +587,51 @@ async def detail(mid: str):
 
 
 class Title(BaseModel):
-    title: str = Field(min_length=1, max_length=160)
+    title: str | None = Field(default=None, min_length=1, max_length=160)
+    speakers: dict[str, str] | None = None
 
 
 @router.put("/{mid}")
 async def rename(mid: str, body: Title):
     require(mid)
-    if not body.title.strip():
+    if body.title is not None and not body.title.strip():
         raise HTTPException(400, "Enter a meeting title")
-    manager.store.update(mid, title=body.title.strip())
+    if body.speakers is not None:
+        try:
+            manager.store.edit_speakers(mid, names=body.speakers)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+    if body.title is not None:
+        manager.store.update(mid, title=body.title.strip())
+    return {"ok": True}
+
+
+class Merge(BaseModel):
+    source: str
+    target: str
+
+
+class Unmerge(BaseModel):
+    key: str
+
+
+@router.post("/{mid}/speakers/merge")
+async def merge_speakers(mid: str, body: Merge):
+    require(mid)
+    try:
+        manager.store.edit_speakers(mid, source=body.source, target=body.target)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {"ok": True}
+
+
+@router.post("/{mid}/speakers/unmerge")
+async def unmerge_speakers(mid: str, body: Unmerge):
+    require(mid)
+    try:
+        manager.store.edit_speakers(mid, source=body.key)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
     return {"ok": True}
 
 
