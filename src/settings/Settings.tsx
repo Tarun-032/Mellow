@@ -274,10 +274,17 @@ export default function Settings() {
   const [devices, setDevices] = useState<Device[]>([]);
   // Live agent CLI + model catalogue (refresh re-probes).
   const [agents, setAgents] = useState<AgentInfo[]>([]);
+  const [agentsLoading, setAgentsLoading] = useState(true);
+  const [agentsError, setAgentsError] = useState(false);
+  const agentsRequest = useRef(0);
   const loadAgents = (refresh = false) => {
+    const id = ++agentsRequest.current;
+    setAgentsLoading(true);
+    setAgentsError(false);
     request<{ agents: AgentInfo[] }>(`/agents${refresh ? "?refresh=true" : ""}`)
-      .then((result) => setAgents(result.agents))
-      .catch(() => void 0);
+      .then((result) => { if (id === agentsRequest.current) setAgents(result.agents); })
+      .catch(() => { if (id === agentsRequest.current) setAgentsError(true); })
+      .finally(() => { if (id === agentsRequest.current) setAgentsLoading(false); });
   };
   // Cloud model list for the key currently in the box.
   const [voices, setVoices] = useState<Voice[]>([]);
@@ -398,10 +405,13 @@ export default function Settings() {
         setSavedEngineKey(engineKey(result.settings));
         // The pet window follows the saved coat, never the in-progress form.
         emit("coat", result.settings.coat).catch(() => undefined);
+        emit("ai-enabled", result.settings.ai_enabled).catch(() => undefined);
         if (result.engine_changed) {
           setOpenSession(null);
           loadHistory();
-          ok("Engine changed. Your next message starts a new session.");
+          ok(result.settings.ai_enabled
+            ? "Engine changed. Your next message starts a new session."
+            : "Switched to Just the pet. AI is off.");
         } else {
           ok("Settings saved.");
         }
@@ -750,7 +760,17 @@ export default function Settings() {
                     onProvider={(provider) => chooseProvider("llm", provider)}
                   />
                 ) : form.llm.mode === "agent" ? (
-                  <AgentFields
+                  agentsLoading ? (
+                    <div className="agent-discovery" role="status">
+                      <span className="update-spinner" aria-hidden="true" />
+                      <span>Checking available agents and models…</span>
+                    </div>
+                  ) : agentsError ? (
+                    <div className="agent-discovery">
+                      <p className="field-note" role="status">Couldn’t check available agents. Try again.</p>
+                      <button className="button button--secondary" type="button" onClick={() => loadAgents(true)}>Retry</button>
+                    </div>
+                  ) : <AgentFields
                     provider={form.llm.provider}
                     model={form.llm.model}
                     speed={form.llm.agent_speed}
@@ -1277,11 +1297,12 @@ export default function Settings() {
             aria-labelledby="engine-change-title"
             aria-describedby="engine-change-description"
           >
-            <p className="engine-change-dialog__eyebrow">New conversation</p>
-            <h2 id="engine-change-title">Change Mellow's engine?</h2>
+            <p className="engine-change-dialog__eyebrow">{form.ai_enabled ? "New conversation" : "Just the pet"}</p>
+            <h2 id="engine-change-title">{form.ai_enabled ? "Change Mellow's engine?" : "Switch to Just the pet?"}</h2>
             <p id="engine-change-description">
-              This will end the current session. It will stay saved, and your
-              next message will begin a new session with the selected engine.
+              {form.ai_enabled
+                ? "This will end the current session. It will stay saved, and your next message will begin a new session with the selected engine."
+                : "This will end the current session and turn off AI features, the microphone and the bone pointer. Your saved conversations will stay available, and Mellow will remain on your desktop."}
             </p>
             <div className="engine-change-dialog__actions">
               <button
@@ -1297,7 +1318,7 @@ export default function Settings() {
                 type="button"
                 onClick={confirmEngineChange}
               >
-                Change engine &amp; start new session
+                {form.ai_enabled ? "Change engine & start new session" : "Switch to Just the pet"}
               </button>
             </div>
           </section>

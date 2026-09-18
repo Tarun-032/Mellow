@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { emit } from "@tauri-apps/api/event";
+import { emit, listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 
 const URL = "ws://127.0.0.1:8765/ws";
@@ -40,6 +40,8 @@ export type Point = { nx: number; ny: number; label: string; monitor?: Monitor }
 /** Sidecar connection. */
 export function useSocket() {
   const [connected, setConnected] = useState(false);
+  const [aiEnabled, setAiEnabled] = useState(false);
+  const aiEnabledRef = useRef(false);
   const [state, setState] = useState<PetState>("idle");
   // Microphone readiness.
   const [microphone, setMicrophone] = useState<MicrophoneState>("warming");
@@ -58,6 +60,38 @@ export function useSocket() {
   // Spoken pomodoro request.
   const [timer, setTimer] = useState<{ action: "start" | "stop"; minutes: number | null; n: number } | null>(null);
   const ws = useRef<WebSocket | null>(null);
+
+  // Follow saved settings only; an unsaved engine selection must not hide the guide.
+  useEffect(() => {
+    let alive = true;
+    let revision = 0;
+    const update = (enabled: boolean) => {
+      if (!alive) return;
+      aiEnabledRef.current = enabled;
+      setAiEnabled(enabled);
+      if (!enabled) setPoint(null);
+    };
+    const stop = listen<boolean>("ai-enabled", ({ payload }) => {
+      if (typeof payload !== "boolean") return;
+      revision += 1;
+      update(payload);
+    });
+    // Subscribe before reading so an older response cannot undo a newer save.
+    void stop.then(async () => {
+      if (!connected || !alive) return;
+      const current = revision;
+      const response = await fetch("http://127.0.0.1:8765/config");
+      if (!response.ok) return;
+      const body = await response.json();
+      if (revision === current && typeof body?.settings?.ai_enabled === "boolean") {
+        update(body.settings.ai_enabled);
+      }
+    }).catch((error) => console.error("[mellow] could not read guide visibility:", error));
+    return () => {
+      alive = false;
+      void stop.then((off) => off()).catch(() => {});
+    };
+  }, [connected]);
 
   useEffect(() => {
     let disposed = false;
@@ -127,7 +161,7 @@ export function useSocket() {
             break;
           case "point":
             setPoint(
-              msg.nx === null
+              msg.nx === null || !aiEnabledRef.current
                 ? null
                 : {
                     nx: msg.nx,
@@ -201,6 +235,7 @@ export function useSocket() {
 
   return {
     connected,
+    aiEnabled,
     state,
     microphone,
     micLevel,

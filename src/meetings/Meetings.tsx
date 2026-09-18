@@ -235,11 +235,17 @@ export default function Meetings({ openLast = false }: { openLast?: boolean }) {
     <p className="meetings-intro">Right-click Mellow and choose Transcribe meeting. Your transcript and notes stay here until you delete them, independently of saved conversations.</p>
     {banner}
     {speakerSettings && <div className="meeting-speaker-setting">
-      <label><input type="checkbox" checked={speakerSettings.enabled} disabled={busy || !!meeting.status?.active}
+      <label className="switch">
+        <span className="switch__text">
+          <b>Label remote speakers (experimental)</b>
+          <small>Local processing; voice data is discarded when the meeting ends. Mixed speech may remain unassigned. Rename speakers after recording.</small>
+        </span>
+        <input type="checkbox" role="switch" checked={speakerSettings.enabled} disabled={busy || !!meeting.status?.active}
         onChange={e => { const enabled = e.target.checked; void act(() => request("/meetings/speaker-settings", {
           method: "POST", body: JSON.stringify({ enabled }),
-        })); }} /> Label remote speakers (experimental)</label>
-      <p>Local processing; voice data is discarded when the meeting ends. Mixed speech may remain unassigned. Rename speakers after recording.</p>
+        })); }} />
+        <i className="switch__track" aria-hidden="true" />
+      </label>
       {speakerSettings.enabled && <small role="status">{speakerSettings.error || (speakerSettings.preparing ? "Preparing speaker models…"
         : speakerSettings.ready ? "Models downloaded. Ready for the next meeting." : "Models are not ready; recording will use source labels.")}</small>}
     </div>}

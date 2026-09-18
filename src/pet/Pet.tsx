@@ -83,6 +83,7 @@ export default function Pet() {
   useCoat();
   const {
     connected,
+    aiEnabled,
     state,
     microphone,
     micLevel,
@@ -284,7 +285,7 @@ export default function Pet() {
     if (meetingActive) { held.current = false; clear(); }
   }, [meetingActive, panel, setQuiet, clear]);
   // Disable pointing while hidden.
-  const pointing = point !== null && !quiet && pose === "awake";
+  const pointing = aiEnabled && point !== null && !quiet && pose === "awake";
   // Wait for bone arrival.
   const [landed, setLanded] = useState(false);
   // Track the pointing turn.
@@ -341,10 +342,10 @@ export default function Pet() {
   }, [point]);
 
   useEffect(() => {
-    void invoke("guide_set_quiet", { quiet: quiet !== null }).catch((error) =>
+    void invoke("guide_set_quiet", { quiet: !aiEnabled || quiet !== null }).catch((error) =>
       console.error("[mellow] guide visibility failed:", error),
     );
-  }, [quiet]);
+  }, [quiet, aiEnabled]);
 
   // Track turn playback.
   useEffect(() => {

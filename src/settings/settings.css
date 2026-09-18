@@ -746,6 +746,17 @@ input[type="range"] {
   animation: update-spin 700ms linear infinite;
 }
 
+.agent-discovery {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 72px;
+  color: var(--settings-muted);
+  font-size: 14px;
+}
+
+.agent-discovery .update-spinner { flex-shrink: 0; }
+
 .update-check::after {
   width: 7px;
   height: 12px;
