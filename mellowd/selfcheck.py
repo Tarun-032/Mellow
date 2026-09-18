@@ -47,12 +47,12 @@ def check_sentences() -> None:
     got += buf.flush()
     assert got == ["hello there.", "how are you?", "fine"], got
 
-    # A decimal must not look like a sentence end.
+    # Preserve decimals.
     buf = tts.SentenceBuffer()
     assert buf.feed("it costs 3.5 dollars") == [], "split inside a decimal"
     assert buf.flush() == ["it costs 3.5 dollars"]
 
-    # Long unpunctuated text must still start speaking.
+    # Flush long unpunctuated text.
     buf = tts.SentenceBuffer()
     out = buf.feed("word " * 60)
     assert out, "MAX_CHARS force-flush never fired"
@@ -80,7 +80,7 @@ async def check_speech_pipeline() -> None:
         return text, len(text)  # (samples, rate), opaque to the Speaker
 
     def fake_play(samples, rate, blocking=True):
-        # sd.stop() is what releases a blocked sd.play — cancelling the task cannot
+        # Stop blocked playback.
         if cut.wait(PLAY):
             return
         played.append(samples)
@@ -104,11 +104,11 @@ async def check_speech_pipeline() -> None:
 
         assert played == lines, played
         assert said[:1] == ["talking"], said
-        # Serialised this would be 4*(FETCH+PLAY) = 1.00s
+        # Verify pipeline overlap.
         serial = len(lines) * (FETCH + PLAY)
         assert elapsed < serial * 0.75, f"still serialised: {elapsed:.2f}s of {serial:.2f}s"
 
-        # Barge-in has to kill both stages.
+        # Stop both stages.
         cut.clear()
         speaker.begin()
         for line in lines:
@@ -139,7 +139,7 @@ def check_stale_refusals() -> None:
     for text in stale:
         assert llm._BLIND_CLAIM.search(text), f"missed a real refusal: {text!r}"
 
-    # Answers that merely mention screens or seeing are not refusals.
+    # Keep valid screen answers.
     keep = (
         "Your screen shows the NVIDIA build page for thinkingmachines slash inkling.",
         "I can see your screen. Visual Studio Code is open to architecture dot md.",
@@ -156,7 +156,7 @@ def check_stale_refusals() -> None:
         {"role": "user", "content": "what is on it now?"},
     ]
     out = llm._drop_stale_refusals(history)
-    # The refusal goes, and the two user turns it was between must not end up adjacent
+    # Remove refusal pairs.
     assert [m["role"] for m in out] == ["user"], out
     assert out[-1]["content"] == "what is on it now?", out
 
@@ -174,7 +174,7 @@ def check_thinking_filter() -> None:
     """A truncated chain of thought must not reach the user as an answer."""
     from mellowd import llm
 
-    # The bad case: content echoes the thinking from the first token.
+    # Reject echoed reasoning.
     echo = llm._Stream()
     thought = "Okay, the user is asking again about what model I'm running on."
     kept = ""
@@ -185,7 +185,7 @@ def check_thinking_filter() -> None:
             kept += piece
     assert kept == "", f"leaked thinking: {kept!r}"
 
-    # The good case: same thinking, then a real answer. Every word survives.
+    # Keep the real answer.
     real = llm._Stream()
     real.thoughts = thought
     answer = "i'm running on nemotron, but i'm still mellow."
@@ -195,11 +195,11 @@ def check_thinking_filter() -> None:
     )
     assert kept == answer, f"ate the answer: {kept!r}"
 
-    # No reasoning channel at all: nothing to compare against, nothing filtered.
+    # Keep content without reasoning.
     plain = llm._Stream()
     assert not plain.is_thinking("hello")
 
-    # Groq Qwen raw format: thinking arrives inside <think> tags in content
+    # Handle Groq think tags.
     tagged = llm._Stream()
     parts = [
         "<thi",
@@ -211,7 +211,7 @@ def check_thinking_filter() -> None:
     assert kept == "\n\nI am Mellow.", f"think tags leaked or ate answer: {kept!r}"
     assert tagged.reasoning, "a think block should count as reasoning"
 
-    # Google AI Studio Gemma 4: same idea, different tag (<thought>)
+    # Handle Gemma thought tags.
     gemma = llm._Stream()
     raw = (
         "<thought>*   User says: Hello.\n"
@@ -256,7 +256,7 @@ def check_opener_filter() -> None:
         "I'm running on gemma three.",
         "Looking at memory use helps.",  # must not be eaten as "look"
     )
-    for chunked in (1, 3, 100):  # token-at-a-time, realistic, and one whole gulp
+    for chunked in (1, 3, 100):  # Test varied chunking.
         for bad, good in strip.items():
             got = stream(bad, chunked)
             assert got == good, f"step {chunked}: {bad!r} -> {got!r}, wanted {good!r}"
@@ -264,7 +264,7 @@ def check_opener_filter() -> None:
             got = stream(good, chunked)
             assert got == good, f"step {chunked}: mangled {good!r} -> {got!r}"
 
-    # An answer that is nothing but filler is left alone rather than emptied
+    # Keep filler-only answers.
     assert stream("Well, ") == "Well, ", "an all-filler answer must survive"
     print(f"ok  {len(strip)} filler openers stripped, {len(keep)} lookalikes kept")
 
@@ -273,7 +273,7 @@ def check_tone_contract() -> None:
     """The prompt, anchor and reminder must not contradict the register."""
     from mellowd import config, llm
 
-    # llm.CORE, not config.DEFAULTS["system_prompt"]
+    # Check the core prompt.
     prompt = llm.CORE
     assert config.DEFAULTS["system_prompt"] == "", (
         "the box has a default again, and clearing it can delete the rules"
@@ -288,27 +288,27 @@ def check_tone_contract() -> None:
         for symbol in ("*", "#", "`", "- "):
             assert symbol not in answer, f"anchor shows markdown {symbol!r}: {answer!r}"
 
-    # The anchor has to demonstrate both lengths, or it only teaches one.
+    # Cover both answer lengths.
     assert min(len(a) for a in answers) < 80, "no short example in the anchor"
     assert max(len(a) for a in answers) > 200, "no explanation example in the anchor"
-    # ...but not a paragraph. The anchor is imitated far more reliably than the rule is followed
+    # Keep the short anchor brief.
     assert max(len(a) for a in answers) < 400, "the anchor teaches a paragraph"
     assert "{model}" in prompt and any("{model}" in a for a in answers)
     assert "start with the answer" in llm.REMINDER.lower()
 
-    # The reminder is the last message in the context
+    # Reminder comes last.
     for name in ("REMINDER", "REMINDER_LOOK", "REMINDER_NOLOOK", "REMINDER_SEEN", "REMINDER_NOSHOT"):
         text = getattr(llm, name)
         assert "never something to quote" in text, f"{name} does not fence itself off"
         assert "numbers as words" not in text, f"{name} still asks for speech spelling"
 
-    # The marker rule lives in the reminders, never in the editable prompt
+    # Keep markers out of user prompts.
     assert "[look]" not in prompt, "screen machinery leaked into the editable prompt"
 
-    # And the prompt must not have an opinion about *seeing* either.
+    # Keep vision rules separate.
     assert "screen" not in prompt, "the prompt has an opinion about seeing the screen"
 
-    # No prohibition-shaped capability line. The one that shipped
+    # Avoid capability prohibitions.
     for banned in ("cannot", "never offer", "you can't", "unable to"):
         assert banned not in prompt, f"prohibition-shaped capability line is back: {banned!r}"
     assert "draft the reply" in prompt, "the prompt no longer says what to do instead"
@@ -316,14 +316,14 @@ def check_tone_contract() -> None:
         "no anchor demonstrates writing something out instead of refusing"
     )
 
-    # Nothing about spelling words out phonetically.
+    # Avoid phonetic spelling.
     for banned in ("dot pie", "ninety eight degrees", "spell out numbers"):
         assert banned not in prompt, f"the model is being asked to phoneticise again: {banned!r}"
     assert not any("dot pie" in a or " dot com" in a for a in answers), (
         "an anchor still demonstrates speech spelling, which outweighs the rule"
     )
 
-    # No two action anchors the same shape. One example is a template
+    # Keep action anchors distinct.
     acted = [a.split("]", 1)[1].strip() for _, a in llm.ANCHOR_ACT]
     assert len(acted) >= 4, "not enough action examples to show a range"
     openers = [line.split()[0].lower().strip(",.") for line in acted]
@@ -335,24 +335,24 @@ def check_tone_contract() -> None:
         "the rule prescribes a shape again, which is what made replies canned"
     )
 
-    # One length for everything now: a paragraph read out loud is tiring.
+    # Keep spoken replies concise.
     assert "three to six" not in prompt, "the old paragraph-length rule is back"
     assert "two or three sentences" in prompt, "no length rule in the prompt"
     assert "exactly [look]" in llm.REMINDER_LOOK and "[look]" not in llm.REMINDER_SEEN
 
-    # Superseding only works on an exact match
+    # Require exact migration matches.
     assert prompt not in config.OLD_PROMPTS, "current prompt listed as superseded"
-    # Wording that was only ever ours is *cleared*, not rewritten
+    # Clear retired defaults.
     old = config.OLD_PROMPTS[-1]
     migrated = config.validate(config.migrate({"system_prompt": old}))
     assert migrated["system_prompt"] == "", "an old default was left in the box"
-    # Including the one that was the default until it moved into the code.
+    # Clear the previous default.
     carried = config.validate(config.migrate({"system_prompt": prompt}))
     assert carried["system_prompt"] == "", "a copy of CORE was left in the box"
     mine = "talk like a pirate"
     kept = config.validate(config.migrate({"system_prompt": mine}))
     assert kept["system_prompt"] == mine, "a custom prompt was overwritten"
-    # ...and it rides after CORE rather than instead of it.
+    # Append after the core prompt.
     both = llm.persona({"system_prompt": mine, "llm": {"model": "m"}})
     assert both.startswith(prompt[:40]) and both.endswith(mine), both[-80:]
     print(f"ok  prompt/anchor/reminder agree, {len(config.OLD_PROMPTS)} old prompts retire")
@@ -373,7 +373,7 @@ async def check_temperature() -> None:
             continue
         raise AssertionError(f"temperature {bad!r} was accepted")
 
-    # An OpenAI-legal 1.6 must not 400 the moment someone picks Anthropic.
+    # Accept Anthropic temperature.
     hot = {**cfg, "llm": {**cfg["llm"], "temperature": 1.6, "provider": "anthropic"}}
     sent = await _capture_anthropic_payload(llm._settings(hot))
     assert sent["temperature"] == 1.0, f"not clamped for anthropic: {sent}"
@@ -457,7 +457,7 @@ def check_elevenlabs() -> None:
             "api_key": "test-key",
             "model": "eleven_flash_v2_5",
             "voice": "21m00Tcm4TlvDq8ikWAM",
-            # Deliberately outside ElevenLabs' 0.7-1.2 window.
+            # Test invalid stability.
             "speech_speed": 2.0,
         }
         samples, rate = tts.synth("hello", cfg)
@@ -517,10 +517,10 @@ def check_openrouter() -> None:
     }
     try:
         samples, rate = tts.synth("hello", cfg)
-        # A provider that says nothing about the rate gets the documented guess.
+        # Use the default rate.
         assert rate == tts.CLOUD_PCM_RATE, rate
 
-        # ...and one that does say is believed
+        # Honor explicit rates.
         served["content_type"] = "audio/pcm; rate=44100"
         _, rate = tts.synth("hello", cfg)
         assert rate == 44_100, rate
@@ -566,18 +566,18 @@ def check_stream_failure() -> None:
         try:
             rec.open()
         except RuntimeError:
-            # A sentence for the bubble, not a stack of driver GUIDs
+            # Keep errors readable.
             raised = True
         assert raised, "a microphone that cannot start must not open quietly"
 
         assert rec._stream is None, "left a stream that was never started"
         assert rec._device is None, "left a name that would take the early return"
-        # Every candidate tried once per round, for OPEN_RETRIES rounds
+        # Try every candidate.
         per_round = len(set(attempts))
         assert per_round >= 1, attempts
         assert len(attempts) == stt.OPEN_RETRIES * per_round, attempts
 
-        # reopen() is opportunistic recovery mid-handler
+        # Test reopen recovery.
         rec._stream = Dead()
         rec.reopen()
         assert rec._stream is None, "a failed reopen left a dead stream behind"
@@ -585,7 +585,7 @@ def check_stream_failure() -> None:
         stt.sd.InputStream = real
         stt.OPEN_RETRY_DELAY = delay
 
-    # reopen() on a released microphone must stay released
+    # Keep released mics closed.
     idle = stt.Recorder(cfg)
     idle.reopen()
     assert idle._stream is None, "reopen() opened a microphone nobody asked for"
@@ -604,7 +604,7 @@ def check_warm_signatures() -> None:
         except TypeError as e:
             raise AssertionError(f"warm_models cannot call {name}: {e}") from None
 
-    # And the call site really does use the keyword. Positional is what broke.
+    # Require keyword arguments.
     source = inspect.getsource(__import__("mellowd.main", fromlist=["x"]).warm_models)
     assert "progress=_progress_cb(name)" in source, (
         "warm_models is passing the loaders positionally again"
@@ -641,14 +641,14 @@ def check_warmup() -> None:
     real_slow, main.WARM_SLOW_SECONDS = main.WARM_SLOW_SECONDS, 0
     real_refresh, stt.refresh_devices = stt.refresh_devices, lambda: refreshes.append(1) or True
     try:
-        # Refused far past the old 6-try cap, then success — no give-up.
+        # Retry until success.
         s = session(Rec(failures=40))
         assert s._warm_open()
         assert s.recorder.opens == 41, s.recorder.opens
         assert not s.recorder.closed, "a successful warm-up must hold the mic"
         assert len(refreshes) == 1, "the portaudio refresh must run exactly once"
 
-        # Napping mid-wait stops the probing without an exception.
+        # Stop probing on nap.
         rec = Rec(failures=10 ** 9)
         s = session(rec)
         stop = s
@@ -656,7 +656,7 @@ def check_warmup() -> None:
         original_open = rec.open
 
         def open_and_count(quiet=False):
-            if rec.opens == 4:  # the nap arrives between probes
+            if rec.opens == 4:  # Nap between probes.
                 stop.awake = False
             original_open(quiet)
 
@@ -664,14 +664,14 @@ def check_warmup() -> None:
         assert not s._warm_open()
         assert rec.opens <= 6, f"kept probing after the nap: {rec.opens}"
 
-        # Napped while the open was in flight: the mic must be released
+        # Release after a mid-open nap.
         rec = Rec()
         s = session(rec)
         rec.on_open = lambda: setattr(s, "awake", False)
         assert not s._warm_open()
         assert rec.closed, "an open that lands after the nap must be undone"
 
-        # Already napping: no probe at all.
+        # Skip probes while asleep.
         s = session(Rec())
         s.awake = False
         assert not s._warm_open()
@@ -690,7 +690,7 @@ def check_tts() -> tuple:
     from mellowd import tts
 
     samples, rate = tts.synth(SPEECH_CHECK)
-    # Not "== SAMPLE_RATE": that is Kokoro's number
+    # Kokoro uses another rate.
     assert 8_000 <= rate <= 48_000, f"implausible sample rate {rate}"
     assert len(samples) > 0, "kokoro returned no samples"
     assert np.max(np.abs(samples)) > 0.01, "kokoro returned silence"
@@ -716,7 +716,7 @@ def check_resample() -> None:
         peak = freqs[np.argmax(np.abs(np.fft.rfft(out)))]
         assert abs(peak - 440) < 5, f"{src}: pitch shifted to {peak:.0f}Hz"
 
-        # Preserve amplitude as well as pitch.
+        # Preserve amplitude.
         loud_in, loud_out = float(np.abs(tone).max()), float(np.abs(out).max())
         assert abs(loud_out - loud_in) < 0.02, (
             f"{src}: level changed {loud_in:.3f} -> {loud_out:.3f}"
@@ -734,7 +734,7 @@ def check_config() -> None:
 
     base = config.validate(dict(config.DEFAULTS))
 
-    # Every preset of every capability must survive a round trip.
+    # Round-trip every preset.
     for name in config.CAPABILITIES:
         for provider, preset in config.PRESETS[name].items():
             checked = config.validate(
@@ -750,13 +750,32 @@ def check_config() -> None:
             assert checked[name]["provider"] == provider, (name, provider)
             assert checked[name]["base_url"].startswith(("http://", "https://"))
 
-    # Mode follows the preset. "Cloud + Ollama" was savable
+    # Mode follows the preset.
     snapped = config.validate(_with(base, "llm", mode="cloud", provider="ollama"))
     assert snapped["llm"]["mode"] == "local", snapped["llm"]["mode"]
-    # The settings window builds the cloud list from these
+    # Populate cloud options.
     for name in config.CAPABILITIES:
         assert any(not p["local"] for p in config.PRESETS[name].values()), name
     assert any(p["local"] for p in config.LLM_PRESETS.values()), "no on-device llm"
+
+    # The coat is user input from a colour picker, so it is a trust boundary.
+    worn = {**config.DEFAULTS["coat"], "tan": "#3F7FD0"}
+    assert config.validate({**base, "coat": worn})["coat"]["tan"] == "#3f7fd0", "coat not normalised"
+    partial = dict(config.DEFAULTS["coat"])
+    partial.pop("salmon")
+    for bad in (
+        "brown",                                          # not an object
+        {**config.DEFAULTS["coat"], "extra": "#000000"},  # unknown part
+        {**config.DEFAULTS["coat"], "tan": "#abc"},       # short hex
+        {**config.DEFAULTS["coat"], "tan": "red"},        # named colour
+        {**config.DEFAULTS["coat"], "tan": None},         # missing colour
+        partial,                                          # missing part
+    ):
+        try:
+            config.validate({**base, "coat": bad})
+        except ValueError:
+            continue
+        raise AssertionError(f"coat accepted bad value: {bad!r}")
 
     for name in config.CAPABILITIES:
         try:
@@ -766,7 +785,7 @@ def check_config() -> None:
         else:
             raise AssertionError(f"{name}: unsafe provider URL was accepted")
 
-    # Every key must be blanked, not just the LLM's.
+    # Redact every key.
     loaded = dict(base)
     for name in config.CAPABILITIES:
         loaded = _with(loaded, name, api_key="secret")
@@ -786,7 +805,7 @@ def check_migration() -> None:
         "base_url": "https://api.groq.com/openai/v1",
         "api_key": "sk-from-the-old-schema",
         "model": "llama-3.3-70b",
-        "max_tokens": 300,  # the superseded default, should be lifted
+        "max_tokens": 300,  # Retired default.
         "stt_model": "medium.en",
         "input_device": 3,
         "input_channel": 1,
@@ -798,12 +817,12 @@ def check_migration() -> None:
     new = config.validate(config.migrate(dict(old)))
     assert new["llm"]["api_key"] == old["api_key"], "API KEY LOST ON MIGRATION"
     assert new["llm"]["provider"] == "groq" and new["llm"]["mode"] == "cloud"
-    # Against DEFAULTS, not a literal
+    # Compare with defaults.
     assert (
         new["llm"]["max_tokens"] == config.DEFAULTS["llm"]["max_tokens"]
     ), "superseded default not lifted all the way to today's"
     assert new["stt"]["local_model"] == "medium.en"
-    # A microphone is saved by name now.
+    # Save microphones by name.
     assert new["stt"]["input_device"] is None, new["stt"]["input_device"]
     assert "input_channel" not in new["stt"], "the channel picker is gone"
 
@@ -813,10 +832,13 @@ def check_migration() -> None:
     assert new["system_prompt"] == "be brief"
     assert "provider" not in new, "flat keys left behind alongside nested ones"
 
-    # Idempotent: an already-migrated config must come back unchanged.
+    # An old config predates the coat and must come back wearing the default one.
+    assert new["coat"] == config.DEFAULTS["coat"], new["coat"]
+
+    # Keep migrations idempotent.
     assert config.validate(config.migrate(dict(new))) == new, "migrate is not idempotent"
 
-    # A local LLM stays local.
+    # Preserve local mode.
     local = config.validate(config.migrate({**old, "provider": "ollama", "api_key": ""}))
     assert local["llm"]["mode"] == "local", local["llm"]["mode"]
     print("ok  flat config migrates, keeps its key, and is idempotent")
@@ -833,10 +855,10 @@ def check_wav() -> None:
     back, rate = wav.decode(wav.encode(tone, 16_000))
     assert rate == 16_000, rate
     assert back.shape == tone.shape, (back.shape, tone.shape)
-    # 16-bit quantisation is the only loss allowed
+    # Allow 16-bit quantization only.
     assert float(np.max(np.abs(back - tone))) < 1e-3
 
-    # Full scale must not wrap around to the opposite sign.
+    # Prevent full-scale wrapping.
     ends, _ = wav.decode(wav.encode(np.array([-1.0, 1.0], np.float32), 16_000))
     assert ends[0] < -0.99 and ends[1] > 0.99, ends
     print("ok  wav round trip is sample-accurate and doesn't clip-wrap")
@@ -857,7 +879,7 @@ def check_audio_selection() -> None:
     assert 1 < gain <= stt.MAX_GAIN
     assert np.max(np.abs(gained)) <= 1
 
-    # The real failure
+    # Test a real failure.
     hiss = 0.09 * np.sin(2 * np.pi * 220 * t)
     burst = np.zeros_like(t)
     voice = slice(0, len(t) // 10)
@@ -882,7 +904,7 @@ def check_devices() -> None:
     assert len(names) == len(set(names)), f"same microphone listed twice: {names}"
     assert all("index" not in d for d in devices), "still exposing positional indices"
     assert sum(d["default"] for d in devices) <= 1, "more than one default"
-    # Whatever "let Windows decide" resolves to has to be something real.
+    # Validate the Windows default.
     assert stt._resolve(None) is None or isinstance(stt._resolve(None), int)
     assert stt._resolve("a microphone nobody has") == stt._resolve(None)
     print(f"ok  {len(names)} microphone(s) offered, saved by name: {names[0]}")
@@ -897,7 +919,7 @@ def check_errors() -> None:
     body = '{"error":{"message":"Rate limit reached for model openai/gpt-oss-120b"}}'
     limited = str(errors.provider_error(429, body, "groq"))
     assert "rate limiting" in limited, limited
-    # The raw body belongs in the log, not the speech bubble.
+    # Hide raw provider errors.
     assert "Rate limit reached" not in limited, limited
 
     assert "api key" in str(errors.provider_error(401, "", "groq"))
@@ -905,12 +927,12 @@ def check_errors() -> None:
     missing = str(errors.provider_error(404, "", "groq", "openai/gpt-oss-120b"))
     assert "openai/gpt-oss-120b" in missing, missing
 
-    # Ollama not running is the most common failure of all, and "ConnectError" told nobody to go
+    # Explain Ollama connection failures.
     request = httpx.Request("POST", "http://127.0.0.1:11434/v1/chat/completions")
     unreachable = errors.message(httpx.ConnectError("refused", request=request))
     assert "can't reach 127.0.0.1" in unreachable, unreachable
 
-    # Anything already worded passes through untouched
+    # Preserve readable errors.
     assert errors.message(RuntimeError(limited)) == limited
     print("ok  provider failures read as sentences, raw bodies stay in the log")
 
@@ -926,41 +948,41 @@ def check_reminders() -> None:
     once = {"id": "a", "time": "09:00", "text": "standup", "daily": False}
     daily = {"id": "b", "time": "09:00", "text": "stretch", "daily": True}
 
-    # Nothing is due before its minute arrives.
+    # Do not fire early.
     fired, keep = remind.due([once], at(8, 59))
     assert fired == [], fired
     assert len(keep) == 1, keep
 
-    # A one-off fires once, and firing is what retires it.
+    # Retire one-off reminders.
     fired, keep = remind.due([once], at(9, 0))
     assert [f["text"] for f in fired] == ["standup"], fired
     assert keep == [], keep
 
-    # A daily fires, is kept
+    # Keep daily reminders.
     fired, keep = remind.due([daily], at(9, 0))
     assert len(fired) == 1, fired
     assert keep[0]["last_fired"] == "2026-03-14", keep
     again, keep = remind.due(keep, at(9, 0))
     assert again == [], again
-    # ...but tomorrow it fires again.
+    # Fire again tomorrow.
     tomorrow, _ = remind.due(keep, at(9, 0) + timedelta(days=1))
     assert len(tomorrow) == 1, tomorrow
 
-    # Closed over the moment: inside the grace window it still fires
+    # Honor the grace window.
     late, _ = remind.due([once], at(9, 0) + remind.GRACE - timedelta(seconds=1))
     assert len(late) == 1, late
     missed, keep = remind.due([once], at(9, 0) + remind.GRACE + timedelta(minutes=1))
     assert missed == [], missed
     assert len(keep) == 1, "a missed one-off should wait, not vanish"
 
-    # A hand-edited file must not stop the healthy entries from firing.
+    # Ignore malformed entries.
     junk = ["nonsense", {"time": "25:00", "text": "bad hour"}, {"time": "9", "text": "no colon"},
             {"time": "09:00", "text": "   "}, once]
     fired, keep = remind.due(junk, at(9, 0))
     assert [f["text"] for f in fired] == ["standup"], fired
     assert keep == [], keep
 
-    # Round-trips through storage are normalised the same way
+    # Normalize stored reminders.
     stored = remind.normalize([{"time": "7:5", "text": "  padded  "}])
     assert stored[0]["time"] == "07:05", stored
     assert stored[0]["text"] == "padded", stored
@@ -995,20 +1017,22 @@ def check_preroll() -> None:
     from mellowd import config, stt
 
     rate, block = 48_000, 512
-    # A fixed cfg, so the check doesn't depend on which microphone is saved.
+    # Use a fixed microphone config.
     cfg = config.validate(dict(config.DEFAULTS))
     rec = stt.Recorder(cfg)
     rec._stream, rec._device = object(), cfg["stt"].get("input_device")
     rec._rate, rec._preroll = rate, int(rate * stt.PREROLL_SECONDS)
 
-    for _ in range(rate // block):  # a full second of speech before the press
+    for _ in range(rate // block):  # One second of pre-roll.
         rec._capture(np.full((block, 1), 0.5, np.float32), block, None, None)
 
     held = rec._ring_samples
     assert held >= rec._preroll, f"ring starved: {held} < {rec._preroll}"
     assert held < rec._preroll + 2 * block, f"ring grew unbounded: {held}"
 
-    rec.start()  # press and release in the same instant
+    rec.start()  # Instant press and release.
+    rec._capture(np.full((block, 1), 0.5, np.float32), block, None, None)
+    assert rec.live_level > 0.9, f"live meter missed speech: {rec.live_level}"
     captured = np.concatenate(rec._frames)
     rec._armed = False
     assert len(captured) >= rec._preroll, f"pre-roll lost: {len(captured)}"
@@ -1069,7 +1093,7 @@ async def check_pet_only() -> None:
     }
     saved = config.validate(pet)
     assert saved["ai_enabled"] is False and saved["llm"]["model"] == "", saved["llm"]
-    # With the brain on, the same empty model is still a mistake.
+    # Brain mode requires a model.
     try:
         config.validate({**config.DEFAULTS, "llm": {**config.DEFAULTS["llm"], "model": ""}})
         raise AssertionError("an empty model passed with ai_enabled on")
@@ -1081,7 +1105,7 @@ async def check_pet_only() -> None:
         assert main.standby() is True
     with _scratch_config({**config.DEFAULTS, "ai_enabled": True}):
         assert main.standby() is False
-    # No file at all is the first-run case: standby until the wizard finishes.
+    # Missing config means first run.
     import tempfile as _tempfile
 
     with _tempfile.TemporaryDirectory() as tmp:
@@ -1093,7 +1117,7 @@ async def check_pet_only() -> None:
             config.CONFIG_PATH = real
     print("ok  standby: absent config or ai off, never an on-brain config")
 
-    # Warm-up: stub both loaders, prove neither is called.
+    # Skip loaders during warm-up.
     with _scratch_config(pet):
         called = []
         real_stt, real_tts = main.stt.load, main.tts.load
@@ -1106,7 +1130,7 @@ async def check_pet_only() -> None:
         assert called == [], called
     print("ok  pet-only warm-up loads neither engine")
 
-    # The hotkey in pet-only: one bubble line, back to idle, recorder closed.
+    # Pet-only hotkey behavior.
     class FakeRecorder:
         def __init__(self):
             self.started = False
@@ -1145,7 +1169,7 @@ async def check_pet_only() -> None:
         s.ws = FakeWS()
         s.history = []
         s.destination = None
-        # object.__new__ skips __init__, so dataclass defaults never run.
+    # Supply skipped dataclass defaults.
         s.writer = main.writing.Writer()
         s.speaker = FakeSpeaker()
         s.turn = None
@@ -1155,7 +1179,7 @@ async def check_pet_only() -> None:
         assert ("reply_chunk", None) in [(k, v) for k, v in kinds], kinds
         assert ("state", "idle") in kinds, kinds
         assert s.recorder.started is False, "the recorder opened in pet-only"
-        # And the typed path answers the same way.
+    # Match typed answers.
         s.ws.sent.clear()
         await main.handle(s, {"type": "text", "text": "hello"})
         kinds = [m["type"] for m in s.ws.sent]
@@ -1165,7 +1189,7 @@ async def check_pet_only() -> None:
         assert s.turn is None, "pet-only started a turn"
     print("ok  pet-only hotkey: one line, idle, microphone never opened")
 
-    # The progress feed: bytes only ever go up across files
+    # Progress never decreases.
     main._download_progress["tts"].update(
         state="idle", name="", done=0, total=0, error="", base=0
     )
@@ -1177,7 +1201,7 @@ async def check_pet_only() -> None:
     assert first["done"] == 100 and second["done"] == 150, (first, second)
     assert second["total"] == 300 and second["state"] == "running", second
 
-    # A local voice preview must not claim readiness after only one of Kokoro's two files
+    # Kokoro needs both files.
     import tempfile as _model_tempfile
     real_models_dir = main.tts.models.MODELS_DIR
     with _model_tempfile.TemporaryDirectory() as tmp:
@@ -1210,7 +1234,7 @@ async def check_pet_only() -> None:
     assert failed["state"] == "failed", failed
     assert "disk filled up" in failed["error"] and "\n" not in failed["error"], failed
 
-    # First-run setup has no config file yet, so the explicit download route must not consult standby().
+    # First-run downloads bypass standby.
     selected = config.validate(config.DEFAULTS)
     calls = []
     real_standby, real_stt_load, real_tts_load = (
@@ -1265,7 +1289,7 @@ def check_sessions() -> None:
         try:
             config.load = remembering(True)
 
-            # Round trip: both events land, sequenced
+    # Preserve event order.
             sessions.record("user_said", text="hello world this is mellow")
             sessions.record(
                 "assistant_said", text="hi", model="test-model",
@@ -1283,19 +1307,19 @@ def check_sessions() -> None:
             assert [e["seq"] for e in events] == [0, 1, 2], events
             assert events[2]["model"] == "test-model" and not events[2]["aborted"]
 
-            # A crash mid-write leaves a partial final line
+    # Recover partial final lines.
             with sessions._path(entries[0]["id"]).open("a", encoding="utf-8") as f:
                 f.write('{"v":1,"seq":9,"ts":"2026')
             again = sessions.read(entries[0]["id"])
             assert len(again) == 3, f"a torn tail corrupted the session: {again}"
 
-            # ...and the next event must not fuse itself onto the tear.
+    # Keep the next event separate.
             sessions.record("user_said", text="written after the crash")
             after = sessions.read(entries[0]["id"])
             assert len(after) == 4, f"the append fused onto the torn line: {after}"
             assert after[-1]["text"] == "written after the crash", after[-1]
 
-            # Half an hour of silence starts a new session
+    # Split sessions after silence.
             aged = sessions._current
             sessions._open[aged].last_ts -= timedelta(minutes=31)
             sessions.record("user_said", text="a fresh conversation begins here")
@@ -1309,7 +1333,7 @@ def check_sessions() -> None:
             assert closed["type"] == "session_ended", closed
             assert closed["reason"] == "silence", closed
 
-            # Titles cut on a word boundary, not mid-word.
+    # Cut titles between words.
             sessions._open[sessions._current].last_ts -= timedelta(minutes=31)
             sessions.record(
                 "user_said", text="what is the meaning of " + "extraordinary " * 10
@@ -1318,7 +1342,7 @@ def check_sessions() -> None:
             assert top["title"].startswith("what is the meaning of"), top
             assert len(top["title"]) <= 49, top["title"]
 
-            # An agent's session (step 16) runs beside the conversation
+    # Run agent and chat sessions together.
             talk = sessions._current
             agent = sessions.open_session(kind="agent", parent=talk)
             assert sessions._current == talk, "an agent session stole the default"
@@ -1333,7 +1357,7 @@ def check_sessions() -> None:
             assert agent_events[0]["kind"] == "agent"
             assert len(sessions.read(talk)) == 2, "the agent wrote into the conversation"
 
-            # Two threads, two sessions: no interleaving, no lost counts.
+    # Concurrent sessions stay isolated.
             other = sessions.open_session(kind="agent", parent=talk)
 
             def hammer(target: str, tag: str) -> None:
@@ -1356,11 +1380,11 @@ def check_sessions() -> None:
                     range(1, 41 + already)
                 ), target
 
-            # A step-15 tool argument json can't serialise must cost one event
+    # Invalid tool JSON costs one event.
             sessions.record("tool_call", session=agent, args={"when": datetime.now()})
             assert sessions.read(agent)[-1]["type"] == "tool_call"
 
-            # The index is a cache: lose it and every session comes back.
+    # Rebuild a missing index.
             expected = {e["id"] for e in sessions.list_sessions()}
             sessions.INDEX_PATH.unlink()
             rebuilt = sessions.list_sessions()
@@ -1377,7 +1401,7 @@ def check_sessions() -> None:
             assert sessions.list_sessions() == before, "the toggle did not stop writes"
             config.load = remembering(True)
 
-            # Retention, clock one: screenshots go at a week.
+    # Expire screenshots weekly.
             fresh, stale = sessions.media_path(), sessions.media_path()
             fresh.write_bytes(b"x")
             stale.write_bytes(b"x")
@@ -1388,7 +1412,7 @@ def check_sessions() -> None:
             assert not stale.exists(), "an eight-day-old screenshot survived"
             assert len(sessions.list_sessions()) == len(before), "sweep ate live sessions"
 
-            # Retention, clock two: text goes at a year.
+    # Expire text yearly.
             sessions.close()
             doomed = sessions.list_sessions()[0]["id"]
             stamp = (datetime.now(timezone.utc) - timedelta(days=400)).isoformat()
@@ -1405,7 +1429,7 @@ def check_sessions() -> None:
                 e["id"] for e in sessions.list_sessions()
             }, "a year-old session survived the sweep"
 
-            # Clear takes the whole tree, screenshots included.
+    # Clear all session files.
             survivor = sessions.list_sessions()[0]["id"]
             kept = sessions.media_path()
             kept.write_bytes(b"secret")
@@ -1415,7 +1439,7 @@ def check_sessions() -> None:
             assert not sessions.MEDIA_DIR.exists(), "clear left the media directory"
             assert sessions.read(survivor) is None, "clear left a session file behind"
 
-            # And it recovers: the next event opens a fresh session.
+    # Recover with a fresh session.
             sessions.record("user_said", text="after the clear")
             assert len(sessions.list_sessions()) == 1
         finally:
@@ -1435,7 +1459,7 @@ async def check_turn_logging() -> None:
             pass
 
     class FakeSpeaker:
-        # Mirrors the real Speaker: begin() is sync, the rest are awaited.
+    # Match the Speaker interface.
         def begin(self):
             pass
 
@@ -1450,7 +1474,7 @@ async def check_turn_logging() -> None:
 
     real_chat = llm.chat
     real_load = config.load
-    # The check must not depend on the user's own toggle
+    # Ignore the user's toggle.
     config.load = lambda: {**real_load(), "remember_conversations": True}
 
     def blank_session():
@@ -1470,7 +1494,7 @@ async def check_turn_logging() -> None:
         if hang_at_end:
             await asyncio.sleep(3600)  # cancelled long before this fires
 
-    # main._pass picks its brain from the saved config
+    # Load the saved brain.
     from mellowd import agents
 
     real_agent_chat = agents.chat
@@ -1480,11 +1504,11 @@ async def check_turn_logging() -> None:
 
     with _scratch_log():
         try:
-            # A turn that finishes: aborted comes out false.
+    # Mark completed turns.
             brain(lambda history, cfg, image=None: chat(["a short ", "answer."]))
             await main.answer(blank_session(), "say something")
 
-            # A turn cut off mid-stream: whatever was said lands anyway.
+    # Save interrupted speech.
             brain(
                 lambda history, cfg, image=None: chat(
                     ["one ", "two ", "three "], hang_at_end=True
@@ -1514,7 +1538,7 @@ async def check_turn_logging() -> None:
             failed = [e for e in logged if e["type"] == "turn_failed"]
             assert len(failed) == 1 and failed[0]["reason"], failed
 
-            # A reconnect picks the conversation back up
+    # Resume after reconnecting.
             history, destination = sessions.resume()
             assert [m["role"] for m in history] == [
                 "user", "assistant", "user", "assistant"
@@ -1527,7 +1551,7 @@ async def check_turn_logging() -> None:
                 cfg["provider"], cfg["base_url"], cfg["model"]
             ), destination
 
-            # The next turn must stay in the same session file.
+    # Reuse the current session.
             before = len(sessions.list_sessions())
             brain(lambda history, cfg, image=None: chat(["still ", "here."]))
             await main.answer(blank_session(), "are you there")
@@ -1537,7 +1561,7 @@ async def check_turn_logging() -> None:
             seqs = [e["seq"] for e in newest]
             assert seqs == sorted(set(seqs)), f"resume reused a seq: {seqs}"
 
-            # "New conversation" has to survive a reload.
+    # Persist new conversations.
             ended = sessions._current
             sessions.close()
             assert sessions.read(ended)[-1]["type"] == "session_ended"
@@ -1559,13 +1583,13 @@ def check_vision() -> None:
     """The vision flag resolves, and the right screen rule reaches the request."""
     from mellowd import config, llm
 
-    # The editable prompt carries no screen machinery at all.
+    # Keep screen logic out of the prompt.
     assert "[look]" not in config.DEFAULTS["system_prompt"]
     for clause in (llm.REMINDER_LOOK, llm.REMINDER_NOLOOK, llm.REMINDER_SEEN):
         assert "[look]" not in clause or clause is llm.REMINDER_LOOK
         assert "Reminder: you are mellow" in clause
 
-    # Auto resolution over a spread of real model ids.
+    # Resolve representative model IDs.
     cases = {
         "gpt-oss-120b": False,
         # False is the correct *guess*
@@ -1588,7 +1612,7 @@ def check_vision() -> None:
     assert config.resolves_vision({"vision": "on", "model": "gpt-oss-120b"})
     assert not config.resolves_vision({"vision": "off", "model": "gpt-4o"})
 
-    # Validation accepts only the three modes.
+    # Validate the three modes.
     cfg = config.validate(dict(config.DEFAULTS))
     assert cfg["llm"]["vision"] == "auto"
     try:
@@ -1598,19 +1622,19 @@ def check_vision() -> None:
     else:
         raise AssertionError("an unknown vision mode was accepted")
 
-    # The reminder each configuration produces.
+    # Check each reminder.
     look = llm._settings({**cfg, "llm": {**cfg["llm"], "vision": "on"}})
     assert look["vision_ok"] is True
     nolook = llm._settings({**cfg, "llm": {**cfg["llm"], "vision": "off"}})
     assert nolook["vision_ok"] is False
 
-    # The marker is taught by example, not only described
+    # Teach the marker by example.
     def shown(**over) -> bool:
         turns = llm._anchored({"model": "m", "anchor": True, **over}, [])
         return any(t["content"] == llm.LOOK for t in turns)
 
     assert shown(vision_ok=True), "the look example never reaches a vision model"
-    # Both phrasings. "can you see my screen?" is the one that failed in use
+    # Cover both screen phrasings.
     asked = [q for q, _ in llm.ANCHOR_LOOK]
     assert any("can you see" in q for q in asked), asked
     assert len(asked) >= 2, "only one way of asking is demonstrated"
@@ -1646,7 +1670,7 @@ def check_wants_screen() -> None:
         "can you see what im reading",
         "whats in front of me right now",
         "show me whats wrong with this form",
-        # A pointer with no noun after it. These missed, so no screenshot was taken
+    # Pointer phrases without nouns.
         "can you explain this",
         "can you explain this?",
         "what is this",
@@ -1654,7 +1678,7 @@ def check_wants_screen() -> None:
         "explain this to me",
         "describe this",
     )
-    # The expensive half. A false positive costs one ignored screenshot
+    # Reject costly false positives.
     answer = (
         "what is the capital of france",
         "explain why my laptop gets slow with lots of tabs",
@@ -1672,7 +1696,7 @@ def check_wants_screen() -> None:
         "what did you just say",
         "explain how memory paging works",
         "lets see what you can do",
-        # The other side of the bare-pointer rule
+    # Check bare-pointer exclusions.
         "explain this concept again",
         "can you explain this idea in simpler terms",
         "what is this thing you mentioned",
@@ -1682,7 +1706,7 @@ def check_wants_screen() -> None:
     assert not missed, f"would not have looked: {missed}"
     assert not fired, f"would have looked for no reason: {fired}"
 
-    # Case and punctuation are not signal — speech-to-text supplies neither reliably
+    # Ignore case and punctuation.
     assert capture.wants_screen("WHAT IS ON MY SCREEN")
     assert capture.wants_screen("what is on my screen")
 
@@ -1703,7 +1727,7 @@ def check_wants_pointing() -> None:
         "where do i find the settings for this",
         "how do i change the font on this page",
         "show me the button to start a render",
-        # Everything below is a sentence a real person actually said to Mellow and did not get a bone
+    # Previously missed pointing phrases.
         "where can i see my profile",
         "where do i see my profile",
         "can you help me find the export button",
@@ -1732,7 +1756,7 @@ def check_wants_pointing() -> None:
     assert not missed, f"would not have pointed: {missed}"
     assert not fired, f"would have pointed for no reason: {fired}"
 
-    # A pointing question must also pull a screenshot
+    # Capture screens for pointing.
     for q in point:
         assert capture.wants_screen(q) or capture.wants_pointing(q), q
 
@@ -1754,7 +1778,7 @@ def check_vision_probe() -> None:
                 self.rfile.read(int(self.headers.get("content-length", 0))) or b"{}"
             )
             asked.append((self.path, body.get("model")))
-            # What a real Ollama returns for these two, measured on this laptop.
+    # Representative Ollama responses.
             seeing = body.get("model", "").startswith("gemma3:4b")
             payload = json.dumps(
                 {"capabilities": ["completion", "vision"] if seeing else ["completion"]}
@@ -1773,7 +1797,7 @@ def check_vision_probe() -> None:
     saved = dict(llm._VISION_CACHE)
     llm._VISION_CACHE.clear()
     try:
-        # The /v1 the chat adapter talks to is not where /api/show lives.
+    # Ollama metadata uses the root URL.
         assert llm._ollama_root("http://127.0.0.1:8796/v1") == "http://127.0.0.1:8796"
         assert llm._ollama_root("http://127.0.0.1:8796") == "http://127.0.0.1:8796"
 
@@ -1785,7 +1809,7 @@ def check_vision_probe() -> None:
                 "base_url": "http://127.0.0.1:8796/v1",
             }
 
-        # The whole point: the table says no, Ollama says yes, Ollama wins.
+    # Ollama metadata overrides guesses.
         seeing = section("gemma3:4b")
         assert not config.resolves_vision(seeing), "the name table changed under us"
         assert not llm.vision_ok(seeing), "answered before anyone asked ollama"
@@ -1793,14 +1817,14 @@ def check_vision_probe() -> None:
         assert llm.vision_ok(seeing), "ollama said vision and we ignored it"
         assert asked == [("/api/show", "gemma3:4b")], asked
 
-        # A text-only local model is believed too, and the answer is cached
+    # Cache text-only metadata too.
         blind = section("gemma3:1b")
         llm.probe_vision(blind)
         llm.probe_vision(blind)
         assert not llm.vision_ok(blind)
         assert len(asked) == 2, asked
 
-        # An explicit setting is the user's answer
+    # Honor explicit settings.
         for mode, want in (("on", True), ("off", False)):
             forced = section("gemma3:1b" if want else "gemma3:4b", vision=mode)
             before = len(asked)
@@ -1808,14 +1832,14 @@ def check_vision_probe() -> None:
             assert llm.vision_ok(forced) is want, (mode, want)
             assert len(asked) == before, "probed a model the user had already decided"
 
-        # Cloud providers have no /api/show, so they keep the name table.
+    # Cloud models use name guesses.
         cloud = section("gpt-4o", provider="openai")
         before = len(asked)
         llm.probe_vision(cloud)
         assert len(asked) == before, "probed a provider that has no such endpoint"
         assert llm.vision_ok(cloud), "cloud lost its name-table guess"
 
-        # Ollama down: no answer, no cache entry, and the guess stands
+    # Failed metadata keeps the guess.
         llm._VISION_CACHE.clear()
         dead = {**section("gemma3:4b"), "base_url": "http://127.0.0.1:8797/v1"}
         llm.probe_vision(dead)
@@ -1852,14 +1876,18 @@ async def _run_pass(chunks, look="ask", fired=None):
     s.writer = main.writing.Writer()
     s.speaker = type("S", (), {"begin": lambda self: None})()
     async def hook(pick):
-        # What had already reached the bubble when the marker landed.
+    # Preserve text before the marker.
         fired.append((pick, len([m for m in ws.sent if m.get("type") == "reply_chunk"])))
 
     real_chat = llm.chat
     llm.chat = lambda history, cfg, image=None: gen()
     try:
         reply, asked, point = await main._pass(
-            s, {}, speak=False, look=look, on_point=hook if fired is not None else None
+            s,
+            {},
+            speak=False,
+            look=look,
+            on_point=hook if fired is not None else None,
         )
     finally:
         llm.chat = real_chat
@@ -1873,7 +1901,7 @@ async def check_marker_hold() -> None:
 
     run = _run_pass
 
-    # The exact marker, chopped every way, is caught with nothing leaking out.
+    # Catch every marker split.
     for step in (1, 2, 3, 6, 100):
         reply, asked, texts, _ = await run(
             [llm.LOOK[i : i + step] for i in range(0, len(llm.LOOK), step)]
@@ -1881,24 +1909,24 @@ async def check_marker_hold() -> None:
         assert asked, f"step {step}: marker missed"
         assert reply == "" and texts == "", f"step {step}: leaked {reply!r} {texts!r}"
 
-    # Marker plus trailing words in one gulp — still a marker, still silent.
+    # Drop marker suffix text.
     reply, asked, texts, _ = await run([f"{llm.LOOK}\n\nLet me see."])
     assert asked and texts == "", (reply, asked, texts)
 
-    # A lookalike that starts the same but isn't the marker flushes whole.
+    # Preserve marker lookalikes.
     keep = "[looking] around the room."
     reply, asked, texts, _ = await run([keep[i : i + 3] for i in range(0, len(keep), 3)])
     assert not asked and texts == keep, (asked, texts)
 
-    # Whitespace before the marker is tolerated.
+    # Allow leading whitespace.
     reply, asked, _, _ = await run(["  ", "[look]"])
     assert asked
 
-    # A stream cut off inside a would-be marker degrades to text, not silence.
+    # Preserve incomplete markers.
     reply, asked, texts, _ = await run(["[lo"])
     assert not asked and texts == "[lo", (asked, texts)
 
-    # The regression this window exists for: one word of preamble used to defeat the scan entirely
+    # Scan after short preambles.
     preamble = "Sure, let me look. [look]"
     for step in (1, 4, 100):
         reply, asked, texts, _ = await run(
@@ -1907,21 +1935,21 @@ async def check_marker_hold() -> None:
         assert asked, f"step {step}: preamble hid the marker"
         assert texts == "", f"step {step}: leaked {texts!r} before asking"
 
-    # Past the window it is an ordinary answer, not a hang.
+    # Treat late text as an answer.
     long_answer = "word " * 40
     reply, asked, texts, _ = await run([long_answer[i : i + 5] for i in range(0, 200, 5)])
     assert not asked and texts == long_answer, (asked, len(texts))
 
-    # Phase 2 already holds the screenshot: a stray marker is dropped
+    # Drop stray phase-two markers.
     reply, asked, texts, _ = await run(["[look] I see a code editor."], look="strip")
     assert not asked, "phase 2 asked for a second screenshot"
     assert "[look]" not in texts and "code editor" in texts, texts
 
-    # Vision off: the model was never told the marker exists
+    # Hide markers when vision is off.
     reply, asked, texts, _ = await run(["[a] bracketed answer."], look="")
     assert not asked and texts == "[a] bracketed answer.", (asked, texts)
 
-    # Past the window it is no longer a request — the answer is already being spoken
+    # Ignore late markers.
     tail = "This is a perfectly ordinary answer that simply runs on for a good "
     tail += "while before anything else happens at all. "
     assert len(tail) > main.LOOK_SCAN, len(tail)
@@ -1930,7 +1958,7 @@ async def check_marker_hold() -> None:
     assert "[look]" not in texts, texts
     assert texts.startswith(tail) and "not for you to see" in texts, texts
 
-    # The backstop for the spoken half. clean_for_speech runs on whole sentences
+    # Clean markers from speech.
     assert tts.clean_for_speech("[look] here it is") == "here it is"
     assert tts.clean_for_speech("it [looks like] rain") == "it [looks like] rain"
     assert tts.clean_for_speech("take a look at this") == "take a look at this"
@@ -1945,7 +1973,7 @@ async def check_point_marker() -> None:
     answer = "Open the File menu in the top left. "
     marker = "[POINT:12]"
 
-    # Chopped every way, including straight through the middle of the marker.
+    # Cover every chunk boundary.
     for step in (1, 2, 3, 6, 100):
         whole = marker + " " + answer
         _, _, texts, point = await _run_pass(
@@ -1956,44 +1984,44 @@ async def check_point_marker() -> None:
         _, _, texts, point = await _run_pass([answer + marker], look="")
         assert point == 12 and texts.strip() == answer.strip(), (point, texts)
 
-    # Words instead of a number. Not asked for and accepted anyway
+    # Accept word arguments.
     _, _, _, point = await _run_pass(["[POINT:API Keys] There."], look="")
     assert point == "API Keys", point
 
-    # The hook fires the instant the marker lands
+    # Fire hooks on marker arrival.
     fired = []
     await _run_pass(["[POINT:", "3] Cl", "ick that."], look="pick", fired=fired)
     assert fired == [(3, 0)], f"the answer started before the bone did: {fired}"
 
-    # "Pointing wouldn't help" must be distinguishable from "the model forgot"
+    # Distinguish explicit point vetoes.
     _, _, texts, point = await _run_pass([f"{answer}[POINT:none]"], look="")
-    # A veto, and it has to be tellable apart from "the model said nothing"
+    # Preserve explicit veto state.
     assert point is main.NONE and texts.strip() == answer.strip(), (point, texts)
 
-    # Brackets that close inside the stream are ordinary words and must not be held back
+    # Preserve ordinary bracketed text.
     ordinary = "Check step [1] and the [second] one."
     _, _, texts, point = await _run_pass(
         [ordinary[i : i + 4] for i in range(0, len(ordinary), 4)], look=""
     )
     assert point is None and texts == ordinary, (point, texts)
 
-    # An unclosed bracket that never becomes a marker is released at the end of the stream
+    # Release unclosed brackets.
     _, _, texts, point = await _run_pass(["All done [", "but not really"], look="")
     assert point is None and texts == "All done [but not really", texts
 
-    # ...and one that runs past the hold is released without waiting.
+    # Release overlong brackets early.
     runaway = "[" + "x" * (main.POINT_HOLD + 20)
     _, _, texts, _ = await _run_pass([runaway], look="")
     assert texts == runaway, texts
 
-    # Both markers on one turn: phase 2 strips [look] and still finds the point.
+    # Support both turn markers.
     _, _, texts, point = await _run_pass(
         ["[look] Click Export. [POINT:9]"], look="strip"
     )
     assert point == 9, point
     assert "[look]" not in texts and "POINT" not in texts, texts
 
-    # The backstop for the spoken half, for a marker that somehow survives.
+    # Strip surviving speech markers.
     assert tts.clean_for_speech("Click it. [POINT:1]") == "Click it."
     assert tts.clean_for_speech("Nothing here. [POINT:none]") == "Nothing here."
 
@@ -2042,7 +2070,7 @@ async def check_act() -> None:
         found = act.direct(query, listing(query))
         return (found[0].kind, found[0].label) if found else None
 
-    # Live drives (not the fixture) must use Explorer-style labels + letter aliases.
+    # Use Explorer-style drive labels.
     live = act.drives()
     assert live, "no drives enumerated on this machine"
     for drive in live:
@@ -2052,7 +2080,7 @@ async def check_act() -> None:
         assert f"{letter} drive".lower() in spoken, (drive.label, drive.aliases)
         assert f"drive {letter}".lower() in spoken, (drive.label, drive.aliases)
 
-    # Resolve folders via Windows; ~/Desktop is wrong under OneDrive backup.
+    # Resolve redirected Windows folders.
     import os as _os
 
     found_any = False
@@ -2061,16 +2089,16 @@ async def check_act() -> None:
         assert where and folder.lower() in where.lower(), (folder, where)
         naive = _os.path.join(_os.path.expanduser("~"), folder)
         if not _os.path.isdir(naive):
-            # Redirected path: Windows answer must still exist.
+    # Accept redirected Windows paths.
             assert _os.path.isdir(where), (folder, where)
         found_any = found_any or _os.path.isdir(where)
     assert found_any, "not one of the user's own folders could be located"
 
-    # The app beats their own note about it. A bare word is the least likely way anyone refers to a file
+    # Prefer the app over note text.
     top = listing("open spotify")[0]
     assert (top.label, top.kind) == ("Spotify", "app"), top
 
-    # A verb row is scored on the sentence, never on its own label
+    # Score verb rows by sentence.
     assert listing("play back in black")[0].kind == "youtube"
     assert listing("play back in black on spotify")[0].kind == "spotify"
     assert listing("turn spotify down to 50")[0].kind == "volume"
@@ -2090,7 +2118,7 @@ async def check_act() -> None:
     assert listing("hey can you open google drive please")[0].kind == "site"
     assert listing("search for cheap flights")[0].kind == "google"
 
-    # Exact commands bypass the fragile model marker.
+    # Exact commands bypass markers.
     downloads = act.direct("could you please open my downloads folder", listing("open downloads"))
     assert downloads and downloads[0].kind == "place" and downloads[1] == "", downloads
     youtube = act.direct("open youtube", listing("open youtube"))
@@ -2107,7 +2135,7 @@ async def check_act() -> None:
     assert act.media_argument("play that on youtube", "that") is None
     assert act.direct("open the file menu", listing("open the file menu")) is None
 
-    # Spoken aliases, drive letters, and settings pages.
+    # Cover spoken action aliases.
     for phrase, expected in [
         ("open calc", ("app", "Calculator")),
         ("open cmd", ("app", "Command Prompt")),
@@ -2115,7 +2143,7 @@ async def check_act() -> None:
         ("open vsc", ("app", "Visual Studio Code")),
         ("open explorer", ("app", "File Explorer")),
         ("open my computer", ("app", "File Explorer")),
-        # Letter drives need aliases; scoring drops single letters.
+    # Add aliases for letter drives.
         ("open local disk C", ("place", "Local Disk (C:)")),
         ("open the C drive", ("place", "Local Disk (C:)")),
         ("open drive D", ("place", "Data (D:)")),
@@ -2126,7 +2154,7 @@ async def check_act() -> None:
     ]:
         assert resolved(phrase) == expected, (phrase, resolved(phrase))
 
-    # Politeness and punctuation must not survive into the target or the query.
+    # Strip politeness and punctuation.
     for phrase, expected in [
         ("can you open Recycle Bin please?", ("place", "Recycle Bin")),
         ("um can you help me open the recycle bin?", ("place", "Recycle Bin")),
@@ -2150,13 +2178,13 @@ async def check_act() -> None:
         found = act.direct(phrase, listing(phrase))
         assert found and found[0].kind == "site_search", (phrase, found)
         assert found[1] == wanted, (phrase, found[1])
-    # Play still beats search when they said play.
+    # Prefer play over search.
     play = act.direct("open youtube and play lofi", listing("open youtube and play lofi"))
     assert play and play[0].kind == "youtube" and play[1] == "lofi", play
     # Sites without a search URL just open.
     assert act.site_search("open google calendar") is None
 
-    # Action gate must admit these (used to require "search for").
+    # Admit direct search requests.
     for errand in ("search youtube for lofi beats", "google the weather in Maryland",
                    "find me a cheap flight", "look up the offside rule"):
         assert capture.wants_action(errand), errand
@@ -2164,17 +2192,17 @@ async def check_act() -> None:
     for asking in ("where is the search box", "which button opens settings",
                    "how do I search in VS Code", "how do I open a new terminal"):
         assert not capture.wants_action(asking), asking
-    # Wider search verbs must not force a Google row.
+    # Avoid forced Google rows.
     for spoken in ("search the transcript for that phrase",
                    "find me a good name for this function",
                    "show me the files on my desktop"):
         top = listing(spoken)[0] if listing(spoken) else None
         assert top is None or top.kind != "google", (spoken, top and top.label)
-    # "google drive" = site; "google the weather" = search.
+    # Distinguish sites from searches.
     assert listing("open google drive")[0].kind == "site"
     assert listing("google the weather in Maryland")[0].kind == "google"
 
-    # An acknowledgement is not filler on an action turn, and it survives by construction
+    # Keep action acknowledgements.
     from mellowd import llm
 
     stream = llm._Stream()
@@ -2183,17 +2211,17 @@ async def check_act() -> None:
     plain = llm._Stream()
     assert (plain.emit("Sure! The answer is 42.") + plain.flush()) == "The answer is 42."
 
-    # Nothing here is worth doing, and the turn has to be free to be about something else entirely.
+    # Reject non-actions.
     quiet = listing("what does this error mean")
     assert not quiet or quiet[0].score < act.THRESHOLD, quiet
 
-    # The gate is loose on purpose and the catalog is the second half of it.
+    # Let the catalog filter loose matches.
     assert capture.wants_action("open file explorer")
     assert capture.wants_action("turn spotify down")
     assert not capture.wants_action("what is on my screen")
     assert not capture.wants_action("summarise this page")
 
-    # A question about *where* is never a command to *do*
+    # Reject informational questions.
     for asking in (
         "show me where to click to run this",
         "show me where i should click for the extension part",
@@ -2205,7 +2233,7 @@ async def check_act() -> None:
         assert not capture.wants_action(asking), f"acting stole {asking!r}"
         assert capture.wants_pointing(asking), f"and pointing did not catch it: {asking!r}"
 
-    # ...without costing any of the sentences that must still open something.
+    # Preserve valid open requests.
     for doing in (
         "open chrome",
         "hey mellow can you open chrome for me",
@@ -2216,7 +2244,7 @@ async def check_act() -> None:
     ):
         assert capture.wants_action(doing), f"stopped opening for {doing!r}"
 
-    # The marker, at every chunking, with and without an argument.
+    # Cover marker chunking.
     whole = "[DO:2|back in black] Putting that on."
     for step in (1, 3, 7, 100):
         text, tail, deed = "", "", None
@@ -2228,26 +2256,26 @@ async def check_act() -> None:
     assert main._split_point("[DO:4] Done.", main._DO_TOKEN)[2] == (4, "")
     assert main._split_point("[DO:none] No.", main._DO_TOKEN)[2] is main.NONE
 
-    # ...and the pointing marker still parses on its own token
+    # Parse standalone point markers.
     assert main._split_point("[POINT:3] There.")[2] == 3
 
-    # Resolving a deed onto a row. Everything that is not a row is nothing
+    # Resolve actions only to rows.
     assert main._chosen((1, ""), rows)[0] is rows[0]
     assert main._chosen((5, "x"), rows) == (rows[4], "x")
     assert main._chosen((0, ""), rows)[0] is None
     assert main._chosen((99, ""), rows)[0] is None
     assert main._chosen(main.NONE, rows)[0] is None
     assert main._chosen(None, rows)[0] is None
-    # Lookup by label; fixture index is unstable.
+    # Find unstable rows by label.
     downloads = next(r for r in rows if r.label == "Downloads")
     assert main._chosen(("Downloads", ""), rows)[0] is downloads
     assert main._chosen(("the printer settings", ""), rows)[0] is None
 
-    # A declined turn is spotted before a word of it is emitted
+    # Detect declined turns early.
     assert main._declined("[DO:none] let me look")
     assert not main._declined("[DO:2] opening")
 
-    # Integration: an exact Downloads request executes and answers without entering _pass
+    # Execute an exact Downloads request.
     sent, ran = [], []
 
     class FakeWS:
@@ -2282,8 +2310,7 @@ async def check_act() -> None:
     assert partial["text"] == "Opened Downloads.", partial
     assert sent == [{"type": "reply_chunk", "text": "Opened Downloads."}], sent
 
-    # Same row, scored below the threshold: an exact name still runs, because
-    # _act asks direct() before the fuzzy score is allowed to discard it.
+    # Exact names bypass fuzzy scoring.
     ran.clear()
     weak = act.Thing(label="Recycle Bin", kind="place",
                      target="shell:RecycleBinFolder", score=0.68)
@@ -2305,13 +2332,13 @@ async def check_act() -> None:
         act.catalog, act.run, main._pass, sessions.record = saved
     assert did and ran == [(weak, "")], (did, ran)
 
-    # The argument split for a volume request
+    # Split volume arguments.
     assert act._volume_args("spotify 50") == ("spotify", 0.5)
     assert act._volume_args("spotify to 30 percent") == ("spotify", 0.3)
     assert act._volume_args("chrome 200")[1] == 1.0
     assert act._volume_args("nothing here") == (None, 0.0)
 
-    # Saying when, out loud. Every one of these is a shape a speech recogniser actually produces
+    # Cover spoken time formats.
     from datetime import datetime
 
     from mellowd import remind
@@ -2332,12 +2359,12 @@ async def check_act() -> None:
         got = remind.at(said, now)
         assert got == (clock, text, daily), f"{said!r} -> {got!r}"
 
-    # When is the one thing that cannot be guessed
+    # Require explicit reminder times.
     assert remind.at("take the bins out", now) is None
     assert remind.at("at 25:00 nonsense", now) is None
     assert remind.at("", now) is None
 
-    # The timers route to their own rows, and stopping is not starting.
+    # Route timer actions correctly.
     assert listing("remind me in ten minutes to stretch")[0].kind == "remind"
     assert listing("set a reminder for 9pm")[0].kind == "remind"
     assert listing("set a pomodoro for 25 minutes")[0].kind == "pomodoro"
@@ -2345,7 +2372,7 @@ async def check_act() -> None:
     assert listing("stop the pomodoro")[0].kind == "pomodoro_stop"
     assert listing("cancel the focus timer")[0].kind == "pomodoro_stop"
 
-    # A count of minutes, however it was said.
+    # Parse spoken minute counts.
     assert [act.minutes(x) for x in ("25 minutes", "twenty five", "thirty five",
                                      "forty five", "half an hour")] == [25, 25, 35, 45, 30]
     assert act.minutes("") is None
@@ -2458,7 +2485,7 @@ async def check_one_turn_one_bone() -> None:
     assert calls == [], "agent pointing made a redundant generic chat call"
 
     points = [m for m in sent if m["type"] == "point"]
-    # One clear on the way in, then the bone. And it is still up at the end
+    # Clear once, then keep the bone.
     assert [p["nx"] for p in points] == [None, 0.5], points
     assert points[-1]["label"] == "File menu", points[-1]
     assert points[-1]["monitor"] == target_monitor, points[-1]
@@ -2520,27 +2547,27 @@ def check_point_score() -> None:
     """The list handed to the model: what stays on it, and in what order."""
     from mellowd import point
 
-    # OCR does not put spaces where you expect them - this exact sidebar comes back as "APIKeys"
+    # Handle collapsed OCR spacing.
     assert point.squash("API Keys") == point.squash("APIKeys") == "apikeys"
 
     mon = {"left": 0, "top": 0, "width": 1920, "height": 1080}
 
     def listing(query, rows, page=None):
-        saved = point.monitor, point.uia_candidates, point.ocr_candidates
+        saved = point.monitor, point.uia_candidates, point._collect_ocr
         try:
             point.monitor = lambda: mon
             point.uia_candidates = lambda hwnd=0: (
                 [r for r in rows if r[6] == "uia"], page
             )
-            point.ocr_candidates = lambda pixels: [r for r in rows if r[6] == "ocr"]
+            point._collect_ocr = lambda pending: [r for r in rows if r[6] == "ocr"]
             return point.candidates(query, None)
         finally:
-            point.monitor, point.uia_candidates, point.ocr_candidates = saved
+            point.monitor, point.uia_candidates, point._collect_ocr = saved
 
     def row(name, x, y, w, h, kind="", source="ocr"):
         return (name, x, y, w, h, kind, source)
 
-    # Ordering: the rows the question is about come first
+    # Put relevant rows first.
     got = listing("point me towards the API key", [
         row("Models", 7, 440, 102, 29),
         row("APIKeys", 40, 565, 90, 25),
@@ -2549,7 +2576,7 @@ def check_point_score() -> None:
     assert [c.label for c in got][0] == "APIKeys", [c.label for c in got]
     assert len(got) == 3, "a row was dropped that could have been the answer"
 
-    # VS Code appends shortcuts and status badges to the accessible name.
+    # Ignore VS Code accessibility suffixes.
     vscode = listing("where is source control", [
         row(
             "Source Control (Ctrl+Shift+G) - 9 pending changes",
@@ -2558,7 +2585,7 @@ def check_point_score() -> None:
     ])
     assert len(vscode) == 1 and vscode[0].label == "Source Control", vscode
 
-    # The bug that put the bone in the tab strip twice.
+    # Avoid duplicate tab targets.
     browser = listing("what should i click to get new models", [
         row("Models | NVIDIA NIM", 660, 12, 110, 26, "tab", "uia"),
         row("New Tab", 1480, 12, 30, 26, "button", "uia"),
@@ -2567,12 +2594,12 @@ def check_point_score() -> None:
     ])
     assert browser[0].label == "Models" and browser[0].ny * 1080 > 100, browser[0]
 
-    # And the model is told which is which, in words
+    # Label target groups.
     shown = point.describe(browser)
     assert '"Models | NVIDIA NIM" tab 37,2' in shown, shown
     # No document rect here
 
-    # Chrome calls its address bar "Address and search bar"
+    # Match Chrome's address bar name.
     page_rect = (0, 145, 1917, 933)
     amazon = listing("where should i click to update my address", [
         row("Address and search bar", 190, 66, 1500, 28, "text box", "uia"),
@@ -2586,7 +2613,7 @@ def check_point_score() -> None:
     assert told.index("Update location") < told.index("BROWSER"), told
     assert told.index("BROWSER") < told.index("Address and search bar"), told
 
-    # And the browser can never take more than its share of the list
+    # Cap browser results.
     crowd = listing("where do i click to save", [
         row("Tab %d" % i, i * 20, 12, 18, 26, "tab", "uia")
         for i in range(point.MAX_CHROME + 20)
@@ -2594,7 +2621,7 @@ def check_point_score() -> None:
     assert sum(c.chrome for c in crowd) == point.MAX_CHROME, crowd
     assert crowd[0].label == "Save", crowd[0]
 
-    # The split must never be able to starve the list
+    # Preserve list capacity.
     elsewhere = listing("where is the source control", [
         row("Source Control", 30, 178, 46, 46, "tab", "uia"),
         row("Explorer", 30, 70, 46, 46, "tab", "uia"),
@@ -2604,25 +2631,25 @@ def check_point_score() -> None:
     assert not any(c.chrome for c in elsewhere), elsewhere
     assert elsewhere[0].label == "Source Control", elsewhere[0]
 
-    # ...and even with a document that *is* on this screen
+    # Cover visible native documents.
     nothing_inside = listing("where is the toolbar", [
         row("Toolbar", 30, 900, 60, 20),
     ], (0, 0, 1920, 200))
     assert len(nothing_inside) == 1 and not nothing_inside[0].chrome, nothing_inside
 
-    # A native app has no document in its tree, and then none of it is furniture
+    # Native controls are not furniture.
     native = listing("where is the export button", [
         row("Export Media", 400, 40, 100, 20, "menu item", "uia"),
     ])
     assert native and not native[0].chrome, native
 
-    # A pane the size of the window is the window.
+    # Reject window-sized panes.
     assert [c.label for c in listing("where are the settings", [
         row("Settings", 0, 0, 1900, 1000),
         row("Settings", 800, 400, 90, 24, "button", "uia"),
     ])] == ["Settings"]
 
-    # Prose is not a click target, and neither is a stray letter.
+    # Reject prose and stray letters.
     kept = [c.label for c in listing("how do i export", [
         row("Export", 100, 100, 70, 20),
         row("Follows Selected Date Range and then some more", 700, 300, 400, 20),
@@ -2630,14 +2657,14 @@ def check_point_score() -> None:
     ])]
     assert kept == ["Export"], kept
 
-    # The same thing read twice, once by each source. One row
+    # Deduplicate source results.
     twice = listing("open the export panel", [
         row("Export", 101, 101, 68, 18, False, "ocr"),
         row("Export", 100, 100, 70, 20, "button", "uia"),
     ])
     assert len(twice) == 1 and twice[0].source == "uia", twice
 
-    # A second monitor is somewhere the overlay cannot draw
+    # Reject unreachable monitors.
     assert listing("where is the export button", [
         row("Export", -900, 500, 80, 24, "button", "uia")
     ]) == []
@@ -2659,18 +2686,18 @@ def check_point_pick() -> None:
         point.Target(0.05, 0.26, "Projects", "ocr", 0.0),
     ]
 
-    # A number is one-based, because the list the model reads is.
+    # Model indices are one-based.
     assert main._picked(1, rows) is rows[0]
     assert main._picked(3, rows) is rows[2]
 
-    # Everything that is not a row on that list is no bone.
+    # Point only to listed rows.
     assert main._picked(0, rows) is None
     assert main._picked(99, rows) is None
     assert main._picked(main.NONE, rows) is None
     assert main._picked(None, rows) is None
     assert main._picked(2, []) is None
 
-    # Words instead of a number, matched against the rows it was shown and nothing else
+    # Match word arguments to shown rows.
     assert main._picked("New", rows) is rows[0]
     assert main._picked("Projects", rows) is rows[2]
     assert main._picked("the print dialog", rows) is None
@@ -2739,7 +2766,7 @@ async def check_locator() -> None:
     assert 0.8 < visual.nx < 1 and 0.8 < visual.ny < 1, visual
     assert visual.monitor["left"] == -1920, visual.monitor
 
-    # These are the literal replies captured from failed Codex/Claude turns.
+    # Previously failed agent replies.
     assert locator._bare_choice("E1", "coarse") == "E1"
     assert locator._bare_choice("E7", "fine") == "E7"
     assert locator._bare_choice("13", "coarse") == "C13"
@@ -2748,37 +2775,31 @@ async def check_locator() -> None:
         '{"selection":"E1","answer":"Click Source Control."}',
         "coarse",
         {"NONE", "E1", "E2"},
-        [source, nearby],
     ) == ("E1", "Click Source Control.")
 
-    # Codex 0.150 was observed returning a useful natural-language answer instead of the schema.
-    extensions = point.Target(
-        28 / 1920,
-        285 / 1080,
-        "Extensions",
-        "uia",
-        1.0,
-        "button",
-        False,
-        (-1918, 262, 46, 46),
-        mon,
-    )
+    # This is the API/local coarse-fine path only. Subscription agents short
+    # circuit to the one-turn locator above and never reach it, so the prose
+    # matching that once resolved a Codex sentence to an element is gone with
+    # the caller that needed it: a sentence is now an answer, not a selection.
     prose = "Click the Extensions icon on the far-left Activity Bar, around (20, 265)."
-    assert locator._grounded_fields(
-        prose, "coarse", {"NONE", "E1"}, [extensions]
-    )[0] == "E1"
-    duplicate = replace(extensions, source="ocr", score=0.0)
-    assert locator._grounded_fields(
-        prose, "coarse", {"NONE", "E1", "E2"}, [extensions, duplicate]
-    )[0] == "E1", "an OCR duplicate hid the exact UIA control"
+    assert locator._grounded_fields(prose, "coarse", {"NONE", "E1"}) == (None, prose)
 
-    # Agent pointing makes one structured call when the overview already has the exact measured control
+    # Point from an exact overview match.
     calls = []
     real_grounded = locator.agents.complete_grounded
     try:
-        async def grounded(*args):
+        box = locator._agent_bounds(source, mon)
+
+        async def grounded(*args, **kwargs):
             calls.append(args)
-            return '{"selection":"E1","answer":"Click Source Control on the left."}'
+            # The one-turn agent shape, with the row's own 0-1000 bounds copied
+            # back. The old {"selection": ...} shape belongs to the API path.
+            return (
+                '{"selection_kind":"element","selection_index":1,'
+                f'"visual_left":{box[0]},"visual_top":{box[1]},'
+                f'"visual_right":{box[2]},"visual_bottom":{box[3]},'
+                '"spoken_answer":"Click Source Control on the left."}'
+            )
 
         locator.agents.complete_grounded = grounded
         result = await locator.locate_and_answer(
@@ -2904,18 +2925,18 @@ def check_ocr() -> None:
     if not found:
         print("..  no OCR language pack on this machine; the text tier is off")
         return
-    # Fast enough to run *before* the answer rather than behind it. rapidocr was tried here and took
+    # Keep OCR ahead of the answer.
     assert took < 3.0, f"OCR took {took:.1f}s; the bone waits on this"
 
-    # Every label drawn has to reach the list
-    saved = point.monitor, point.uia_candidates, point.ocr_candidates
+    # Include every drawn label.
+    saved = point.monitor, point.uia_candidates, point._collect_ocr
     try:
         point.monitor = lambda: {"left": 0, "top": 0, "width": 900, "height": 400}
         point.uia_candidates = lambda hwnd=0: ([], None)
-        point.ocr_candidates = lambda pixels: found
+        point._collect_ocr = lambda pending: found
         rows = point.candidates("what is on screen", None)
     finally:
-        point.monitor, point.uia_candidates, point.ocr_candidates = saved
+        point.monitor, point.uia_candidates, point._collect_ocr = saved
 
     for want, (x, y) in placed.items():
         hit = [c for c in rows if point.squash(want) in point.squash(c.label)]
@@ -3000,7 +3021,7 @@ async def check_point_first() -> None:
             llm.chat, agents.chat, llm.probe_vision, llm.vision_ok, config.load,
             capture.grab, capture.media_bytes, capture.foreground,
             capture.thumbnail, sessions.record, point.candidates,
-            main.HIDE_TIMEOUT, locator.locate, locator.changed_at,
+            main.HIDE_TIMEOUT, main._resolve_point, locator.changed_at,
             capture.active_monitor,
         )
         try:
@@ -3015,7 +3036,9 @@ async def check_point_first() -> None:
             sessions.record = lambda *a, **k: None
             point.candidates = lambda *args, **kwargs: list(offered)
             resolved = offered[0] if offered and reply_text.startswith("[POINT:1]") else None
-            locator.locate = lambda *args, **kwargs: asyncio.sleep(0, result=resolved)
+            main._resolve_point = lambda *args, **kwargs: asyncio.sleep(
+                0, result=locator.GroundedResult(resolved, "")
+            )
             locator.changed_at = lambda *args: False
             capture.active_monitor = lambda: {"left": 0, "top": 0, "width": 2048, "height": 1152}
             main.HIDE_TIMEOUT = 1.0
@@ -3027,13 +3050,13 @@ async def check_point_first() -> None:
                 llm.chat, agents.chat, llm.probe_vision, llm.vision_ok, config.load,
                 capture.grab, capture.media_bytes, capture.foreground,
                 capture.thumbnail, sessions.record, point.candidates,
-                main.HIDE_TIMEOUT, locator.locate, locator.changed_at,
+                main.HIDE_TIMEOUT, main._resolve_point, locator.changed_at,
                 capture.active_monitor,
             ) = saved
         return sent
 
     sent = await turn("[POINT:1] That is where your keys live. Copy one from there.")
-    # Every turn opens by clearing whatever the last one pointed at, so the bone that matters
+    # Clear the previous pointer first.
     assert sent[0] == {"type": "point", "nx": None}, sent[0]
     kinds = [m["type"] for m in sent[1:]]
     assert "point" in kinds and "reply_chunk" in kinds, kinds
@@ -3041,7 +3064,7 @@ async def check_point_first() -> None:
         "the answer started before the bone did: " + str(kinds)
     )
     aimed = sent[1:][kinds.index("point")]
-    # The row's own fractions go out untouched.
+    # Preserve row fractions.
     assert aimed["nx"] == 0.03 and aimed["label"] == "API Keys", aimed
     bubble = "".join(m["text"] for m in sent if m["type"] == "reply_chunk")
     assert "POINT" not in bubble and bubble.lstrip().startswith("That is"), bubble
@@ -3062,7 +3085,7 @@ async def check_point_first() -> None:
     assert not [m for m in sent if m["type"] == "point" and m["nx"] is not None], sent
     assert any(m["type"] == "reply_chunk" for m in sent), "no answer either"
 
-    # A screen with nothing readable on it: no list
+    # Handle unreadable screens.
     sent = await turn("[POINT:1] Right here.", offered=[])
     assert not [m for m in sent if m["type"] == "point" and m["nx"] is not None], sent
 
@@ -3077,22 +3100,22 @@ def check_screen_change() -> None:
 
     base = np.full((36, capture.THUMB_W), 128, dtype=np.int16)
 
-    # A menu opening: a large block goes dark.
+    # Detect an opened menu.
     menu = base.copy()
     menu[4:20, 2:14] = 20
     assert capture.changed(base, menu), "a menu opening was missed"
 
-    # Mellow idling in the corner: a few pixels, well under the threshold.
+    # Ignore idle sprite changes.
     dog = base.copy()
     dog[32:36, 58:64] = 20
     assert not capture.changed(base, dog), "the pet's own animation would re-point"
 
-    # Noise below CHANGE_LEVEL is not a change however widely it is spread.
+    # Ignore sub-threshold noise.
     dither = base.copy()
     dither[:, :] = 128 + capture.CHANGE_LEVEL - 1
     assert not capture.changed(base, dither), "a brightness nudge counted as a change"
 
-    # Mismatched or missing frames are "nothing happened", never a crash.
+    # Missing frames mean no change.
     assert not capture.changed(None, menu)
     assert not capture.changed(base, np.zeros((4, 4), dtype=np.int16))
 
@@ -3143,16 +3166,16 @@ async def check_screen_request() -> None:
         "reasoning_effort": "",
     }
     messages = [{"role": "user", "content": "read my screen"}]
-    # Not a real JPEG and doesn't need to be: the adapter only base64s it.
+    # The adapter only base64-encodes this.
     fake_jpeg = b"\xff\xd8\xff\xe0fakejpegbytes"
 
     try:
-        # Phase 2: image attached -> parts + REMINDER_SEEN.
+    # Build the vision phase-two prompt.
         await once(base, messages, image=fake_jpeg)
         body = seen["body"]
         user = [m for m in body["messages"] if m["role"] == "user"][-1]
         parts = user["content"]
-        # Image first, question last, in that order. Both adapters agree on it now
+    # Put the image before the question.
         assert isinstance(parts, list) and parts[0]["type"] == "image_url", parts
         url = parts[0]["image_url"]["url"]
         assert url.startswith("data:image/jpeg;base64,"), url[:40]
@@ -3163,11 +3186,11 @@ async def check_screen_request() -> None:
         ][-1]["content"]
         assert "attached to their latest message" in last_system, last_system
         assert "[look]" not in last_system, "phase 2 must not re-arm the marker"
-        # The one demonstration of a screen answer, and only on this pass.
+    # Include one screen example.
         answers = [m["content"] for m in body["messages"] if m["role"] == "assistant"]
         assert any(llm.ANCHOR_SEEN[0][1] == a for a in answers), "no seen anchor on phase 2"
 
-        # Phase 1, vision-capable: plain strings + REMINDER_LOOK.
+    # Build the vision phase-one prompt.
         seeing = {**base, "llm": {**base["llm"], "vision": "on"}}
         await once(seeing, messages)
         body = seen["body"]
@@ -3176,7 +3199,7 @@ async def check_screen_request() -> None:
         last_system = [m for m in body["messages"] if m["role"] == "system"][-1]["content"]
         assert "exactly [look]" in last_system and "attached" not in last_system
 
-        # Vision off: REMINDER_NOLOOK, and no marker instruction anywhere.
+    # Omit disabled vision instructions.
         blind = {**base, "llm": {**base["llm"], "vision": "off"}}
         await once(blind, messages)
         last_system = [m for m in seen["body"]["messages"] if m["role"] == "system"][-1][
@@ -3207,7 +3230,7 @@ async def check_screen_request() -> None:
             "a markerless screen answer was shown alongside the pointing rule"
         )
 
-        # A later step of the same walkthrough. Its rule is not REMINDER_SEEN's
+    # Use the later walkthrough rule.
         guiding = {**aiming, "llm": {**aiming["llm"], "screen": "guide"}}
         await once(guiding, messages, image=fake_jpeg)
         last_system = [m for m in seen["body"]["messages"] if m["role"] == "system"][-1][
@@ -3242,7 +3265,7 @@ def check_capture() -> None:
         assert im.size == (width, height), f"{im.size} reported as {(width, height)}"
         long_edge = max(im.size)
         assert long_edge <= capture.MAX_EDGE, f"oversized: {im.size}"
-        # 1080p-and-under monitors must go through untouched
+    # Preserve smaller screenshots.
         assert long_edge == min(long_edge, capture.MAX_EDGE) or long_edge == (
             capture.MAX_EDGE
         ), im.size
@@ -3254,7 +3277,7 @@ def check_capture() -> None:
     tight, narrow, short, raw = small
     assert max(narrow, short) <= capture.POINT_EDGE, (narrow, short)
     assert capture.POINT_EDGE < capture.MAX_EDGE, "the two frames are one frame"
-    # Still the full-resolution pixels: the OCR reads those
+    # Preserve full-resolution pixels.
     assert max(raw.shape[:2]) >= max(pixels.shape[:2]), "the pointing pixels were shrunk"
     if max(width, height) > capture.POINT_EDGE:
         assert len(tight) < len(data), (len(tight), len(data))
@@ -3271,7 +3294,7 @@ async def check_agents() -> None:
     """The agent brain, offline: registry, prompts, argv shapes, parsers."""
     from mellowd import agents, config, llm, main, point
 
-    # The settings window renders straight out of this table
+    # Feed the settings table.
     assert set(config.AGENT_PRESETS) == {"claude", "codex"}, config.AGENT_PRESETS
     for agent_id, preset in config.AGENT_PRESETS.items():
         assert preset["label"] and preset["install"], agent_id
@@ -3285,17 +3308,17 @@ async def check_agents() -> None:
         "mode": "agent",
         "provider": "claude",
         "model": "",
-        # Composed the way agents.chat composes it, placeholder intact.
+    # Match agent prompt composition.
         "system_prompt": llm.persona({"system_prompt": "", "llm": {"model": ""}}, "{model}"),
     }
 
-    # One question, no history. The persona goes to --system-prompt so it replaces Claude Code's own
+    # Pass the persona as the system prompt.
     system, user = agents.build_prompt(
         [{"role": "user", "content": "what is a waffle?"}], section
     )
     assert system.startswith("you are mellow"), system[:60]
     assert "Claude Code" in system, "{model} must fall back to the agent label"
-    # _REMINDER_TONE opens "Reminder: you are mellow"
+    # Verify the tone reminder.
     assert system not in user, "the persona must not be sent twice"
     assert "They just said: what is a waffle?" in user, user[-200:]
     assert "[look]" in user, "a vision-capable agent must be offered the marker"
@@ -3312,7 +3335,7 @@ async def check_agents() -> None:
     assert user.index("You answered: hello") < user.index("They just said:")
     print("ok  agent prompt replays history inline")
 
-    # Prompt context is now an agent-only latency budget.
+    # Limit prompt context for agents.
     long_history = []
     for i in range(10):
         long_history.extend(
@@ -3350,7 +3373,7 @@ async def check_agents() -> None:
     assert "attached to their latest message" in seen
     assert "[look]" not in seen, "a screenshot turn must not invite another"
 
-    # The gap that let step 14 ship with agent mode silently unable to point.
+    # Catch missing agent pointing support.
     listing = point.describe([
         point.Target(0.03, 0.53, "API Keys", "ocr", 0.0),
         point.Target(0.40, 0.02, "TokenRouter - Chrome", "uia", 1.0),
@@ -3362,7 +3385,7 @@ async def check_agents() -> None:
     assert llm.ANCHOR_POINT[0][1] in ask, "no worked example reached the agent"
     assert llm.ANCHOR_POINT[1][1] in ask, "no [POINT:none] example reached the agent"
 
-    # Nothing readable on screen means no list
+    # Omit empty screen lists.
     _, blindish = agents.build_prompt(history, {**aiming, "items": ""}, seen=True)
     assert "[POINT:" not in blindish, "asked for a pick with nothing to pick from"
 
@@ -3376,30 +3399,31 @@ async def check_agents() -> None:
     assert "capture failed" in broke, "a failed capture blamed the model instead"
     print("ok  agent prompts carry every screen rule llm has, pointing included")
 
-    # agents.chat itself, with only the subprocess stubbed.
+    # Exercise chat with a stubbed transport. Patch the seam chat actually uses:
+    # it builds an AgentRequest and hands it to _dispatch, so stubbing the older
+    # _turn/_stream pair silently asserted nothing.
     talked = {}
+    real_dispatch = agents._dispatch
 
-    def fake_turn(provider, section, messages, image):
-        talked["section"] = section
-        return object()
-
-    async def fake_stream(provider, turn):
+    async def fake_dispatch(request):
+        talked["section"] = request.section
+        talked["system"] = request.system
         yield "hello"
 
     live = config.load()
     live["llm"] = {**live["llm"], "mode": "agent", "provider": "claude", "model": ""}
-    real_turn, real_stream = agents._turn, agents._stream
     try:
-        agents._turn, agents._stream = fake_turn, fake_stream
+        agents._dispatch = fake_dispatch
         said = "".join(
             [c async for c in agents.chat([{"role": "user", "content": "hi"}], live)]
         )
     finally:
-        agents._turn, agents._stream = real_turn, real_stream
+        agents._dispatch = real_dispatch
     assert said == "hello", said
+    assert talked, "chat never reached the transport"
     persona = talked["section"]["system_prompt"]
     assert persona.startswith("you are mellow"), persona[:60]
-    # The placeholder has to survive to build_prompt
+    # Preserve the prompt placeholder.
     assert "{model}" in persona, "the model placeholder was substituted too early"
 
     stub = ["stub-cli"]
@@ -3408,7 +3432,7 @@ async def check_agents() -> None:
     assert argv[argv.index("--system-prompt") + 1] == "PERSONA"
     assert argv[argv.index("--output-format") + 1] == "stream-json"
     assert "--verbose" in argv and "--include-partial-messages" in argv
-    # No tools at all. The screenshot rides inline now
+    # Send screenshots inline.
     assert argv[argv.index("--tools") + 1] == "", argv
     for flag in ("--safe-mode", "--strict-mcp-config", "--setting-sources", "--no-session-persistence"):
         assert flag in argv, f"{flag} missing — claude would load the user's own config"
@@ -3436,7 +3460,7 @@ async def check_agents() -> None:
     assert "--ignore-user-config" in argv and "--ignore-rules" in argv
     assert argv[argv.index("-i") + 1] == "s.jpg"
     assert argv[argv.index("--output-schema") + 1] == "schema.json"
-    # -i is variadic: without the separator the prompt becomes a second image path and Codex silently
+    # Separate the variadic image argument.
     assert argv[-2] == "--", argv
     # The persona is deliberately absent
     assert argv[-1] == "-", argv
@@ -3470,13 +3494,13 @@ async def check_agents() -> None:
     assert payload is not None and payload.endswith(b"\n")
     body = json.loads(payload)
     parts = body["message"]["content"]
-    # Image first, question last — end of context is the privileged position
+    # Put the question last.
     assert parts[0]["type"] == "image" and parts[0]["source"]["media_type"] == "image/jpeg"
     assert parts[-1] == {"type": "text", "text": "QUESTION"}
     assert agents._payload("Q", None) is None
     print("ok  claude stdin message carries the screenshot inline, image first")
 
-    # --- real captured stream lines ------------------------------------------
+    # Captured stream lines.
     fam: dict = {}
     chunks: list[str] = []
     for line in (
@@ -3507,7 +3531,7 @@ async def check_agents() -> None:
     )
     assert err_state.get("error") == "not logged in", err_state
 
-    # Codex, captured from `codex exec --json` on a live account.
+    # Captured Codex stream.
     cod: dict = {}
     chunks = []
     for line in (
@@ -3520,10 +3544,10 @@ async def check_agents() -> None:
     ):
         chunks += agents._parse_codex(line, cod)
     assert chunks == ["Your screen shows a terminal."], chunks
-    # A nested error item is a warning the run recovers from; treating it as fatal would kill turns
+    # Nested errors may be recoverable.
     assert "error" not in cod, cod
 
-    # And the real failure shape — on stdout, not stderr
+    # Handle failures on stdout.
     cod_err: dict = {}
     assert agents._parse_codex(
         '{"type":"error","message":"{\\"type\\":\\"error\\",\\"status\\":400,'
@@ -3538,7 +3562,7 @@ async def check_agents() -> None:
     )
     assert turn_failed["error"] == "stream disconnected", turn_failed
 
-    # The older wire shapes still work, because these CLIs change them.
+    # Keep older wire formats working.
     old: dict = {}
     assert agents._parse_codex(
         '{"msg":{"type":"agent_message_delta","delta":"hi"}}', old
@@ -3576,7 +3600,7 @@ async def check_agents() -> None:
             assert "will not let the agent silently substitute" in str(e), e
     finally:
         agents.models = real_models
-    # Claude has no list command, so the preset aliases are the list.
+    # Claude uses preset aliases.
     assert agents.models("claude") == config.AGENT_PRESETS["claude"]["models"]
     print("ok  model lists omit routed entries and exact selections are enforced")
 
@@ -3584,7 +3608,7 @@ async def check_agents() -> None:
     assert "signed in" in str(err), err
     err = agents._failure("codex", "usage limit reached for your plan")
     assert "limit" in str(err), err
-    # The live failure on a real account: the configured model is not on the plan.
+    # Report unavailable models.
     err = agents._failure(
         "codex", "The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account."
     )
@@ -3619,7 +3643,12 @@ async def check_agents() -> None:
     deep_cfg = config.validate(
         {**candidate, "llm": {**candidate["llm"], "agent_speed": "deep"}}
     )
-    assert main._engine_signature(fast_cfg) == main._engine_signature(deep_cfg)
+    # Effort is part of the engine now: a prepared worker is launched with a
+    # fixed --effort, so changing it must reset the session rather than quietly
+    # keep answering at the old one.
+    assert main._engine_signature(fast_cfg) != main._engine_signature(deep_cfg), (
+        "an effort change no longer resets the warm runtime"
+    )
     try:
         config.validate({**candidate, "llm": {**saved, "provider": "nope"}})
         raise AssertionError("an unknown agent was accepted")
@@ -3630,14 +3659,14 @@ async def check_agents() -> None:
         raise AssertionError("stt accepted agent mode")
     except ValueError:
         pass
-    # A config parked on one of the four retired CLIs must not take the whole sidecar down on load
+    # Ignore retired CLI configs.
     retired = config.migrate(
         {"llm": {"mode": "agent", "provider": "antigravity", "model": "gemini-3.7-flash-high"}}
     )["llm"]
     assert retired == {"mode": "agent", "provider": "claude", "model": ""}, retired
     print("ok  config: agent mode validates, retired agents migrate, keys preserved")
 
-    # Connect verifies the actual image+schema route
+    # Verify image and schema support.
     real_complete_vision = agents.complete_vision
     try:
         async def fake_capability(prompt, cfg, image, schema=None):
@@ -3652,7 +3681,7 @@ async def check_agents() -> None:
     assert capable and "images" in detail, detail
     print("ok  Connect capability probe verifies image plus structured output")
 
-    # Keep the token-consuming live probe opt-in.
+    # Keep live probes opt-in.
     for agent_id in config.AGENT_PRESETS:
         if agents.find(agent_id) is None:
             print(f"..  {agent_id} not installed; native auth status unavailable")
@@ -3777,7 +3806,7 @@ async def main() -> None:
     async with connect(URL) as ws:
         hello = await recv(ws)
         assert hello == {"type": "state", "state": "idle"}, f"bad greeting: {hello}"
-        # The shell needs the voice flag before the user right-clicks
+    # Load the voice flag early.
         voice = await recv(ws)
         assert voice["type"] == "speak", f"expected speak flag, got {voice}"
         assert isinstance(voice["value"], bool), f"speak must be a bool: {voice}"
@@ -3794,7 +3823,7 @@ async def main() -> None:
         assert err["type"] == "error", f"unknown message should error, got {err}"
         print("ok  unknown message rejected")
 
-        # Mute round trip, then straight back — this writes config
+        # Persist mute changes.
         await ws.send(json.dumps({"type": "set_speak", "value": not voice["value"]}))
         flipped = await recv(ws)
         assert flipped == {"type": "speak", "value": not voice["value"]}, flipped
@@ -3802,7 +3831,7 @@ async def main() -> None:
         assert (await recv(ws))["value"] == voice["value"]
         print("ok  mute toggles and restores")
 
-        # Waking starts the quiet keeper and reports its real readiness.
+    # Waking starts the quiet keeper.
         await ws.send(json.dumps({"type": "awake", "value": True}))
         await ws.send(json.dumps({"type": "ping", "text": "awake"}))
         mic_ready = False
@@ -3819,22 +3848,29 @@ async def main() -> None:
             mic_ready = mic["state"] == "ready"
         print("ok  mic warms without blocking the socket, then reports ready")
 
-        # Must exceed stt.MIN_SECONDS or transcribe() short-circuits and the model never loads
+    # Exceed the transcription minimum.
         await ws.send(json.dumps({"type": "ptt_start"}))
         assert (await recv(ws))["state"] == "listening"
         await asyncio.sleep(1.5)
         await ws.send(json.dumps({"type": "ptt_end"}))
 
-        assert (await recv(ws))["state"] == "thinking"
-        tr = await recv(ws, timeout=180.0)  # first run downloads the model
-        assert tr["type"] == "transcript", f"expected transcript, got {tr}"
-        await drain_until_idle(ws)
-        if tr["text"] == "…didn't catch that":
+        levels = []
+        while True:
+            event = await recv(ws)
+            if event["type"] == "mic_level":
+                levels.append(event["level"])
+                continue
+            assert event == {"type": "state", "state": "thinking"}, event
+            break
+        assert levels and levels[-1] == 0.0, f"meter did not settle: {levels[-3:]}"
+
+        heard, _, _ = await drain_until_idle(ws)
+        if not heard:
             print("..  push-to-talk mic path reached; live recognition unverified (silence)")
         else:
-            print(f"ok  push-to-talk -> mic -> whisper (heard: {tr['text']!r})")
+            print("ok  push-to-talk -> private transcript -> streamed reply")
 
-        # Typed path exercises the LLM without depending on what the mic heard.
+    # Test the LLM through typed input.
         from mellowd import config
 
         cfg = config.load()
@@ -3851,14 +3887,14 @@ async def main() -> None:
             assert talked, "turn finished without ever entering the talking state"
             print("ok  spoke the reply out loud")
 
-        # Identity, through the real socket and the real model.
+    # Verify identity end to end.
         await ws.send(json.dumps({"type": "text", "text": "what is your name?"}))
         assert (await recv(ws))["state"] == "thinking"
         who, _, _ = await drain_until_idle(ws)
         assert "mellow" in who.lower(), f"model would not answer to mellow: {who!r}"
         print(f"ok  answers to its own name: {who.strip()[:80]}")
 
-        # The turns above must have reached disk, not just the screen.
+    # Confirm turns reached disk.
         import httpx
 
         base = "http://127.0.0.1:8765"  # same sidecar URL points at
@@ -3872,7 +3908,7 @@ async def main() -> None:
         assert said["model"] == cfg["llm"]["model"], said
         print(f"ok  live turns logged ({len(kinds)} events, model {said['model']})")
 
-        # Barge-in: ask for something long, cut it off mid-sentence.
+    # Interrupt a long response.
         if cfg["tts"]["speak"]:
             await ws.send(
                 json.dumps({"type": "text", "text": "count slowly from one to twenty"})

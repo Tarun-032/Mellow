@@ -59,6 +59,15 @@ def run() -> None:
     if not preprocessor.is_file():
         raise RuntimeError("onnx-asr preprocessing data is missing")
     checks["onnx_asr_data"] = preprocessor.name
+    from mellowd.meeting_speakers import session
+    speaker_preprocessor = preprocessor.with_name("wespeaker.onnx")
+    features, lengths = session(speaker_preprocessor).run(None, {
+        "waveforms": np.random.default_rng(4).normal(0, 1000, (1, 16000)).astype(np.float32),
+        "waveforms_lens": np.array([16000], dtype=np.int64),
+    })
+    if features.shape[-1] != 80 or lengths[0] < 90 or not np.isfinite(features).all():
+        raise RuntimeError("packaged speaker feature extraction failed")
+    checks["speaker_preprocessor"] = speaker_preprocessor.name
 
     # GetRootControl constructs the real COM client.
     root = uiautomation.GetRootControl()

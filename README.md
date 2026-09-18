@@ -31,7 +31,7 @@ https://github.com/user-attachments/assets/8cb9e786-4c55-4077-bd6f-3200aedc5f61
 - **Help around the desktop.** Open apps, folders, and websites, play media, or adjust one application's volume.
 - **Write for you.** Put your cursor in any text box, speak, and Mellow types it in. He never presses Enter, so nothing sends until you do.
 - **Keep you on track.** Set reminders and run configurable Pomodoro focus sessions directly from the pet.
-- **Take meeting notes.** Transcribe your microphone and meeting audio, generate structured notes with your chosen answer engine, and export the transcript or notes.
+- **Take meeting notes.** Transcribe your microphone and meeting audio, optionally label the remote speakers separately, generate structured notes with your chosen answer engine, and export the transcript or notes.
 - **Feel alive.** Pet, drag, wake, and watch Mellow react through idle, listening, thinking, talking, sleeping, peeking, and stretching animations.
 - **Look how you like.** Recolour Mellow's coat so he stays easy to see against your wallpaper.
 - **Stay up to date.** Check for new versions and install them without leaving the app.
@@ -157,7 +157,22 @@ Let Mellow handle the transcript while you focus on the conversation. Available 
 4. Mellow puts on his glasses and starts writing. Use the bar above him to pause or resume; its **×** button ends the meeting and saves the transcript. You can also use **Stop & save** in the meeting controls.
 5. When processing finishes, click **View notes**, or open **Settings → Meetings** any time to find the saved meeting.
 
-Transcripts group speech into readable turns. **You** means your microphone; **Other participant** means audio from the selected output, not a separately identified person. Echo cancellation helps reduce speaker audio leaking into the microphone, but headphones can improve clarity. Only start transcription with everyone's permission.
+Transcripts group speech into readable turns. **You** means your microphone; **Other participant** means audio from the selected output. During continuous speech the live text can lag a few seconds behind while Mellow waits for a natural pause to split on; no words are dropped. Echo cancellation helps reduce speaker audio leaking into the microphone, but headphones can improve clarity. Only start transcription with everyone's permission.
+
+### Tell remote speakers apart (experimental)
+
+Mellow can separate the remote voices into **Speaker 1**, **Speaker 2**, and so on, instead of labelling all of them **Other participant**.
+
+Turn it on in **Settings → Meetings** under **Speaker recognition**, with **Label remote speakers (experimental)**. The first time, Mellow downloads two speaker models (about 35 MB) and shows the progress there; until they are ready, meetings record with the usual source labels. The switch can only be changed between meetings.
+
+- Only the remote audio is separated. Your microphone stays **You**.
+- Labels appear while recording and are revised when you stop, so a label can change once the meeting finishes.
+- Speech that overlaps or stays uncertain remains **Other participant**.
+- Everything runs on your computer, and the voice measurements are discarded when the meeting ends.
+
+After a meeting, click a speaker label in the transcript to open the speaker editor. Give the speaker a **Name**, choose **Same person as…** and **Combine speakers** to merge two labels, or **Separate this speaker** to undo that. Giving two speakers the same name does not combine them, and combining is reversible. Regenerate existing notes after renaming or combining so the notes use the new labels.
+
+This is experimental and off by default: its accuracy has not been measured against annotated real meetings yet, so check the labels before relying on them.
 
 ### Generate structured notes
 
@@ -193,7 +208,7 @@ The first public binaries are not code-signed, so Windows SmartScreen may ask yo
 
 ## Privacy model
 
-For voice input, Mellow can keep the microphone open while awake to maintain a short pre-roll buffer; push-to-talk selects the audio to transcribe. A meeting you explicitly start captures your microphone and the selected system output, with local echo cancellation to reduce speaker playback in the microphone. Audio stays in memory; saved meetings contain transcripts and notes, not recordings. Cloud transcription sends audio to your selected speech provider. Screen capture is request-driven and can be disabled in Settings.
+For voice input, Mellow can keep the microphone open while awake to maintain a short pre-roll buffer; push-to-talk selects the audio to transcribe. A meeting you explicitly start captures your microphone and the selected system output, with local echo cancellation to reduce speaker playback in the microphone. Audio stays in memory; saved meetings contain transcripts and notes, not recordings. Cloud transcription sends audio to your selected speech provider. Optional speaker labelling runs entirely on your computer; the voice measurements it compares are discarded when the meeting ends and are never stored with the transcript. Screen capture is request-driven and can be disabled in Settings.
 
 - **Local mode:** supported inference runs on the computer. No API key is required.
 - **Cloud mode:** only the data needed for the selected feature is sent to the provider you configure.
