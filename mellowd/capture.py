@@ -125,6 +125,8 @@ def wants_pointing(text: str) -> bool:
         return False
     if ERRAND_RE.search(text):
         return True
+    if re.search(r"\bwalk\s+me\s+through\b", text, _F):
+        return True
     if CONTROL_RE.search(text) and ASK_RE.search(text):
         return True
     # "how do i export this" — being walked through something

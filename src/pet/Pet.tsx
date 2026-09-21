@@ -94,6 +94,7 @@ export default function Pet() {
     speak,
     reminder,
     point,
+    guideWaiting,
     // Socket timer request.
     timer: asked,
     send,
@@ -452,7 +453,7 @@ export default function Pet() {
   // Clear completed exchanges.
   useEffect(() => {
     // Idle follows playback.
-    if (state !== "idle" || !said || alert) return;
+    if (state !== "idle" || !said || alert || guideWaiting) return;
     if (spokeThisTurn.current) {
       pointed.current = false;
       spokeThisTurn.current = false;
@@ -469,7 +470,7 @@ export default function Pet() {
     );
     return () => clearTimeout(reading);
     // Points restart the timer.
-  }, [state, said, alert, pointing, point, clear]);
+  }, [state, said, alert, pointing, point, clear, guideWaiting]);
 
   const shown = meetingActive ? "writing" :
     motion.earTwitch &&

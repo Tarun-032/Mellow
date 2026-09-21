@@ -4,6 +4,8 @@ import asyncio
 import logging
 import re
 from contextlib import suppress
+from dataclasses import dataclass
+from typing import Awaitable, Callable
 from urllib.parse import quote
 
 import httpx
@@ -256,13 +258,19 @@ def backend(cfg: dict | None = None) -> str:
 LOOKAHEAD = 2
 
 
+@dataclass
+class _Beat:
+    text: str
+    before: Callable[[], Awaitable[bool]]
+
+
 class Speaker:
     """Speech for one WebSocket connection."""
 
     def __init__(self, ws, send) -> None:
         self._ws = ws
         self._send = send
-        self._queue: asyncio.Queue[str | None] = asyncio.Queue()
+        self._queue: asyncio.Queue[str | _Beat | None] = asyncio.Queue()
         self._task: asyncio.Task | None = None
         self._talking = False
 
@@ -274,6 +282,15 @@ class Speaker:
     async def speak(self, text: str) -> None:
         if text := clean_for_speech(text):
             await self._queue.put(text)
+
+    async def speak_beat(self, text: str, before: Callable[[], Awaitable[bool]]) -> None:
+        """Prebuffer speech, but verify/move its pointer only at playback time.
+
+        Returning False from `before` ends the sequence without playing this
+        clip or any later one. The ordinary sentence pipeline is unchanged.
+        """
+        if text := clean_for_speech(text):
+            await self._queue.put(_Beat(text, before))
 
     async def finish(self) -> None:
         """Wait until every queued sentence has actually finished playing."""
@@ -312,22 +329,26 @@ class Speaker:
     async def _fetch(self, clips: asyncio.Queue) -> None:
         """Text in, audio out. Blocks on `clips` once the lookahead is full."""
         while True:
-            text = await self._queue.get()
-            if text is None:
+            item = await self._queue.get()
+            if item is None:
                 await clips.put(None)
                 return
+            text = item.text if isinstance(item, _Beat) else item
+            before = item.before if isinstance(item, _Beat) else None
             # Before the synth, not after. Locally that was a 30ms difference nobody could see
             if not self._talking:
                 self._talking = True
                 await self._send(self._ws, type="state", state="talking")
-            await clips.put(await asyncio.to_thread(synth, text))
+            await clips.put((await asyncio.to_thread(synth, text), before))
 
     async def _play(self, clips: asyncio.Queue) -> None:
         while True:
             clip = await clips.get()
             if clip is None:
                 return
-            samples, rate = clip
+            (samples, rate), before = clip
+            if before is not None and not await before():
+                return
             await asyncio.to_thread(self._submit, samples, rate)
 
     @staticmethod

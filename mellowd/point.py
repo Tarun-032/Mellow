@@ -642,6 +642,11 @@ def _display(name: str, source: str) -> str:
 
 def _fit(name: str, kind: str = "", source: str = "ocr") -> bool:
     """Could this be a thing you click, or is it prose, or is it noise?"""
+    # UIA already identifies an interactive control. Its accessible name can
+    # legitimately be "To", "From", "On", or a single character; OCR's word
+    # noise filter must not erase real form fields and toggle buttons.
+    if source == "uia" and kind in INTERACTIVE.values():
+        return bool(name.strip())
     words = squash(name)
     return (
         len(words) >= 2

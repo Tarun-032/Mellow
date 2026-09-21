@@ -110,7 +110,7 @@ def record_agent(*, provider, purpose, transport, prompt_bytes, image_bytes,
 
 
 def record_pointer(*, outcome: str, candidates: int = 0, measured: int = 0,
-                   source: str = "") -> None:
+                   source: str = "", step: int = 0) -> None:
     """Attach target-selection metadata without screen text or coordinates."""
     turn = _current.get()
     if not turn:
@@ -122,6 +122,9 @@ def record_pointer(*, outcome: str, candidates: int = 0, measured: int = 0,
     }
     if source:
         row["source"] = source
+    # Absent on a one-bone turn, so existing rows keep their shape.
+    if step:
+        row["step"] = int(step)
     with turn.lock:
         if not turn.closed:
             turn.pointer.append(row)

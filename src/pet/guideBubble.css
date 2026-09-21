@@ -83,7 +83,9 @@ body,
 .guide-dialogue__text {
   display: flex;
   max-height: 11.6em;
-  overflow-y: hidden;
+  /* Beats accumulate into one paragraph; column-reverse clips the
+     oldest text, so the tail stays visible and older lines scroll. */
+  overflow-y: auto;
   overflow-wrap: break-word;
   flex-direction: column-reverse;
   color: var(--ink);

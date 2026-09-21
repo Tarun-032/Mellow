@@ -21,6 +21,7 @@ export type WritingStatus = {
 
 type Incoming =
   | WritingStatus
+  | { type: "guide"; waiting: boolean }
   | { type: "state"; state: PetState }
   | { type: "microphone"; state: MicrophoneState }
   | { type: "mic_level"; level: number }
@@ -57,6 +58,7 @@ export function useSocket() {
   const [reminder, setReminder] = useState("");
   // Current point target.
   const [point, setPoint] = useState<Point | null>(null);
+  const [guideWaiting, setGuideWaiting] = useState(false);
   // Spoken pomodoro request.
   const [timer, setTimer] = useState<{ action: "start" | "stop"; minutes: number | null; n: number } | null>(null);
   const ws = useRef<WebSocket | null>(null);
@@ -109,6 +111,9 @@ export function useSocket() {
       sock.onmessage = async (e) => {
         const msg: Incoming = JSON.parse(e.data);
         switch (msg.type) {
+          case "guide":
+            setGuideWaiting(msg.waiting);
+            break;
           case "writing":
             setWriting(msg.status === "idle" ? null : msg);
             break;
@@ -187,6 +192,7 @@ export function useSocket() {
         setMicLevel(0);
         // Clear disconnected guides.
         setPoint(null);
+        setGuideWaiting(false);
         if (!disposed) timer = setTimeout(connect, 1000);
       };
     };
@@ -246,6 +252,7 @@ export function useSocket() {
     speak,
     reminder,
     point,
+    guideWaiting,
     timer,
     send,
     clear,

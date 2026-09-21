@@ -12,7 +12,7 @@ from dataclasses import dataclass, replace
 
 from PIL import Image, ImageDraw, ImageFont
 
-from mellowd import agents, llm, perf, point
+from mellowd import agents, guide, llm, perf, point
 
 log = logging.getLogger(__name__)
 
@@ -41,14 +41,34 @@ _REGION = re.compile(r"\[?(?:REGION|CELL)\s*:\s*(none|[EC]?\s*\d+)\]?", re.IGNOR
 _TARGET = re.compile(r"\[?TARGET\s*:\s*(none|[EG]\s*\d+)\]?", re.IGNORECASE)
 
 
+# One frame, one call: every step that carries a control has to be visible and
+# boundable on this screenshot, so the cap is about what a screen can hold
+# rather than how long a task is.
+MAX_STEPS = 3
+# Beats include narration, which costs no screen room - an opening line and a
+# handover on top of the bones. Caps count bones; this only bounds the parse.
+MAX_BEATS = MAX_STEPS + 2
+
+
 @dataclass
 class GroundedResult:
     target: point.Target | None
     answer: str
+    # The whole narration in order, each beat prose plus an optional target; a
+    # beat with no target moves no bone. `target`/`answer` are the first beat
+    # that carries one, repeated here because answer() verifies, relocates or
+    # replaces that target long after the model has spoken. Empty for the
+    # ordinary one-bone turn, which is most of them.
+    beats: tuple[tuple[point.Target | None, str], ...] = ()
+    continuation: guide.Continuation | None = None
 
 
 class InvalidGrounding(ValueError):
     """The combined API response needs the original strict locator fallback."""
+
+
+class InvalidGuidePlan(ValueError):
+    """Do not silently turn an incomplete walkthrough into generic speech."""
 
 
 def _json_result(text: str) -> dict | None:
@@ -77,6 +97,28 @@ def _json_result(text: str) -> dict | None:
     return None
 
 
+def _steps(raw: str) -> list[dict]:
+    """The result as ordered step objects, nested or flat.
+
+    Claude runs without the CLI schema flag, so it can still answer with the
+    bare object the schema used to require; that is one step.
+    """
+    parsed = _json_result(raw)
+    if not parsed:
+        return []
+    found = parsed.get("steps")
+    if isinstance(found, list):
+        steps = []
+        for step in found[:MAX_BEATS]:
+            if not isinstance(step, dict):
+                # Truncate rather than skip: dropping a malformed entry would
+                # promote the step after it and show them out of order.
+                break
+            steps.append(step)
+        return steps
+    return [parsed]
+
+
 def _bare_choice(text: str, stage: str) -> str | None:
     """Normalize strict, bracketed, and bare locator tokens."""
     raw = text.strip()
@@ -102,7 +144,13 @@ def _grounded_fields(
     valid: set[str],
 ) -> tuple[str | None, str]:
     parsed = _json_result(raw)
-    if parsed and not isinstance(parsed.get("answer"), str):
+    # A sequence owns its prose in `beats`. Providers legitimately omit the
+    # unused answer field; rejecting that discarded every beat and invoked the
+    # legacy one-pointer fallback. Still reject a malformed supplied answer.
+    if parsed and (
+        ("answer" in parsed and not isinstance(parsed["answer"], str))
+        or ("answer" not in parsed and not _cloud_beats(raw))
+    ):
         return None, ""
     if parsed and "selection_kind" in parsed and "selection_index" in parsed:
         kind = str(parsed.get("selection_kind") or "").lower()
@@ -129,28 +177,90 @@ def _grounded_fields(
 
 
 def _schema(valid: list[str] | None = None) -> dict:
-    del valid
-    return {
+    sequence = valid is None or any(value.startswith("C") for value in valid)
+    schema = {
         "type": "object",
         "properties": {
+            "continue_after": {"anyOf": [guide.SCHEMA, {"type": "null"}]},
             "selection_kind": {
                 "type": "string",
                 "enum": ["none", "element", "cell"],
             },
             "selection_index": {"type": "integer", "minimum": 0},
             "answer": {"type": "string"},
+            # The whole reply as ordered beats, first control included. Present
+            # only for a sequence, and then `answer` is unused: one field per
+            # meaning, because a field that is both "the whole reply" and "the
+            # first line of it" gets written as the whole reply and then
+            # repeated beat by beat.
+            #
+            # Measured elements only; an unresolved cell is not a hitbox.
+            "beats": {
+                "type": "array",
+                "minItems": 2,
+                "maxItems": MAX_BEATS,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        # Zero is a narration beat: prose with no control, which
+                        # is how a handover or a connective gets written without
+                        # a hardcoded closing line.
+                        "selection_index": {"type": "integer", "minimum": 0},
+                        "answer": {"type": "string"},
+                    },
+                    "required": ["selection_index", "answer"],
+                    "additionalProperties": False,
+                },
+            },
         },
-        "required": ["selection_kind", "selection_index", "answer"],
+        "required": ["continue_after", "selection_kind", "selection_index"],
+        "anyOf": [{"required": ["answer"]}, {"required": ["beats"]}],
         "additionalProperties": False,
     }
+    if not sequence:
+        del schema["properties"]["beats"]
+        del schema["anyOf"]
+        schema["required"].append("answer")
+    elif valid is not None:
+        schema["properties"]["beats"]["items"]["properties"]["selection_index"]["enum"] = [
+            0, *(int(value[1:]) for value in valid if value.startswith("E"))
+        ]
+    return schema
 
 
-AGENT_SCHEMA = {
+def _cloud_beats(raw: str) -> list[dict]:
+    """Every beat of a cloud sequence, in order, or nothing.
+
+    Index zero is narration. A list shorter than two beats is not a sequence,
+    so it falls back to `answer`, which keeps each field to one job: `answer` is
+    the whole reply, `beats` is the whole reply split up, and never both.
+
+    Truncates at the first malformed entry for the same reason `_steps` does:
+    skipping one would promote the beat after it into a position the model never
+    chose for it.
+    """
+    parsed = _json_result(raw)
+    found = parsed.get("beats") if parsed else None
+    if not isinstance(found, list):
+        return []
+    beats = []
+    for beat in found[:MAX_BEATS]:
+        if not isinstance(beat, dict):
+            break
+        index = _whole(beat.get("selection_index"))
+        answer = str(beat.get("answer") or "").strip()
+        if index is None or index < 0 or not answer:
+            break
+        beats.append({"index": index, "answer": answer})
+    return beats if len(beats) >= 2 else []
+
+
+_STEP_SCHEMA = {
     "type": "object",
     "properties": {
         "selection_kind": {
             "type": "string",
-            "enum": ["none", "element", "visual"],
+            "enum": ["none", "say", "element", "visual"],
         },
         "selection_index": {"type": "integer", "minimum": 0},
         "visual_left": {"type": "integer", "minimum": 0, "maximum": 1000},
@@ -167,12 +277,29 @@ AGENT_SCHEMA = {
     "additionalProperties": False,
 }
 
+# The field names inside a step are exactly what the flat object used to carry,
+# so _agent_target and _agent_spoken read a step without knowing about steps.
+AGENT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "continue_after": {"anyOf": [guide.SCHEMA, {"type": "null"}]},
+        "steps": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": MAX_BEATS,
+            "items": _STEP_SCHEMA,
+        },
+    },
+    "required": ["steps", "continue_after"],
+    "additionalProperties": False,
+}
+
 
 # One prepared locator worker, one turn per pointer. Codex receives AGENT_SCHEMA
 # per turn; Claude is prepared without the CLI schema flag because that flag
 # withholds the whole answer until the process exits. The returned JSON passes
 # the same local validator either way.
-agents.register_profile("locator", agents.VISUAL_LOCATOR_SYSTEM, None)
+agents.register_profile("locator", agents.VISUAL_LOCATOR_TEMPLATE, None)
 
 
 def _font(size: int):
@@ -225,7 +352,7 @@ def coarse_image(
             draw.text((x, y), text, font=face, fill=(255, 255, 255, 255), stroke_width=1, stroke_fill=(0, 0, 0, 255))
 
     # Put the small set of lexically relevant measured elements directly on the overview.
-    available = [c for c in (candidates or []) if c.bounds]
+    available = [c for c in (candidates or []) if c.bounds and c.enabled and c.visible]
     matched = sorted(
         (c for c in available if c.score > 0),
         key=lambda c: (-c.score, c.chrome, c.source != "uia"),
@@ -239,7 +366,23 @@ def coarse_image(
             c.bounds[3] * c.bounds[2],
         ),
     )
-    measured = (matched + context)[:24]
+    # Unnamed / short-labelled inputs seldom share the words of a task. Reserve
+    # space for actual form fields before filling with inbox rows or headings.
+    # This is structural, not an email-specific synonym or screen coordinate.
+    fields = sorted(
+        (c for c in available if c.source == "uia" and not c.chrome
+         and c.kind in {"text box", "dropdown"}),
+        key=lambda c: (-c.score, c.bounds[1], c.bounds[0]),
+    )[:8]
+    measured = []
+    for cand in fields + matched + sorted(context, key=lambda c: (
+        not bool(c.kind), c.source != "uia", c.bounds[1], c.bounds[0],
+    )):
+        if cand in measured or any(point._same_place(cand, prior) for prior in measured):
+            continue
+        measured.append(cand)
+        if len(measured) >= 40:
+            break
     tag_face = _font(max(13, round(max(image.size) / 75)))
     native_w = pixels.shape[1]
     scale = image.width / native_w
@@ -464,7 +607,8 @@ def _agent_target(raw: str, shot, measured: list[point.Target], candidates: list
     Rejections name their reason (invalid_json, invalid_kind, invalid_index,
     invalid_box) so a withheld pointer can be diagnosed from telemetry alone.
     """
-    parsed = _json_result(raw)
+    # A step of a sequence arrives already parsed; a whole reply does not.
+    parsed = raw if isinstance(raw, dict) else _json_result(raw)
     if not parsed:
         return None, "invalid_json"
     kind = str(parsed.get("selection_kind") or "").strip().lower()
@@ -483,8 +627,11 @@ def _agent_target(raw: str, shot, measured: list[point.Target], candidates: list
     ]
     # How a visual pick was reached, so a wrong bone can be traced to its path.
     via = "visual"
-    if kind == "none":
-        return None, "none"
+    if kind in ("none", "say"):
+        # "none" is a refusal; "say" is a narration beat that deliberately
+        # carries no control. Both have no target, and the caller tells them
+        # apart by the reason - a refusal ends the turn, narration does not.
+        return None, kind
     if kind == "element" and (index is None or not 1 <= index <= len(measured)):
         # A row number that does not exist, but the box may still be right:
         # judge the box, which is validated and snapped like any visual pick.
@@ -596,21 +743,29 @@ def pointer_reply(target: point.Target) -> str:
     return f"The highlighted {kind} is the control you want."
 
 
-def _agent_spoken(raw: str, target: point.Target | None) -> str:
-    """Return a short private spoken instruction, never a raw control label."""
-    if target is None:
-        return ""
-    parsed = _json_result(raw) or {}
+def _agent_spoken(raw: str, target: point.Target | None, floor: int = 4) -> str:
+    """Return a short private spoken instruction, never a raw control label.
+
+    A narration beat has no control to fall back to, so a line that fails the
+    gate is dropped rather than replaced with the canned pointer reply, which
+    would read as a non sequitur in the middle of one explanation.
+
+    `floor` is the word minimum. Four for a lone or leading bone, whose line has
+    to stand on its own; three for a later beat, where "then drag it" is a
+    connective by design. Three still catches "click here" and "right here",
+    which is what the gate is actually for.
+    """
+    parsed = (raw if isinstance(raw, dict) else _json_result(raw)) or {}
     answer = " ".join(str(parsed.get("spoken_answer") or "").split()).strip()
     if (
         len(answer) < 3
-        or len(answer.split()) < 4
+        or len(answer.split()) < floor
         or len(answer) > 180
         or _PRIVATE_SPOKEN.search(answer)
         or "```" in answer
         or re.search(r"\[(?:look|point|do|region|target)\b", answer, re.IGNORECASE)
     ):
-        return pointer_reply(target)
+        return pointer_reply(target) if target is not None else ""
     return answer
 
 
@@ -620,21 +775,71 @@ _EARLY_FIELD = re.compile(r'"(selection_kind|selection_index|visual_left|visual_
                           r'\s*:\s*("[^"]*"|-?\d+(?:\.\d+)?)\s*[,}]')
 
 
-def early_choice(text: str) -> str | None:
-    """The model's choice as JSON once all six selection fields have arrived.
+def _step_spans(text: str) -> list[tuple[int, int]]:
+    """Character ranges of each step object in a partial `steps` array.
 
-    The spoken sentence is written after them and takes about half the reply, so
-    the bone need not wait for it. Returns None until the choice is complete, and
-    for "none", which has nothing to show early.
+    Boundaries come from brace depth rather than from a field repeating, so a
+    reordered object cannot make two beats' fields look like one. The final span
+    is usually unterminated, which is the point: its selection fields have
+    arrived while its prose is still being written.
     """
-    fields = {name: json.loads(value) for name, value in _EARLY_FIELD.findall(text)}
-    if len(fields) < 6 or str(fields["selection_kind"]).strip().lower() not in {"element", "visual"}:
-        return None
-    return json.dumps(fields)
+    start = text.find('"steps"')
+    if start < 0:
+        # A bare object (Claude without the schema flag) is one step.
+        return [(0, len(text))] if text.strip() else []
+    spans: list[tuple[int, int]] = []
+    depth, opened, in_string, escaped = 0, -1, False, False
+    for index in range(text.find("[", start) + 1 or len(text), len(text)):
+        char = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            if depth == 0:
+                opened = index
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0 and opened >= 0:
+                spans.append((opened, index + 1))
+                opened = -1
+        elif char == "]" and depth == 0:
+            break
+    if opened >= 0:
+        spans.append((opened, len(text)))
+    return spans
+
+
+def early_choice(text: str) -> str | None:
+    """The first beat carrying a bone, as JSON, once its six fields have arrived.
+
+    Fires while `spoken_answer` is still streaming - that is the whole ~700ms
+    win, because the prose is written last and is about half the reply. A `say`
+    or `none` beat has nothing to show, so the scan moves to the next beat
+    rather than stopping; an opening narration beat must not cost the early bone.
+    """
+    for start, end in _step_spans(text):
+        fields = {
+            name: json.loads(value)
+            for name, value in _EARLY_FIELD.findall(text[start:end])
+        }
+        if len(fields) < 6:
+            continue
+        if str(fields["selection_kind"]).strip().lower() in {"element", "visual"}:
+            return json.dumps(fields)
+    return None
 
 
 async def _visual_agent_locate_and_answer(
-    query: str, shot, cfg: dict, candidates: list[point.Target], on_choice=None
+    query: str, shot, cfg: dict, candidates: list[point.Target],
+    messages: list[dict] | None = None, on_choice=None,
 ) -> GroundedResult:
     image, measured = agent_image(shot.pixels, candidates, shot.monitor)
     # Each row carries the box in the same 0-1000 space the answer must use.
@@ -650,8 +855,17 @@ async def _visual_agent_locate_and_answer(
         f'{"|expands" if candidate.expands else ""}'
         for index, candidate in enumerate(measured, 1)
     ) or "(no measured controls)"
+    # Persona lives in the system prompt, which is stable so the warm worker
+    # still matches. The conversation varies per turn, so it rides here.
+    prior = agents.history_prose(
+        agents.select_history(
+            list(messages or []) + [{"role": "user", "content": query}],
+            str(cfg["llm"].get("agent_speed") or "fast"),
+        )
+    )
     prompt = (
-        f'User request: "{query}"\n'
+        (prior + "\n\n" if prior else "")
+        + f'User request: "{query}"\n'
         "Every coordinate you read or write is 0-1000 across the full image "
         "width and 0-1000 down its full height. Never answer in image pixels.\n"
         "The image is the complete current screen. Magenta E boxes are measured "
@@ -660,7 +874,8 @@ async def _visual_agent_locate_and_answer(
         "best visible next control. If the requested item is not visible, choose "
         "the visible control that reveals it where that item belongs - usually a "
         "More, Show more or expand control in the list or group the item would be "
-        "in - and say that it reveals the item. A row marked expands opens its own "
+        "in - and name the final item in that step's spoken_answer, such as "
+        "'open File and pick Export in there'. A row marked expands opens its own "
         "menu, so choose one only when the item is a command in that menu. Never "
         "name or bound a control that is not visible on this screen. "
         "Otherwise choose visual and tightly bound the visible control using "
@@ -675,9 +890,22 @@ async def _visual_agent_locate_and_answer(
         "spoken_answer. For an element, copy that row's four bounds exactly into "
         "the visual fields, so the two selections can be checked against each "
         "other. Set selection_index to zero for visual or none, and set visual "
-        "coordinates to zero only for none. Return exactly one "
-        "JSON object with these fields: selection_kind, selection_index, "
-        "visual_left, visual_top, visual_right, visual_bottom, spoken_answer.\n"
+        "coordinates to zero only for none. "
+        f"Return up to {MAX_STEPS} steps whenever the request covers more than one "
+        "control: a task with several visible steps (\"how do I start editing\"), or "
+        "several things asked for together (\"show me the source control, the audio "
+        "mixer and the record button\", \"the three settings I need to change\"). "
+        "Return exactly one step when the request names a single control "
+        "(\"where is Export\"). Every step must be a control that is visible and can "
+        "be bounded on this screen right now; never add a step for something that "
+        "only appears after an earlier step is used, and never point twice at the "
+        "same control. Each step's spoken_answer is one sentence about that step's "
+        "control alone, in the order given - 'first...', 'then...'; never list the "
+        "other steps' controls in it, because each sentence is said while the "
+        "pointer is on its own control. Return exactly one JSON object, "
+        '{"steps": [ ... ]}, each step having these fields: selection_kind, '
+        "selection_index, visual_left, visual_top, visual_right, visual_bottom, "
+        "spoken_answer.\n"
         f"Measured controls:\n{listing}"
     )
     early: list[point.Target] = []
@@ -695,11 +923,17 @@ async def _visual_agent_locate_and_answer(
         raw = await agents.complete_grounded(
             prompt, cfg, image, [], AGENT_SCHEMA, on_text=on_text
         )
-    target, outcome = _agent_target(raw, shot, measured, candidates)
+    # A reply that did not parse into steps still goes through as raw text, so
+    # _agent_target reports why (invalid_json) rather than silently finding none.
+    beats, outcome = _beats(_steps(raw) or [raw], shot, measured, candidates)
+    bones = [step for step, _ in beats if step is not None]
+    target = bones[0] if bones else None
     if target is None and early:
         # The choice validated while streaming but the finished reply did not
         # parse, usually a broken sentence. The bone may already be up; keep it.
         target, outcome = early[0], "early_choice"
+        beats = ((target, pointer_reply(target)),)
+        bones = [target]
     perf.mark("locator." + outcome)
     perf.record_pointer(
         outcome=outcome,
@@ -710,8 +944,124 @@ async def _visual_agent_locate_and_answer(
     log.info("agent locator result: %s from %d measured controls", outcome, len(measured))
     if target is None:
         return GroundedResult(None, "")
-    answer = _agent_spoken(raw, target) if outcome != "early_choice" else pointer_reply(target)
-    return GroundedResult(target, answer)
+    answer = next(words for step, words in beats if step is target)
+    if len(bones) > 1:
+        # Unique per turn, because Turn.mark keeps only the first of a name.
+        perf.mark(f"pointer_steps_{len(bones)}")
+        log.info("agent locator returned %d bones in %d beats", len(bones), len(beats))
+    # One beat is the ordinary turn: keep its shape byte-identical to before.
+    continuation = guide.parse((_json_result(raw) or {}).get("continue_after"))
+    if continuation and continuation.after_bone != len(bones):
+        continuation = None
+    return GroundedResult(target, answer, beats if len(beats) > 1 else (), continuation)
+
+
+def _beats(
+    steps: list[dict],
+    shot,
+    measured: list[point.Target],
+    candidates: list[point.Target],
+) -> tuple[tuple[tuple[point.Target | None, str], ...], str]:
+    """Every step as (target or None, prose), plus the first bone's outcome.
+
+    Each bone goes through the same gauntlet as a lone pointer - element/visual
+    agreement, enabled, visible, owning window, whole-pane guard, UIA snapping -
+    against the one frame they were all chosen on. A `say` step is narration: no
+    target, no pointer row, and it does not consume a bone slot or advance the
+    step numbering, so latency.jsonl keeps counting bones the way latency.md
+    says it does.
+
+    Stops at the first bad or repeated bone rather than skipping it: once the
+    chain is broken a later step no longer follows from what the user has been
+    shown, and a repeat is a bone that does not move.
+
+    ponytail: a model can still invent a plausible in-window box for a control
+    that is not there, and it will snap to whatever sits at those coordinates.
+    The prompt, the whole-pane guard, the bone cap and the distinct-box rule are
+    the only brakes. Requiring `element` for later bones would close it, but a
+    video editor's timeline is a canvas with no UIA row, which is the case this
+    feature exists for. The per-step pointer rows are the evidence.
+    """
+    beats: list[tuple[point.Target | None, str], ] = []
+    bones: list[point.Target] = []
+    first = "invalid_json"
+    for step in steps:
+        target, outcome = _agent_target(step, shot, measured, candidates)
+        if outcome == "say":
+            # Narration: the prose is the whole payload, so a line that fails
+            # the gate is dropped rather than replaced with a canned pointer
+            # reply that would read as a non sequitur mid-explanation.
+            if words := _agent_spoken(step, None, floor=3):
+                beats.append((None, words))
+            continue
+        if not bones:
+            # The caller records and marks the first bone, so a one-bone turn's
+            # telemetry keeps exactly the shape it has always had.
+            first = outcome
+        else:
+            perf.record_pointer(
+                outcome=outcome,
+                candidates=len(candidates),
+                measured=len(measured),
+                source=target.source if target is not None else "",
+                step=len(bones) + 1,
+            )
+        if target is None or any(point._same_place(target, b) for b in bones):
+            break
+        if len(bones) >= MAX_STEPS:
+            # The cap is reached. That is a limit, not a failure, so keep
+            # reading: a handover beat after the last bone still belongs.
+            continue
+        beats.append((target, _agent_spoken(step, target, floor=4 if not bones else 3)))
+        bones.append(target)
+    return tuple(beats), first
+
+
+def narration(result: GroundedResult, target, answer: str):
+    """The beats to speak, with the model's first bone swapped for the verified one.
+
+    answer() relocates, replaces or withholds that target long after the model
+    wrote the sentences around it. Swap by position of the first beat carrying a
+    target rather than by object identity: identity aliases badly if `aimed` is
+    ever mutated in place, and the failure mode there is a bone on one control
+    while the words describe another.
+    """
+    if target is None:
+        return ()
+    if not answer and result.continuation and result.continuation.after_bone == 1:
+        answer = result.continuation.instruction
+    if not answer:
+        return ()
+    def finished(beats):
+        out = list(beats)
+        continuation = result.continuation
+        bones = [i for i, (step, _) in enumerate(out) if step is not None]
+        if continuation and continuation.instruction and continuation.after_bone == len(bones):
+            # Remaining work is planning data, not speech at this target. Even
+            # if `answer` summarizes the whole task, speak only this boundary's
+            # model-written instruction and drop any premature trailing prose.
+            boundary = bones[-1]
+            out = out[:boundary + 1]
+            out[-1] = (out[-1][0], continuation.instruction)
+        target, words = out[-1]
+        # A validated prefix may end before the model's final beat. Repair its
+        # terminal punctuation only; the wording and conclusion stay model-owned.
+        words = words.rstrip()
+        if not re.search(r'[.!?][\"\u201d\u2019]*$', words):
+            words = words.rstrip(",;: \u2014-") + "."
+        out[-1] = (target, words)
+        return tuple(out)
+    if result.target is None or not result.beats:
+        return finished(((target, answer),))
+    swapped = False
+    out = []
+    for step, words in result.beats:
+        if step is not None and not swapped:
+            out.append((target, answer))
+            swapped = True
+        else:
+            out.append((step, words))
+    return finished(out if swapped else ((target, answer),))
 
 
 async def _call(cfg: dict, prompt: str, image: bytes) -> str:
@@ -785,7 +1135,7 @@ async def locate(
         "If the requested item is hidden, choose the visible menu, expander, or parent control that reveals it and explain that next step. "
         "A browser URL or browser tab is not an in-page/app command. For 'start a new chat', choose the New button inside the app, not a tab, URL, or existing Chat mode. "
         "For profile/account/avatar requests, choose the username, avatar, or account menu inside the site/app; never choose browser controls such as Ask Gemini or the browser profile. "
-        "For an icon, choose its measured element or the cell containing the icon. If no visible control answers the request, return [REGION:none]."
+        "For an icon, choose its measured element or the cell containing the icon. Choose none only when no visible control answers the request."
     )
     picked = await _strict(cfg, coarse_prompt, coarse, _REGION)
     log.info("locator overview returned %s from %d measured elements", picked, len(overview))
@@ -870,7 +1220,7 @@ async def _agent_pick(
     messages: list[dict],
     valid: list[str],
     stage: str,
-) -> tuple[str | None, str]:
+) -> tuple[str | None, str, list[dict], guide.Continuation | None]:
     """Structured selection; API failures fall back to the strict locator."""
     schema = _schema(valid)
     valid_set = {value.upper() for value in valid}
@@ -879,29 +1229,133 @@ async def _agent_pick(
     # Subscription CLIs have high process startup cost. Structured schema output
     # gets one attempt; invalid output is withheld instead of paying for another
     # process and risking a guessed target.
-    for attempt in range(1):
-        asked = prompt + (
-            "\nReturn selection_kind=element with the E number, "
-            "selection_kind=cell with the C/G number, or "
-            "selection_kind=none with selection_index=0."
+    asked = prompt + (
+        "\nReturn selection_kind=element with the E number, "
+        "selection_kind=cell with the C/G number, or "
+        "selection_kind=none with selection_index=0."
+    )
+    with perf.purpose("locator_overview" if stage == "coarse" else "locator_refinement"), perf.span("grounded_locator"):
+        complete = agents.complete_grounded if agent else llm.complete_grounded
+        raw = await complete(asked, cfg, image, messages, schema)
+    if agent:
+        choice, answer = _grounded_fields(raw, stage, valid_set)
+    else:
+        choice, answer = _grounded_fields(raw, stage, valid_set)
+        if choice is None:
+            parsed = _json_result(raw)
+            # Metadata only: distinguish format loss from target rejection
+            # without retaining screen text or model prose in diagnostics.
+            reason = "invalid_json" if parsed is None else (
+                "invalid_answer" if "answer" in parsed and not isinstance(parsed["answer"], str)
+                else "invalid_selection"
+            )
+            perf.record_pointer(outcome=reason)
+            raise InvalidGrounding("selection is not an offered element or cell")
+        if re.search(r"\[(?:look|point|do|region|target)\b", answer, re.I):
+            answer = ""  # Resolve speech separately; never expose control tokens.
+    if choice:
+        # Only the coarse pass offers the whole screen's elements, so only it
+        # can name later steps; a refinement crop has already committed.
+        parsed = _json_result(raw) or {}
+        cloud_beats = _cloud_beats(raw) if stage == "coarse" else []
+        # A continuation always pauses after this segment's final bone. Derive
+        # its ordinal from the sequence instead of trusting an E element index
+        # in after_bone. The resolved sequence is checked again before arming.
+        boundary = min(MAX_STEPS, sum(1 for beat in cloud_beats if beat["index"])) or 1
+        continuation = guide.parse(parsed.get("continue_after"), after_bone=boundary if not agent else None)
+        valid_decision = "continue_after" in parsed and (
+            parsed["continue_after"] is None or (continuation is not None and bool(continuation.instruction))
         )
-        if attempt:
-            asked += "\nThe previous selection was invalid. Choose one value from the schema enum."
-        with perf.purpose("locator_overview" if stage == "coarse" else "locator_refinement"), perf.span("grounded_locator"):
-            complete = agents.complete_grounded if agent else llm.complete_grounded
-            raw = await complete(asked, cfg, image, messages, schema)
-        if agent:
-            choice, answer = _grounded_fields(raw, stage, valid_set)
-        else:
-            choice, answer = _grounded_fields(raw, stage, valid_set)
-            if choice is None:
-                raise InvalidGrounding("selection is not an offered element or cell")
-            if re.search(r"\[(?:look|point|do|region|target)\b", answer, re.I):
-                answer = ""  # Resolve speech separately; never expose control tokens.
-        if choice:
-            return choice, answer
-        log.info("structured agent locator output did not parse: %r", raw[:240])
-    return None, "" if agent else answer
+        if not agent and not valid_decision:
+            perf.mark("guide_decision_repair")
+            # Repair only the rejected metadata. Repeating the whole
+            # locator previously made the same malformed plan twice and
+            # could replace an otherwise correct control or narration.
+            repair_schema = {
+                "type": "object",
+                "properties": {"continue_after": schema["properties"]["continue_after"]},
+                "required": ["continue_after"], "additionalProperties": False,
+            }
+            with perf.purpose("guide_plan_repair"):
+                fixed = _json_result(await llm.repair_continuation(
+                    prompt + f"\nThe current segment has {boundary} pointed control(s). "
+                    f"after_bone must be {boundary}, not an E element number. "
+                    "Rejected fields: " + json.dumps(guide.invalid_fields(parsed.get("continue_after"))),
+                    cfg, image, raw, repair_schema,
+                )) or {}
+            continuation = guide.parse(fixed.get("continue_after"), after_bone=boundary)
+            valid_decision = "continue_after" in fixed and (
+                fixed["continue_after"] is None or (continuation is not None and bool(continuation.instruction))
+            )
+            if not valid_decision:
+                perf.mark("guide_decision_invalid")
+                value = fixed.get("continue_after")
+                # Field names/types only: diagnose malformed plans without
+                # persisting the user's screenshot or model-generated text.
+                log.warning("guide metadata repair rejected: %s", guide.invalid_fields(value))
+                raise InvalidGuidePlan("The model did not provide a valid next-step plan. Please ask again.")
+        perf.mark("guide_reveal_planned" if continuation else "guide_visible_plan")
+        return choice, answer, cloud_beats, continuation
+    log.info("structured agent locator output did not parse: %r", raw[:240])
+    return None, "" if agent else answer, [], None
+
+
+def _overview_steps(
+    beats: list[dict], first: point.Target, chosen_index: int,
+    overview: list[point.Target], mon: dict,
+) -> tuple[tuple[point.Target | None, str], ...]:
+    """Cloud beats as (target or None, prose), resolved against the overview rows.
+
+    The list carries the whole reply, the selection's own control included, so
+    the first beat that names a control must be the control the selection
+    already chose. If it is not, the words and the bone disagree and the caller
+    drops the sequence for the single line.
+
+    Every row here is already a measured UIA/OCR rectangle, so a later bone
+    costs no second model call - the whole reason cloud sequences are restricted
+    to element picks. Index zero is narration and needs no row, so it is free.
+    Stops at the first bone that is out of range or repeats one already shown.
+    """
+    shown: list[tuple[point.Target | None, str]] = []
+    bones: list[point.Target] = []
+    for step in beats:
+        index = step.get("index")
+        if index == 0:
+            shown.append((None, step["answer"]))
+            continue
+        if not bones:
+            # The selection's own control, already resolved, validated and (for
+            # a C cell) refined. Take its line and move on.
+            if index != chosen_index:
+                return ()
+            shown.append((first, step["answer"]))
+            bones.append(first)
+            continue
+        # A limit is not a failure: keep reading, because a handover beat after
+        # the last bone still belongs.
+        if len(bones) >= MAX_STEPS:
+            continue
+        # Numbered by bone, so a narration beat never shifts the step column
+        # that latency.md documents.
+        position = len(bones) + 1
+        if index is None or not 1 <= index <= len(overview):
+            perf.record_pointer(outcome="invalid_index", measured=len(overview), step=position)
+            break
+        target = replace(
+            overview[index - 1], score=max(overview[index - 1].score, 1.0), monitor=dict(mon)
+        )
+        if point._same_place(target, first) or any(
+            point._same_place(target, earlier) for earlier in bones
+        ):
+            perf.record_pointer(outcome="duplicate", measured=len(overview), step=position)
+            break
+        perf.record_pointer(
+            outcome="model_element", measured=len(overview),
+            source=target.source, step=position,
+        )
+        shown.append((target, step["answer"]))
+        bones.append(target)
+    return tuple(shown) if bones else ()
 
 
 @perf.timed("localization_and_answer")
@@ -919,7 +1373,9 @@ async def locate_and_answer(
     writing its sentence, with a target that already passed validation.
     """
     if cfg["llm"].get("mode") == "agent":
-        return await _visual_agent_locate_and_answer(query, shot, cfg, candidates, on_choice)
+        return await _visual_agent_locate_and_answer(
+            query, shot, cfg, candidates, messages, on_choice
+        )
     mon = shot.monitor
     coarse, overview = coarse_image(shot.pixels, candidates, mon)
     overview_list = "\n".join(
@@ -937,12 +1393,32 @@ async def locate_and_answer(
         "If the requested item is hidden, choose the visible menu, expander, or parent control that reveals it and explain that next step. "
         "A browser URL or browser tab is not an in-page/app command. For 'start a new chat', choose the New button inside the app, not a tab, URL, or existing Chat mode. "
         "For profile/account/avatar requests, choose the username, avatar, or account menu inside the site/app; never browser controls such as Ask Gemini. "
-        "For an icon, choose its measured element or the cell containing the icon. Choose none only when no visible control answers the request."
+        "For an icon, choose its measured element or the cell containing the icon. Choose none only when no visible control answers the request.\n"
+        "When the request covers more than one control - a task with several "
+        "visible steps ('how do I start editing'), or several things asked for "
+        "together ('show me the source control, the audio mixer and the record "
+        "button') - omit answer and write beats instead: the whole reply "
+        "split into ordered pieces, the first of them naming the same control "
+        "as your selection above. Each beat says only what belongs to its own "
+        "control, because the bone sits on that control while the beat is "
+        "spoken; never put the whole answer into one beat and never summarise "
+        f"the others in it. At most {MAX_STEPS} beats carry a control, each a "
+        "measured E element on this screen, never a C cell and never a control "
+        "that is not visible yet. A beat with selection_index zero is narration "
+        "with no control at all - a connective clause or a closing handover - "
+        "written only where the explanation needs one, never as a stock "
+        "sign-off. For a single named control ('where is Export'), use answer "
+        "on its own and write no beats. Start from the current visible state: "
+        "if the user already opened a form, guide its visible fields instead "
+        "of only pointing at the button that opens it again. If the user "
+        "explicitly asks where that button and the fields are, show each. "
+        "Every nonzero beat index must be one of the listed E numbers; cyan "
+        "grid numbers cannot be used as element indices."
     )
     coarse_valid = ["none"] + [f"E{i}" for i in range(1, len(overview) + 1)] + [
         f"C{i}" for i in range(1, COARSE_COLS * COARSE_ROWS + 1)
     ]
-    picked, answer = await _agent_pick(
+    picked, answer, cloud_beats, continuation = await _agent_pick(
         prompt, cfg, coarse, messages, coarse_valid, "coarse"
     )
     log.info(
@@ -959,10 +1435,26 @@ async def locate_and_answer(
         chosen = _lexical_guard(overview[index - 1], overview)
         if chosen is not overview[index - 1]:
             answer = ""  # The explanation described a different control.
-        return GroundedResult(
-            replace(chosen, score=max(chosen.score, 1.0), monitor=dict(mon)),
-            answer,
+            cloud_beats = []  # Its first beat describes that old control too.
+            continuation = None
+        first = replace(chosen, score=max(chosen.score, 1.0), monitor=dict(mon))
+        # `beats` carries the whole reply when the model wrote a sequence;
+        # otherwise `answer` is the whole reply on its own. One job each.
+        beats = _overview_steps(cloud_beats, first, index, overview, mon) or (
+            (first, answer),
         )
+        bones = [step for step, _ in beats if step is not None]
+        # The spoken line for this bone is its own beat's, never the top-level
+        # `answer`: a model that filled in both would otherwise have its summary
+        # spoken first and then repeated beat by beat.
+        answer = next(words for step, words in beats if step is not None)
+        if len(bones) > 1:
+            perf.mark(f"pointer_steps_{len(bones)}")
+            log.info("cloud locator returned %d bones in %d beats", len(bones), len(beats))
+        # One beat is the ordinary turn: keep its shape byte-identical.
+        if continuation and continuation.after_bone != len(bones):
+            continuation = None
+        return GroundedResult(first, answer, beats if len(beats) > 1 else (), continuation)
 
     cell = int(picked[1:])
     height, width = shot.pixels.shape[:2]
@@ -1005,11 +1497,13 @@ async def locate_and_answer(
     fine_valid = ["none"] + [f"E{i}" for i in range(1, len(regional) + 1)] + [
         f"G{i}" for i in range(1, FINE_COLS * FINE_ROWS + 1)
     ]
-    selected, fine_answer = await _agent_pick(
+    selected, fine_answer, _, continuation = await _agent_pick(
         fine_prompt, cfg, fine, messages, fine_valid, "fine"
     )
     # A coarse-cell explanation cannot stand in for the refined target's answer.
     answer = (fine_answer or answer) if cfg["llm"].get("mode") == "agent" else fine_answer
+    if continuation and continuation.after_bone != 1:
+        continuation = None
     log.info(
         "grounded locator fine crop returned %s from %d measured elements",
         selected,
@@ -1024,9 +1518,11 @@ async def locate_and_answer(
         chosen = _lexical_guard(regional[index - 1], regional)
         if chosen is not regional[index - 1]:
             answer = ""
+            continuation = None
         return GroundedResult(
             replace(chosen, score=max(chosen.score, 1.0), monitor=dict(mon)),
             answer,
+            continuation=continuation,
         )
 
     grid = int(selected[1:])
@@ -1055,6 +1551,7 @@ async def locate_and_answer(
             monitor=dict(mon),
         ),
         answer,
+        continuation=continuation,
     )
 
 

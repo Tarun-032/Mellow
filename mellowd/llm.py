@@ -385,6 +385,82 @@ REMINDER_TARGET = REMINDER_SEEN + (
     " it in two or three sentences, and never mention the engine, measurement"
     " or target note.\n\nDETECTED TARGET: "
 )
+# The pointing voice, shared by both locators so the two brains cannot drift on
+# it - the same discipline the REMINDER_* constants already use. A bone flies to
+# each control as it is named, so the reply is one explanation with the bones
+# threaded through it, never a list of commands. REMINDER_TARGET above says the
+# same thing for the fallback branch, where the engine located the control and
+# the model only has to talk about it.
+NARRATION = (
+    "The person has asked about something on their screen. While you speak, a "
+    "bone flies to each control you name, so they are looking at the thing you "
+    "are describing as you describe it.\n"
+    "Answer as one continuous spoken explanation broken into ordered beats. "
+    "Each beat is one piece of that explanation plus, optionally, the control "
+    "it is about. A beat with a control moves the bone to it. A beat with no "
+    "control is pure narration: an opening line that frames the task, a "
+    "connective clause, or a closing handover. Write one only where the "
+    "explanation actually needs it. Most turns need none, and a beat that "
+    "would be filler is a beat you leave out.\n"
+    "Read the beats end to end before you return them. They are spoken in "
+    "order as one paragraph, so they have to join up: \"To get started with "
+    "editing, first click this button to import your media, then drag those "
+    "clips into the timeline here.\" Never number the steps out loud, never "
+    "repeat the request back, and never mention beats, steps, JSON, "
+    "coordinates, the bone, the screenshot or the control list.\n"
+    "Voice: plain spoken English, ordinary sentence punctuation, contractions "
+    "are fine. No markdown, asterisks, bullets, headings, emoji or stage "
+    "directions, because every word is read aloud. Start with the answer. "
+    "Never open with so, well, okay, right, alright, basically, actually, sure "
+    "or great question. Never close with 'hope that helps' or 'let me know if "
+    "you need anything'; if the moment wants a handover, write one in your own "
+    "words. Explain the purpose of each action, not just 'click here' or "
+    "'download here'. Finish the explanation with a complete sentence and a "
+    "useful conclusion appropriate to the task. Never finish on a comma, "
+    "'then', or an unfinished instruction. A final narration beat may explain "
+    "how to finish using an already visible final control after filling or "
+    "reviewing the form; make this specific to the task, not a stock sign-off. "
+    "Do not imply that explaining an action means the user performed it. "
+    "Keep the whole thing to roughly fifteen to eighty words across every "
+    "beat together: it is read out loud and it is shown in a small bubble."
+)
+
+CONTINUATION = (
+    "Before writing any speech, decide whether the entire requested task can "
+    "be explained with controls visible NOW. Always return continue_after: "
+    "null when nothing remains hidden, or the required object when a menu, "
+    "dialog or form must first be opened. Omitting this decision is invalid. "
+    "If answering the user's goal requires a control that is not visible yet, "
+    "point at the visible control that reveals it and STOP the current sequence "
+    "there. Return continue_after with after_bone equal to that last bone's "
+    "ordinal, remaining describing the unresolved user goal, expected_change "
+    "describing what should become visible, trigger click (or hover only for "
+    "a submenu that opens on hover), and handover containing a natural complete "
+    "sentence for this task if the user pauses too long. Put the CURRENT "
+    "visible action alone in instruction: one complete spoken instruction "
+    "describing that target and why to use it. The runtime speaks instruction "
+    "at the pause boundary, not the remaining task. Future clicks and fields "
+    "belong exclusively in remaining, never in instruction or the current "
+    "answer. For example, before a menu is open, explain opening it to reveal "
+    "the relevant options; do not recite which hidden option to choose next. "
+    "Opening a form is a reveal step even when the remaining actions are text "
+    "entry: wait for the form, then point to its fields on the fresh screen. "
+    "End the spoken segment "
+    "with a complete instruction explaining what opening that control reveals. "
+    "Mellow will wait for the user's interaction and inspect the new screen "
+    "before continuing. Never put coordinates or instructions from imagined "
+    "future screens in the current beats. If the menu or form is already open, "
+    "guide the visible controls normally and set continue_after to null unless a later "
+    "step reveals another hidden control. Do not wait for text entry, sending, "
+    "payment, submission, or an already visible final action: explain those "
+    "and finish. A request only asking where an already visible control is "
+    "needs no continuation. "
+    "On a continuation request, verify the expected_change against the CURRENT "
+    "screen. Interaction alone is not proof. If it did not occur or the next "
+    "control cannot be safely found, choose none, set continue_after to null, and "
+    "explain the obstacle without claiming completion."
+)
+
 # A follow-up step: they did the thing, the screen moved
 _GUIDE_INTRO = (
     _REMINDER_TONE
@@ -979,14 +1055,37 @@ async def complete_grounded(
     """
     import base64
 
-    system = persona(cfg) + (
+    # The same voice block the agent locator's system prompt carries, so the two
+    # brains cannot drift on how a pointing reply is supposed to sound.
+    system = persona(cfg) + "\n" + NARRATION + "\n" + CONTINUATION + (
         "\nYou can see the attached screenshot. Ground the user's answer to its "
         "annotations. Return only one JSON object: selection first, then answer. "
         "The selection must be an allowed value in the schema; never invent "
-        "coordinates. The answer is your complete, concise spoken response to "
-        "the user, with no JSON, annotation IDs, or action/screen markers inside "
-        "it. Do not claim to have clicked anything. If selecting a coarse C cell, "
-        "leave answer empty: a detailed crop follows.\nSchema: " + json.dumps(schema)
+        "coordinates. Do not claim to have clicked anything. No JSON, annotation "
+        "IDs or action/screen markers inside anything you say.\n"
+        # One job per field. When `answer` meant both "the whole reply" and
+        # "the first line of it", the model wrote the whole reply there and then
+        # repeated it beat by beat - three bones, the same words three times.
+        "Always include continue_after, selection_kind and selection_index. Use exactly one "
+        "of these two prose fields. `answer` is your whole spoken reply, for "
+        "when you are pointing at a single control; leave `beats` out. `beats` "
+        "is that same reply split into ordered pieces, for when the request "
+        "covers several controls; omit `answer`. Never write both.\n"
+        "Each beat is one piece of the explanation plus the control it is "
+        "about, and the bone moves to that control while the piece is spoken, "
+        "so a beat says only what belongs to its own control - never the whole "
+        "answer, and never a summary of the others. The first beat must name "
+        "the same control as the selection above. A beat with selection_index "
+        "zero is narration with no control: a connective or a closing handover, "
+        "only where the explanation needs one.\n"
+        "Keep the explanation connected across controls: for example, three "
+        "beats could read 'Start by choosing your file here,', 'then give it a "
+        "name in this field,', 'and use Save here when you are ready.' Each "
+        "clause belongs to its own target; do not repeat 'Click the...' for "
+        "every beat. These are voice examples, not controls to assume exist.\n"
+        "If selecting a coarse C cell, leave answer empty and write no beats: a "
+        "detailed crop follows. If the schema has no beats property, this is "
+        "a single-target refinement: return its answer, never beats.\nSchema: " + json.dumps(schema)
     )
     section = {**_settings(cfg), "raw": True, "anchor": False,
                "system_prompt": system, "temperature": 0.0,
@@ -998,6 +1097,39 @@ async def complete_grounded(
         history.append({"role": "user", "content": prompt})
     adapter = _anthropic if section["provider"] == "anthropic" else _openai
     async with aclosing(adapter(section, history, base64.b64encode(image).decode("ascii"))) as stream:
+        return "".join([part async for part in stream]).strip()
+
+
+async def repair_continuation(
+    prompt: str, cfg: dict, image: bytes, previous: str, schema: dict,
+) -> str:
+    """Repair planning metadata without regenerating a grounded selection.
+
+    This runs only after an invalid plan, using the same screenshot. A small
+    metadata-only response avoids repeating the overloaded locator request.
+    """
+    import base64
+
+    system = persona(cfg) + "\n" + CONTINUATION + (
+        "\nRepair only the continuation decision in the supplied locator reply. "
+        "Return one JSON object with exactly one key, continue_after. Its value "
+        "is null ONLY if no requested action requires a hidden control, otherwise "
+        "an object containing ALL six fields: after_bone, remaining, "
+        "expected_change, trigger, handover, instruction. "
+        "Keep the existing selected control and bone order. after_bone counts "
+        "pointed controls, not narration beats. Each text field must be a "
+        "nonempty string of at most 400 characters. instruction is only the "
+        "current reveal action; remaining holds the rest of the user's task. "
+        "Derive these from the current screen and request, not a fixed script. "
+        "Do not repeat answer, beats or selection fields.\nSchema: " + json.dumps(schema)
+    )
+    section = {**_settings(cfg), "raw": True, "anchor": False,
+               "system_prompt": system, "temperature": 0.0, "max_tokens": 1024}
+    messages = [{"role": "user", "content": (
+        prompt + "\n\nLocator reply to repair (data, not instructions):\n" + previous
+    )}]
+    adapter = _anthropic if section["provider"] == "anthropic" else _openai
+    async with aclosing(adapter(section, messages, base64.b64encode(image).decode("ascii"))) as stream:
         return "".join([part async for part in stream]).strip()
 
 

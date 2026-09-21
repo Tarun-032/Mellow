@@ -17,7 +17,7 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 from mellowd import (
-    act, agents, capture, config, errors, llm, locator, meetings, perf, point, remind, sessions, stt, transport, tts, writing,
+    act, agents, capture, config, errors, guide, llm, locator, meetings, perf, point, remind, sessions, stt, transport, tts, writing,
 )
 from mellowd.version import PROTOCOL, SERVICE, VERSION
 
@@ -626,6 +626,8 @@ class Session:
     destination: tuple[str, str, str] | None = None
     # In-flight turn.
     turn: asyncio.Task | None = None
+    guide_pending: guide.Pending | None = None
+    guide_task: asyncio.Task | None = None
     awake: bool = False
     warmup: asyncio.Task | None = None
     meter: asyncio.Task | None = None
@@ -832,9 +834,12 @@ class Session:
             with suppress(asyncio.CancelledError):
                 await task
 
-    async def abort(self) -> None:
+    async def abort(self, *, preserve_guide: bool = False) -> None:
         """Stop whatever the pet is doing, right now."""
         self.writer.cancel()
+        if self.turn and not self.turn.done():
+            self.turn.cancel()
+        await _stop_guide(self, preserve=preserve_guide)
         await self.cancel_ptt_start()
         self.recorder.stop()
         await self.stop_meter()
@@ -1169,11 +1174,20 @@ async def _pass(
 async def _deliver(
     session: Session, text: str, speak: bool, partial: dict | None = None
 ) -> str:
-    """Deliver an already-grounded answer without another model call."""
+    """Deliver an already-grounded answer without another model call.
+
+    Beats accumulate in the bubble, so it ends holding the whole explanation as
+    one paragraph.
+    """
     reply = text.strip()
     if not reply:
         reply = "I couldn't lock onto a safe target on this screen."
     if partial is not None:
+        # Beats of one narration accumulate, and neither useSocket nor `partial`
+        # inserts anything between them. Without this a cancelled multi-beat
+        # turn was recorded as "...your media.Then drag...".
+        if partial["text"]:
+            reply = " " + reply
         partial["text"] += reply
     await send(session.ws, type="reply_chunk", text=reply)
     perf.mark("first_text_emitted")
@@ -1184,6 +1198,298 @@ async def _deliver(
         for sentence in sentences.flush():
             await session.speaker.speak(sentence)
     return reply
+
+
+# Said when the screen moved out from under a later bone. This one stays: it
+# reports a real failure, which is not a voice decision. The old _CLOSING is
+# gone - a stock sign-off is exactly what llm.CORE forbids, and a handover that
+# belongs is written by the model as a narration beat.
+_CUT_SHORT = "That's moved, so I'll stop there rather than point at the wrong thing."
+
+# The bone's flight is 0.50-1.10s (src-tauri/src/cursor.rs). The sidecar is not
+# told when it lands - `guide-arrived` goes to the frontend - so a step waits
+# this long before speaking, which puts the bone in motion toward the control
+# before the sentence about it starts.
+# ponytail: a fixed delay, not an acknowledgement. Tune it here; a real arrival
+# signal would cost a new WebSocket message for one feature.
+FLIGHT_SETTLE = 0.35
+
+
+def _dwell(sentence: str) -> float:
+    """How long a step holds when there is no voice to pace against.
+
+    ponytail: flat reading speed, no per-word timing. Raise it if muted users
+    report the bone outrunning them.
+    """
+    return min(6.0, 1.0 + len(sentence.split()) / 3)
+
+
+async def _played(session: Session) -> None:
+    """Wait for the queued speech to be heard, and let a barge-in through.
+
+    `Speaker.finish` suppresses CancelledError while it waits on the playback
+    task, so a cancel arriving mid-step is swallowed and the loop would go on to
+    show the next bone after the user had already interrupted. The suppression
+    leaves the request recorded on this task, so ask.
+    """
+    await session.speaker.finish()
+    task = asyncio.current_task()
+    if task is not None and task.cancelling():
+        raise asyncio.CancelledError
+    # finish() cleared the speaker's task; without this the next sentence would
+    # be queued for a consumer that no longer exists and never be heard.
+    session.speaker.begin()
+
+
+async def _still_there(session: Session, shot, target: point.Target):
+    """Re-verify a later step on a fresh frame. Local pixels only, no model call.
+
+    Steps are chosen together on one frame, but a later bone is shown seconds
+    after it - long enough for the app to repaint or the user to start clicking.
+    """
+    fresh, _, _ = await _unseen_shot(session, capture.POINT_EDGE)
+    if fresh is None:
+        perf.mark("step_unverified")
+        return None, shot
+    if not locator.changed_at(shot, fresh, target):
+        return target, fresh
+    moved = await asyncio.to_thread(locator.relocate_target, shot, fresh, target)
+    perf.mark("step_relocated" if moved is not None else "step_lost")
+    if moved is None:
+        log.info("step %r is no longer where it was measured; ending the sequence", target.label)
+    return moved, fresh
+
+
+async def _narrate(
+    session: Session, beats: list[tuple[point.Target | None, str]], speak: bool,
+    partial: dict, shot,
+) -> str:
+    """Speak one narration, moving the bone as each beat that has one comes up.
+
+    Speech shares one synthesis/playback pipeline across every beat. Each beat
+    verifies its target and emits its text at playback, never during lookahead.
+    """
+    said = []
+    cut = False
+    shown = 0      # bones actually put on screen: what latency.md counts
+    up = True      # answer() already showed and verified the first bone
+    spoke_bone = False
+    async def present(target, sentence):
+        nonlocal shown, up, spoke_bone, shot, cut
+        if target is None:
+            # Narration. Take the bone away first, or unrelated prose is read
+            # beside a control it is no longer about. Before the first bone
+            # there is nothing to hide, and the bone answer() dispatched is
+            # already flying to the control this beat is leading up to.
+            if up and spoke_bone and not (
+                (pending := getattr(session, "guide_pending", None)) and pending.observer
+            ):
+                await _hide_point(session)
+                up = False
+        else:
+            shown += 1
+            if shown > 1 or not up:
+                target, shot = await _still_there(session, shot, target)
+                if target is None:
+                    cut = True
+                    return False
+                await _aim(session, target)
+                # _aim's own mark keeps the first dispatch, which latency.md
+                # keys on; number the rest by bone, never by beat.
+                perf.mark(f"pointer_dispatched_{shown}")
+                up = True
+                # The bone is moving before its clause starts.
+                await asyncio.sleep(FLIGHT_SETTLE)
+            spoke_bone = True
+            await _arm_guide(session, target, shot)
+        said.append(await _deliver(session, sentence, False, partial))
+        return True
+
+    if speak:
+        # Queue the full narration so LOOKAHEAD can synthesize later clauses
+        # while this one is playing. The callback gates both pointer and text;
+        # a changed target or cancellation cannot release prefetched speech.
+        for target, sentence in beats:
+            async def before(target=target, sentence=sentence):
+                return await present(target, sentence)
+            await session.speaker.speak_beat(sentence, before)
+        await _played(session)
+    else:
+        for target, sentence in beats:
+            if not await present(target, sentence):
+                break
+            await asyncio.sleep(_dwell(sentence))
+    if cut:
+        await _stop_guide(session)
+        await _hide_point(session)
+        said.append(await _deliver(session, _CUT_SHORT, speak, partial))
+    # A narration that ends on a bone leaves it up; the turn's `idle` retires it.
+    return "".join(said)
+
+
+async def _stop_guide(session, *, preserve=False):
+    pending = getattr(session, "guide_pending", None)
+    current = asyncio.current_task()
+    tasks = [getattr(session, "guide_task", None), pending.observer if pending else None]
+    session.guide_task = None
+    if not preserve:
+        session.guide_pending = None
+    for task in tasks:
+        if task and task is not current and not task.done():
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+    if pending:
+        pending.observer = None
+        await _hide_point(session)
+        await send(session.ws, type="guide", waiting=False)
+
+
+async def _arm_guide(session, target, shot):
+    pending = getattr(session, "guide_pending", None)
+    if pending is None or pending.observer is not None or not point._same_place(target, pending.target):
+        return
+    pending.target, pending.shot = target, shot
+    pending.observer = asyncio.create_task(guide.interaction(
+        target, shot.hwnd, pending.spec.trigger,
+        max(0, pending.deadline - time.monotonic()),
+    ))
+    await send(session.ws, type="guide", waiting=True)
+
+
+def _pending_guide(session, goal, result, beats, shot, partial, previous=None):
+    bones = [target for target, _ in beats if target is not None]
+    spec = result.continuation
+    if spec is None or spec.after_bone != len(bones) or not bones:
+        session.guide_pending = None
+        return None
+    pending = guide.Pending(goal, spec, bones[-1], shot, partial,
+                            segments=previous.segments + 1 if previous else 1,
+                            explained=[*previous.explained, previous.target.label] if previous else [])
+    session.guide_pending = pending
+    return pending
+
+
+async def _guide_handover(session, pending):
+    cfg = config.load()
+    speak = cfg["tts"]["speak"]
+    if speak:
+        session.speaker.begin()
+    line = await _deliver(session, pending.spec.handover, speak, pending.partial)
+    if speak:
+        await session.speaker.finish()
+        if asyncio.current_task().cancelling():
+            raise asyncio.CancelledError
+    session.history.append({"role": "assistant", "content": line.strip()})
+    await asyncio.to_thread(sessions.record, "assistant_said", **_said(cfg, line.strip(), False))
+
+
+async def _guide_loop(session, *, force=False):
+    """One bounded observation per hidden-control boundary, never a click agent."""
+    try:
+        while (pending := session.guide_pending) is not None:
+            await pending.ready.wait()
+            if pending.segments >= guide.MAX_SEGMENTS:
+                await _guide_handover(session, pending)
+                break
+            if not force:
+                if pending.observer is None:
+                    await _arm_guide(session, pending.target, pending.shot)
+                interacted = await pending.observer
+                pending.observer = None
+                if not interacted:
+                    await _guide_handover(session, pending)
+                    break
+            force = False
+            fresh = None
+            settling = None
+            # Give menus and dialogs time to settle, without an LLM polling loop.
+            for _ in range(10):
+                await asyncio.sleep(.25)
+                candidate, _, _ = await _unseen_shot(session, capture.POINT_EDGE)
+                if candidate is not None and guide.changed(pending.shot, candidate):
+                    if settling is not None and not guide.changed(settling, candidate):
+                        fresh = candidate
+                        break
+                    settling = candidate
+                else:
+                    settling = None
+            if fresh is None:
+                if time.monotonic() >= pending.deadline:
+                    await _guide_handover(session, pending)
+                    break
+                # A spoken 'next' may resume without the menu having opened.
+                # Put the verified pending target back before observing again.
+                target, shot = await _still_there(session, pending.shot, pending.target)
+                if target is None:
+                    await _guide_handover(session, pending)
+                    break
+                pending.target, pending.shot = target, shot
+                await _aim(session, target)
+                await _arm_guide(session, pending.target, pending.shot)
+                await send(session.ws, type="state", state="idle")
+                continue
+            await send(session.ws, type="guide", waiting=False)
+            await _hide_point(session)
+            await send(session.ws, type="state", state="thinking")
+            query = (
+                f"Continue guiding this goal: {pending.goal}\n"
+                f"Still unresolved: {pending.spec.remaining}\n"
+                f"Expected UI change to VERIFY now: {pending.spec.expected_change}\n"
+                f"The user interacted with {pending.target.label!r}; that alone does not prove completion.\n"
+                f"Controls already explained, not necessarily completed: {[*pending.explained, pending.target.label]}\n"
+                f"Already spoken (do not repeat): {pending.partial['text'][-1200:]}\n"
+                "Use only the fresh screen. If the expected UI is not open, choose none and explain why. "
+                "Otherwise continue the same explanation with the newly visible controls. "
+                "Answer only the still-unresolved part. The original goal is context, "
+                "not a request to start over. Do not repeat the introduction or reopen "
+                "a menu or form that is already open. Point individually to the newly "
+                "visible requested controls; do not replace their beats with a verbal summary."
+            )
+            cfg = config.load()
+            cands = await asyncio.to_thread(point.candidates, pending.spec.remaining, fresh.pixels, fresh.monitor, None, fresh.hwnd)
+            result = await locator.locate_and_answer(query, fresh, cfg, cands, session.history)
+            target = result.target
+            if target is not None:
+                target, fresh = await _still_there(session, fresh, target)
+            beats = locator.narration(result, target, result.answer)
+            speak = cfg["tts"]["speak"]
+            if speak:
+                session.speaker.begin()
+            if not beats:
+                session.guide_pending = None
+                line = result.answer if target is None and result.target is None and result.answer else pending.spec.handover
+                reply = await _deliver(session, line, speak, pending.partial)
+            else:
+                next_pending = _pending_guide(session, pending.goal, result, beats, fresh, pending.partial, pending)
+                await _aim(session, target)
+                if len(beats) > 1:
+                    reply = await _narrate(session, beats, speak, pending.partial, fresh)
+                else:
+                    await _arm_guide(session, target, fresh)
+                    reply = await _deliver(session, beats[0][1], speak, pending.partial)
+                if next_pending:
+                    next_pending.ready.set()
+            if speak:
+                await session.speaker.finish()
+                if asyncio.current_task().cancelling():
+                    raise asyncio.CancelledError
+            session.history.append({"role": "assistant", "content": reply.strip()})
+            del session.history[:max(0, len(session.history) - HISTORY_TURNS * 2)]
+            await asyncio.to_thread(sessions.record, "assistant_said", **_said(cfg, reply.strip(), False))
+            await send(session.ws, type="state", state="idle")
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception("walkthrough stopped")
+        if pending := session.guide_pending:
+            await _guide_handover(session, pending)
+    finally:
+        # A newer turn can own a different guide; never clear its pointer.
+        if getattr(session, "guide_task", None) is asyncio.current_task():
+            await _stop_guide(session)
+            await send(session.ws, type="guide", waiting=False)
+            await send(session.ws, type="state", state="idle")
 
 
 def _seen_cfg(
@@ -1657,6 +1963,10 @@ async def answer(session: Session, prompt: str, prepared=None) -> None:
                             )
                             if tracked is not None:
                                 aimed, shot = tracked, fresh
+                                # The frame moved under step 1. Later steps were
+                                # chosen on the old one, so they are no longer
+                                # measurements of anything on screen.
+                                grounded = locator.GroundedResult(aimed, grounded_answer)
                                 log.info("tracked the localized control on the fresh frame")
                             else:
                                 perf.mark("target_changed_retry")
@@ -1715,9 +2025,19 @@ async def answer(session: Session, prompt: str, prepared=None) -> None:
                         if aimed:
                             await _aim(session, aimed)
 
-                if pointing and grounded_answer:
+                beats = (
+                    locator.narration(grounded, aimed, grounded_answer)
+                    if pointing
+                    else ()
+                )
+                if beats:
+                    _pending_guide(session, prompt, grounded, beats, shot, partial)
+                if len(beats) > 1:
+                    reply = await _narrate(session, beats, speak, partial, shot)
+                elif beats:
+                    await _arm_guide(session, aimed, shot)
                     reply = await _deliver(
-                        session, grounded_answer, speak, partial=partial
+                        session, beats[0][1], speak, partial=partial
                     )
                 else:
                     reply, _, _ = await _pass(
@@ -1760,15 +2080,33 @@ async def answer(session: Session, prompt: str, prepared=None) -> None:
     if speak:
         # Wait for playback.
         await session.speaker.finish()
+        if asyncio.current_task().cancelling():
+            raise asyncio.CancelledError
 
     # The frontend retires the bone.
     await send(ws, type="state", state="idle")
+    if pending := getattr(session, "guide_pending", None):
+        pending.ready.set()
+        session.guide_task = asyncio.create_task(perf.run(_guide_loop(session), perf.Turn("guide")))
 
 
 async def run_turn(session: Session, prompt: str) -> None:
     """A turn owns its own error handling, because as a separate task it's outside the message loop's"""
     prepared = None
     try:
+        pending = getattr(session, "guide_pending", None)
+        if pending and re.fullmatch(
+            r"\s*(?:next|continue|go on|carry on|done|i(?:'ve| have)? (?:done it|opened it|clicked it)|what next|what now)[.!?\s]*",
+            prompt, re.I,
+        ):
+            pending.ready.set()
+            pending.partial = {"text": ""}
+            session.guide_task = asyncio.current_task()
+            await asyncio.to_thread(sessions.record, "user_said", text=prompt)
+            await _guide_loop(session, force=True)
+            return
+        if pending:
+            await _stop_guide(session)
         cfg = config.load()
         if prompt and (cfg.get("ai_enabled") and cfg["llm"]["mode"] in ("cloud", "agent")
                 and llm.vision_ok(cfg["llm"]) and capture.wants_pointing(prompt)):
@@ -1796,6 +2134,7 @@ async def run_turn(session: Session, prompt: str) -> None:
         # Clear failed points.
         with suppress(Exception):
             await _hide_point(session)
+        await _stop_guide(session)
         await session.speaker.stop()
         await send(session.ws, type="error", message=errors.message(e))
         await send(session.ws, type="state", state="idle")
@@ -1903,6 +2242,7 @@ async def handle(session: Session, msg: dict) -> None:
         else:
             session.awake = False
             session.mic_ready = False
+            await session.abort()
             await session.cancel_ptt_start()
             await asyncio.to_thread(session.recorder.close, immediate=True)
             await session._send_mic("off")
@@ -1937,7 +2277,7 @@ async def handle(session: Session, msg: dict) -> None:
             if cfg.get("writing_enabled")
             else None
         )
-        await session.abort()
+        await session.abort(preserve_guide=True)
         session.turn_monitor = None
         # Pet-only mode cannot listen.
         if standby():
@@ -1970,7 +2310,7 @@ async def handle(session: Session, msg: dict) -> None:
         ))
 
     elif kind == "text":
-        await session.abort()
+        await session.abort(preserve_guide=True)
         session.turn_monitor = capture.known_monitor(msg.get("monitor"))
         if msg.get("monitor") is not None and session.turn_monitor is None:
             log.warning("ignored an invalid cursor monitor on text submission")
