@@ -1,5 +1,24 @@
 Mellow
-Copyright 2026 Tarun-032
+Copyright 2026 Tarun Behera (Tarun-032)
+https://github.com/Tarun-032/Mellow
+
+Mellow is free software: you can redistribute it and/or modify it under the
+terms of the GNU Affero General Public License, version 3 (see LICENSE), with
+the additional terms below.
+
+Additional terms (AGPL-3.0 section 7)
+
+1. Attribution (section 7(b)). Every copy or modified version of Mellow must keep
+   this NOTICE file and the author attribution "Mellow by Tarun Behera", with a
+   link to https://github.com/Tarun-032/Mellow, in its README and in the about or
+   settings screen it shows to users.
+
+2. Name and art (section 7(e)). This license grants no rights to the name
+   "Mellow", its logo or app icons, or the pixel-art pet (including
+   src/pet/*.png, src-tauri/icons/, media/ and "Pet ideas/"). You may
+   redistribute them unchanged as part of unmodified copies of Mellow. A
+   modified version must use a different name and replace the logo, icons and
+   pet art with its own.
 
 This product includes Pixelify Sans, Copyright 2021 The Pixelify Sans
 Project Authors, licensed under the SIL Open Font License, Version 1.1.

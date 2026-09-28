@@ -12,7 +12,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/platform-Windows-5b3328?style=flat-square" alt="Windows" />
   <img src="https://img.shields.io/badge/version-1.2.0-cb7a42?style=flat-square" alt="Version 1.2.0" />
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-f18773?style=flat-square" alt="Apache 2.0 license" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-f18773?style=flat-square" alt="AGPL 3.0 license" /></a>
 </p>
 
 Mellow is an open-source desktop companion with a real personality and a useful set of hands-free tools. He can listen and answer out loud, understand what is on your screen, point you toward controls, open apps and websites, manage focus sessions and reminders, transcribe meetings, and react with expressive pixel-art animations.
@@ -289,7 +289,7 @@ Please never include API keys, personal screenshots, model weights, generated in
 
 ## License
 
-Mellow's source code is licensed under the [Apache License 2.0](LICENSE).
+Mellow by Tarun Behera is licensed under the [GNU Affero General Public License v3.0](LICENSE), with two additional terms in [NOTICE](NOTICE): modified versions must keep the attribution "Mellow by Tarun Behera" with a link to this repository, and must use their own name, icons and pet art.
 
 Pixelify Sans is distributed under the SIL Open Font License 1.1; its license is included at [`src/pet/pixelify-sans.OFL.txt`](src/pet/pixelify-sans.OFL.txt). Downloaded models and third-party services are not distributed under Mellow's license and remain subject to their respective terms.
 
