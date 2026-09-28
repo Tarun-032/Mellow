@@ -221,6 +221,12 @@ def close(session_id: str = "", reason: str = "user") -> None:
             log.exception("could not close session %s", live.id)
 
 
+def current() -> str:
+    """The open conversation's id, or "" when none is open."""
+    with _lock:
+        return _current
+
+
 def _for_write(session_id: str) -> _Live | None:
     """The session an event belongs to, opening or rolling one over as needed."""
     if session_id:
@@ -234,16 +240,20 @@ def _for_write(session_id: str) -> _Live | None:
     return live
 
 
-def record(kind: str, session: str = "", **data) -> None:
-    """Append one event to a session."""
+def record(kind: str, session: str = "", **data) -> dict | None:
+    """Append one event to a session.
+
+    Returns {"session", "seq", "ts"} for the event written, or None when nothing
+    was written. Memory cites these as the evidence for a saved note.
+    """
     try:
         if not config.load()["remember_conversations"]:
-            return
+            return None
         with _lock:
             live = _for_write(session)
             if live is None:
                 log.warning("dropped a %s event for unknown session %r", kind, session)
-                return
+                return None
             live.events += 1
             live.last_ts = datetime.now(timezone.utc)
             if kind == "user_said":
@@ -251,12 +261,13 @@ def record(kind: str, session: str = "", **data) -> None:
                 if not live.title:
                     live.title = _title(str(data.get("text", "")))
                     live.indexed = -1  # a new title is worth writing out now
+            ts = _now()
             _append(
                 live,
                 {
                     "v": SCHEMA_VERSION,
                     "seq": live.events,
-                    "ts": _now(),
+                    "ts": ts,
                     "type": kind,
                     **data,
                 },
@@ -264,9 +275,11 @@ def record(kind: str, session: str = "", **data) -> None:
             # Everything the History panel shows comes from a said-event
             if kind in SAID or live.indexed < 0 or live.events - live.indexed >= INDEX_EVERY:
                 _upsert_index(live)
+            return {"session": live.id, "seq": live.events, "ts": ts}
     except Exception:
         # Deliberately broad. This is the audit trail's own failure mode
         log.exception("could not write to the session log")
+        return None
 
 
 def _safe_id(session_id: str) -> bool:
@@ -417,6 +430,43 @@ def media_path(ext: str = ".png") -> Path:
     """A fresh path under sessions/media/ for a screenshot or other blob."""
     MEDIA_DIR.mkdir(parents=True, exist_ok=True)
     return MEDIA_DIR / f"{uuid.uuid4().hex}{ext if ext.startswith('.') else '.' + ext}"
+
+
+def delete(session_ids) -> list[str]:
+    """Delete these sessions and the screenshots they refer to. Returns the ids actually deleted.
+
+    Deleting the open conversation closes it here; the next event starts a new one.
+    """
+    global _current
+    media = MEDIA_DIR.resolve()
+    gone: list[str] = []
+    with _lock:
+        for session_id in dict.fromkeys(str(i) for i in session_ids):
+            events = read(session_id)  # None for an unsafe or unknown id
+            if events is None:
+                continue
+            for event in events:
+                file = str(event.get("file") or "")
+                if not file:
+                    continue
+                try:
+                    path = Path(file).resolve()
+                    if path.parent == media:  # only ever our own screenshots
+                        path.unlink(missing_ok=True)
+                except OSError:
+                    log.exception("could not delete a screenshot of %s", session_id)
+            _open.pop(session_id, None)
+            if session_id == _current:
+                _current = ""
+            try:
+                _path(session_id).unlink(missing_ok=True)
+            except OSError:
+                log.exception("could not delete session %s", session_id)
+                continue
+            gone.append(session_id)
+        if gone:
+            _write_index([e for e in _index_lines() if e.get("id") not in gone])
+    return gone
 
 
 def clear() -> int:

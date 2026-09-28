@@ -450,6 +450,8 @@ def build_prompt(
     question = str(messages[-1].get("content", "")) if messages else ""
     parts = []
     log.debug("agent context preset=%s prior_messages=%d", speed, len(messages) - 1)
+    if remembered := section.get("memory"):
+        parts.append(remembered)
     if prior := history_prose(messages):
         parts.append(prior)
     parts.append(f"They just said: {question}")
@@ -1031,6 +1033,9 @@ async def _terminate(proc: asyncio.subprocess.Process | None) -> None:
     with contextlib.suppress(Exception, asyncio.CancelledError):
         await asyncio.wait_for(proc.wait(), 1.0)
 
+
+# A background memory extraction may take a while; nobody is waiting on it.
+MEMORY_TIMEOUT = 240
 
 # How many turns one prepared process may serve before it is retired. Each turn
 # keeps the conversation, so turn 2 onward reads the prompt from cache.
@@ -1838,7 +1843,7 @@ async def _dispatch(request: AgentRequest) -> AsyncIterator[str]:
         yield chunk
 
 
-async def _stream(agent_id: str, turn: Invocation) -> AsyncIterator[str]:
+async def _stream(agent_id: str, turn: Invocation, usage_out: dict | None = None) -> AsyncIterator[str]:
     """Run one headless turn, yielding reply text as it arrives."""
     label = config.AGENT_PRESETS[agent_id]["label"]
     state: dict = {"structured": turn.structured}
@@ -1863,6 +1868,8 @@ async def _stream(agent_id: str, turn: Invocation) -> AsyncIterator[str]:
         raise
     process_started = time.perf_counter()
     perf.mark(f"agent.{turn.purpose}.process_started")
+    if usage_out is not None:
+        usage_out["_sent"] = True
 
     # Stdout and stderr both drain concurrently
     err_tail: list[bytes] = []
@@ -1958,7 +1965,7 @@ async def _stream(agent_id: str, turn: Invocation) -> AsyncIterator[str]:
                     prompt_bytes=turn.prompt_bytes,
                     schema_bytes=turn.schema_bytes,
                 )
-                async for chunk in _stream(agent_id, fallback):
+                async for chunk in _stream(agent_id, fallback, usage_out):
                     yield chunk
                 return
             raise _failure(agent_id, failure)
@@ -1998,6 +2005,8 @@ async def _stream(agent_id: str, turn: Invocation) -> AsyncIterator[str]:
                 await proc.wait()
         elapsed = time.perf_counter() - started
         usage = state.get("usage") or {}
+        if usage_out is not None:
+            usage_out.update(usage)
         event_ms = (
             round((first_event - started) * 1000)
             if first_event is not None
@@ -2043,10 +2052,40 @@ async def chat(
     cfg = cfg or config.load()
     # The prompt lives beside the capabilities, not inside llm
     section = {**cfg["llm"], "system_prompt": llm.persona(cfg, "{model}")}
-    system, user = build_prompt(messages, section, seen=image is not None)
+    # What Mellow knows about them rides in the user part (memory.turn_context),
+    # so the system prompt stays the prepared answer worker's exactly.
+    system, user = build_prompt(messages, {**section, "memory": str(cfg.get("memory") or "")},
+                                seen=image is not None)
     request = _request(section["provider"], section, system, user, image, purpose="answer")
     async for chunk in _dispatch(request):
         yield chunk
+
+
+async def complete_isolated(
+    prompt: str,
+    cfg: dict,
+    system: str,
+    schema: dict | None = None,
+    usage: dict | None = None,
+) -> str:
+    """A one-off background call that shares nothing with the warm runtime.
+
+    Memory learning runs here: no Codex lock a live answer could queue behind,
+    and no reused thread in which one batch could see the last. `usage` is
+    filled with whatever the CLI reports, and `_sent` once the process started.
+    """
+    section = cfg["llm"]
+    agent_id = section["provider"]
+    request = _request(
+        agent_id, section, system, prompt, None,
+        schema if agent_id == "codex" else None,
+        purpose="memory", timeout_seconds=MEMORY_TIMEOUT,
+    )
+    text = ""
+    async with contextlib.aclosing(_stream(agent_id, request.cold_turn(), usage_out=usage)) as stream:
+        async for chunk in stream:
+            text += chunk
+    return text.strip()
 
 
 async def complete_text(

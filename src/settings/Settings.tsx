@@ -19,6 +19,7 @@ import {
 import { CoatEditor } from "./CoatEditor";
 import { type Coat } from "../ui/coat";
 import Updates from "./Updates";
+import Personalization, { type Profile } from "./Personalization";
 import { useUpdates } from "./useUpdates";
 import "./settings.css";
 
@@ -48,6 +49,8 @@ type SettingsData = {
     speak: boolean;
   };
   system_prompt: string;
+  /** About you: sent with every answer, memory on or off. Older configs may lack it. */
+  profile?: Profile;
   /** Session event log master switch. */
   remember_conversations: boolean;
   /** AI enabled; false = pet-only mode. */
@@ -121,9 +124,13 @@ type SettingsPage =
   | "tts"
   | "writing"
   | "sessions"
+  | "personalization"
   | "meetings"
   | "updates"
   | "advanced";
+
+/** Pages that save as you go, so they get no Save changes bar. */
+const SAVES_ITSELF = new Set<SettingsPage>(["meetings", "updates", "writing", "sessions"]);
 
 const SETTINGS_PAGES: Array<{
   id: SettingsPage;
@@ -133,7 +140,7 @@ const SETTINGS_PAGES: Array<{
   {
     id: "customize",
     label: "Customize Mellow",
-    description: "Appearance and personality",
+    description: "Appearance",
   },
   {
     id: "engine",
@@ -160,6 +167,7 @@ const SETTINGS_PAGES: Array<{
     label: "Sessions",
     description: "Saved conversations",
   },
+  { id: "personalization", label: "Personalization", description: "About you, personality and memory" },
   { id: "meetings", label: "Meetings", description: "Transcripts and meeting notes" },
   {
     id: "updates",
@@ -317,6 +325,51 @@ export default function Settings() {
       .then((result) => setOpenSession({ entry, events: result.events }))
       .catch(() => void 0)
       .finally(() => setHistoryBusy(false));
+  };
+
+  // Select-and-delete, the way Meetings does it.
+  const [historySelecting, setHistorySelecting] = useState(false);
+  const [historyPicked, setHistoryPicked] = useState<Set<string>>(new Set());
+  const [confirmDeletePicked, setConfirmDeletePicked] = useState(false);
+  const leaveHistorySelect = () => {
+    setHistorySelecting(false);
+    setHistoryPicked(new Set());
+    setConfirmDeletePicked(false);
+  };
+  const deletePickedHistory = async () => {
+    setHistoryBusy(true);
+    try {
+      const result = await request<{ deleted: string[] }>("/history/delete", {
+        method: "POST",
+        body: JSON.stringify({ ids: [...historyPicked] }),
+      });
+      if (openSession && result.deleted.includes(openSession.entry.id)) setOpenSession(null);
+      setHistory((current) => current?.filter((entry) => !result.deleted.includes(entry.id)) ?? current);
+    } catch {
+      void 0;
+    } finally {
+      leaveHistorySelect();
+      setHistoryBusy(false);
+      loadHistory();
+    }
+  };
+
+  // Pages without a Save bar save their switches the moment they change. A
+  // partial body is merged over the saved settings by the sidecar, so unsaved
+  // edits on other pages are neither sent nor lost.
+  const [settingError, setSettingError] = useState("");
+  const saveSetting = (patch: Partial<SettingsData>) => {
+    let before: Partial<SettingsData> = {};
+    setSettingError("");
+    setForm((current) => {
+      if (!current) return current;
+      before = Object.fromEntries(Object.keys(patch).map((key) => [key, current[key as keyof SettingsData]]));
+      return { ...current, ...patch };
+    });
+    request("/config", { method: "PUT", body: JSON.stringify(patch) }).catch((error: Error) => {
+      setForm((current) => (current ? { ...current, ...before } : current));
+      setSettingError(`Could not save that change: ${error.message}`);
+    });
   };
 
   const clearHistory = async () => {
@@ -700,7 +753,7 @@ export default function Settings() {
 
       </aside>
 
-      <form className="settings-workspace" onSubmit={e => { if (activePage === "meetings" || activePage === "updates") e.preventDefault(); else void submit(e); }}>
+      <form className="settings-workspace" onSubmit={e => { if (SAVES_ITSELF.has(activePage)) e.preventDefault(); else void submit(e); }}>
         <header className="settings-topbar">
           <div>
             <h1>{currentPage.label}</h1>
@@ -983,6 +1036,15 @@ export default function Settings() {
             </section>
           )}
 
+          {activePage === "personalization" && (
+            <Personalization
+              prompt={form.system_prompt}
+              onPrompt={(value) => setForm((current) => (current ? { ...current, system_prompt: value } : current))}
+              defaultPrompt={defaultPrompt}
+              profile={form.profile ?? { nickname: "", occupation: "", about: "" }}
+              onProfile={(value) => setForm((current) => (current ? { ...current, profile: value } : current))}
+            />
+          )}
           {activePage === "meetings" && <Meetings key={meetingsEntry.visit} openLast={meetingsEntry.deep} />}
           {activePage === "sessions" && (
             <section className="settings-page settings-page--sessions" aria-labelledby="sessions-heading">
@@ -995,17 +1057,12 @@ export default function Settings() {
                   <input
                     type="checkbox"
                     checked={form.remember_conversations}
-                    onChange={(event) =>
-                      setForm((current) =>
-                        current
-                          ? { ...current, remember_conversations: event.target.checked }
-                          : current,
-                      )
-                    }
+                    onChange={(event) => saveSetting({ remember_conversations: event.target.checked })}
                   />
                   Remember sessions
                 </label>
               </div>
+              {settingError && <p className="notice notice--error" role="alert">{settingError}</p>}
               {!form.remember_conversations ? (
                 <div className="empty-state">
                   <h3>Session history is off</h3>
@@ -1014,26 +1071,79 @@ export default function Settings() {
               ) : (
                 <div className="sessions-panel">
                   <div className="history-bar">
-                    <span>{history?.length ?? 0} saved</span>
-                    <div>
-                      <button className="button button--quiet" type="button" disabled={historyBusy} onClick={loadHistory}>
-                        Refresh
-                      </button>
-                      <button
-                        className="button button--quiet button--danger"
-                        type="button"
-                        disabled={historyBusy || !history?.length}
-                        onClick={() => setConfirmClear(true)}
-                      >
-                        Clear all
-                      </button>
-                    </div>
+                    <span>
+                      {historySelecting ? `${historyPicked.size} selected` : `${history?.length ?? 0} saved`}
+                    </span>
+                    {historySelecting ? (
+                      <div>
+                        <button
+                          className="button button--quiet"
+                          type="button"
+                          disabled={historyBusy || !history?.length}
+                          onClick={() =>
+                            setHistoryPicked((picked) =>
+                              picked.size === (history?.length ?? 0)
+                                ? new Set()
+                                : new Set(history?.map((entry) => entry.id)),
+                            )
+                          }
+                        >
+                          {historyPicked.size === (history?.length ?? 0) ? "Select none" : "Select all"}
+                        </button>
+                        <button
+                          className="button button--quiet button--danger"
+                          type="button"
+                          disabled={historyBusy || !historyPicked.size}
+                          onClick={() => setConfirmDeletePicked(true)}
+                        >
+                          Delete
+                        </button>
+                        <button className="button button--quiet" type="button" disabled={historyBusy} onClick={leaveHistorySelect}>
+                          Cancel
+                        </button>
+                      </div>
+                    ) : (
+                      <div>
+                        <button
+                          className="button button--quiet"
+                          type="button"
+                          disabled={historyBusy || !history?.length}
+                          onClick={() => {
+                            setOpenSession(null);
+                            setHistorySelecting(true);
+                          }}
+                        >
+                          Select
+                        </button>
+                        <button className="button button--quiet" type="button" disabled={historyBusy} onClick={loadHistory}>
+                          Refresh
+                        </button>
+                        <button
+                          className="button button--quiet button--danger"
+                          type="button"
+                          disabled={historyBusy || !history?.length}
+                          onClick={() => setConfirmClear(true)}
+                        >
+                          Clear all
+                        </button>
+                      </div>
+                    )}
                   </div>
+                  {confirmDeletePicked && (
+                    <Confirm
+                      busy={historyBusy}
+                      heading={`Delete ${historyPicked.size} conversation${historyPicked.size === 1 ? "" : "s"}?`}
+                      body={`${historyPicked.size === 1 ? "It goes" : "They go"} for good, screenshots included. This cannot be undone. Mellow's saved memories stay; manage them in Personalization.`}
+                      confirmLabel="Delete permanently"
+                      onCancel={() => setConfirmDeletePicked(false)}
+                      onConfirm={() => void deletePickedHistory()}
+                    />
+                  )}
                   {confirmClear && (
                     <Confirm
                       busy={historyBusy}
                       heading="Delete every saved conversation?"
-                      body={`${history?.length === 1 ? "This conversation goes" : `All ${history?.length ?? 0} conversations go`} for good. This cannot be undone.`}
+                      body={`${history?.length === 1 ? "This conversation goes" : `All ${history?.length ?? 0} conversations go`} for good. This cannot be undone. Mellow's saved memories stay; manage them in Personalization.`}
                       confirmLabel="Delete permanently"
                       onCancel={() => setConfirmClear(false)}
                       onConfirm={() => void clearHistory()}
@@ -1050,6 +1160,30 @@ export default function Settings() {
                     <ul className="history-list">
                       {history.map((entry) => (
                         <li key={entry.id}>
+                          {historySelecting ? (
+                            // A <label> so the whole row toggles its checkbox, as in Meetings.
+                            <label className="history-item history-item--select">
+                              <input
+                                type="checkbox"
+                                checked={historyPicked.has(entry.id)}
+                                onChange={(event) =>
+                                  setHistoryPicked((picked) => {
+                                    const next = new Set(picked);
+                                    if (event.target.checked) next.add(entry.id);
+                                    else next.delete(entry.id);
+                                    return next;
+                                  })
+                                }
+                              />
+                              <span className="history-copy">
+                                <strong>{entry.title || "Untitled conversation"}</strong>
+                                <small>{span(entry.started_at, entry.ended_at)}</small>
+                              </span>
+                              <span className="history-count">
+                                {entry.turns} exchange{entry.turns === 1 ? "" : "s"}
+                              </span>
+                            </label>
+                          ) : (
                           <button
                             className="history-item"
                             type="button"
@@ -1064,7 +1198,8 @@ export default function Settings() {
                               {entry.turns} exchange{entry.turns === 1 ? "" : "s"}
                             </span>
                           </button>
-                          {openSession?.entry.id === entry.id && (
+                          )}
+                          {!historySelecting && openSession?.entry.id === entry.id && (
                             <div className="transcript">
                               {openSession.events
                                 .filter((event) =>
@@ -1117,14 +1252,11 @@ export default function Settings() {
                       type="checkbox"
                       role="switch"
                       checked={form.writing_enabled ?? false}
-                      onChange={(event) =>
-                        setForm((current) =>
-                          current ? { ...current, writing_enabled: event.target.checked } : current,
-                        )
-                      }
+                      onChange={(event) => saveSetting({ writing_enabled: event.target.checked })}
                     />
                     <i className="switch__track" aria-hidden="true" />
                   </label>
+                  {settingError && <p className="notice notice--error" role="alert">{settingError}</p>}
                 </div>
               )}
 
@@ -1236,32 +1368,6 @@ export default function Settings() {
                     <p className="field-note">
                       Controls whether Mellow can inspect screenshots when you ask about the screen.
                     </p>
-                    <label>
-                      Additional personality instructions <span className="optional">optional</span>
-                      <textarea
-                        className="prompt-box"
-                        value={form.system_prompt}
-                        onChange={(event) =>
-                          setForm((current) =>
-                            current ? { ...current, system_prompt: event.target.value } : current,
-                          )
-                        }
-                        spellCheck={false}
-                        placeholder="Add preferences that Mellow should remember in every answer"
-                      />
-                    </label>
-                    <button
-                      type="button"
-                      className="button button--quiet prompt-reset"
-                      disabled={!form.system_prompt}
-                      onClick={() =>
-                        setForm((current) =>
-                          current ? { ...current, system_prompt: defaultPrompt } : current,
-                        )
-                      }
-                    >
-                      Clear instructions
-                    </button>
                   </div>
                 </>
               )}
@@ -1271,7 +1377,7 @@ export default function Settings() {
         </div>
 
         {/* Meetings saves as you go; an inert Save changes bar only takes reading space. */}
-        {activePage !== "meetings" && activePage !== "updates" && (
+        {!SAVES_ITSELF.has(activePage) && (
           <footer className="settings-savebar">
             <div>
               {sectionNotice("save")}

@@ -192,6 +192,10 @@ DEFAULTS = {
     # The whole AI half, off at the master switch ([[roadmap]] step 8's "just the pet").
     "ai_enabled": True,
     "writing_enabled": False,
+    # Long-term memory of the user: saved notes in answers plus background learning.
+    "memory_enabled": False,
+    # About you (Settings, Personalization): used in every answer, memory on or off.
+    "profile": {"nickname": "", "occupation": "", "about": ""},
     # Mellow's five-colour coat. The defaults are the palette scripts/sprites.py
     # snaps the art to; the frontend recolours the atlas to whatever is here.
     "coat": {
@@ -220,6 +224,28 @@ def normalize_base_url(value: str) -> str:
         if parsed.path.rstrip("/").endswith(endpoint):
             return value[: value.rstrip("/").rfind(endpoint)]
     return value
+
+
+# Longest each About-you field may be.
+PROFILE_LIMITS = {"nickname": 60, "occupation": 120, "about": 1500}
+
+
+def validate_profile(value) -> dict:
+    """Nickname, occupation and more-about-you: trimmed strings within their limits."""
+    if value is None:
+        value = {}
+    if not isinstance(value, dict):
+        raise ValueError("profile must be an object")
+    out = {}
+    for key, limit in PROFILE_LIMITS.items():
+        text = value.get(key, "")
+        if not isinstance(text, str):
+            raise ValueError(f"profile {key} must be text")
+        text = text.strip()
+        if len(text) > limit:
+            raise ValueError(f"profile {key} must be at most {limit} characters")
+        out[key] = text
+    return out
 
 
 def _number(section: dict, key: str, low: float, high: float, label: str) -> None:
@@ -304,6 +330,9 @@ def validate(candidate: dict) -> dict:
         raise ValueError("meeting_speakers_enabled must be true or false")
     if not isinstance(cfg.get("writing_enabled"), bool):
         raise ValueError("writing_enabled must be true or false")
+    if not isinstance(cfg.get("memory_enabled"), bool):
+        raise ValueError("memory_enabled must be true or false")
+    cfg["profile"] = validate_profile(cfg.get("profile"))
     cfg["coat"] = validate_coat(cfg.get("coat"))
     cfg["system_prompt"] = str(cfg.get("system_prompt") or "")
 

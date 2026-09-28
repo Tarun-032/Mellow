@@ -92,6 +92,11 @@ def record_agent(*, provider, purpose, transport, prompt_bytes, image_bytes,
             usage.get("cache_read_input_tokens", usage.get("cached_input_tokens", 0))
             if isinstance(usage, dict) else 0
         ),
+        # Claude reports cache writes apart from input; Codex names them differently.
+        "cache_write_tokens": (
+            usage.get("cache_creation_input_tokens", usage.get("cache_write_input_tokens", 0))
+            if isinstance(usage, dict) else 0
+        ),
         "output_tokens": usage.get("output_tokens", 0) if isinstance(usage, dict) else 0,
         "reasoning_tokens": (
             detail.get("thinking_tokens", usage.get("reasoning_output_tokens", 0))
@@ -104,6 +109,32 @@ def record_agent(*, provider, purpose, transport, prompt_bytes, image_bytes,
         call["first_text_ms"] = round((first_text - started) * 1000, 3)
     if input_sent is not None:
         call["local_handoff_ms"] = round((input_sent - started) * 1000, 3)
+    with turn.lock:
+        if not turn.closed:
+            turn.agent_calls.append(call)
+
+
+def record_model(*, provider, prompt_bytes, usage):
+    """An API adapter call, recorded beside the agent calls with transport "api"."""
+    turn = _current.get()
+    if not turn:
+        return
+    usage = usage if isinstance(usage, dict) else {}
+    call = {
+        "provider": provider,
+        "purpose": _purpose.get(),
+        "transport": "api",
+        "prompt_bytes": prompt_bytes,
+        "image_bytes": 0,
+        "schema_bytes": 0,
+        "accepted": True,
+        "reported": bool(usage),
+        "input_tokens": usage.get("input_tokens", 0),
+        "cached_tokens": usage.get("cache_read_input_tokens", usage.get("cached_input_tokens", 0)),
+        "cache_write_tokens": usage.get("cache_creation_input_tokens", 0),
+        "output_tokens": usage.get("output_tokens", 0),
+        "reasoning_tokens": 0,
+    }
     with turn.lock:
         if not turn.closed:
             turn.agent_calls.append(call)

@@ -1,0 +1,154 @@
+.personalization__title { margin: 0 0 4px; color: var(--settings-text); font-size: 17px; font-weight: 650; }
+.personalization .settings-group { display: grid; gap: 12px; margin-bottom: 20px; }
+.personalization__about { min-height: 96px; }
+.personalization label.switch { display: grid; }
+
+.memory-row {
+  display: flex;
+  gap: 16px;
+  align-items: center;
+  justify-content: space-between;
+  padding-top: 14px;
+  border-top: 1px solid var(--settings-border);
+}
+.memory-row .switch__text { display: grid; gap: 2px; }
+.memory-row__meta { color: var(--settings-faint); }
+.memory-status { margin: 0; color: var(--settings-muted); font-size: 13px; }
+
+/* The summary window, laid out like ChatGPT's: title and date, ⋯ and ×, then prose. */
+.memory-dialog { width: min(760px, calc(100vw - 32px)); max-height: min(86vh, 860px); padding: 0; }
+.memory-dialog[open] { display: flex; flex-direction: column; }
+.memory-dialog__head {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  padding: 18px 20px 14px 26px;
+  border-bottom: 1px solid var(--settings-border);
+}
+.memory-dialog__head h2 { margin: 0; font-size: 20px; }
+.memory-dialog__head > span { color: var(--settings-faint); font-size: 13.5px; }
+.memory-dialog__tools { display: flex; gap: 4px; align-items: center; margin-left: auto; }
+.memory-dialog__icon {
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border: 0;
+  border-radius: 8px;
+  color: var(--settings-muted);
+  background: transparent;
+  font-size: 20px;
+  line-height: 1;
+  cursor: pointer;
+}
+.memory-dialog__icon:hover { background: var(--settings-field-hover); color: var(--settings-text); }
+.memory-dialog__body { flex: 1 1 auto; min-height: 0; padding: 8px 26px 22px; overflow-y: auto;
+  scrollbar-color: #c6a790 transparent; scrollbar-width: thin; }
+.memory-dialog__foot {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 20px 14px 26px;
+  border-top: 1px solid var(--settings-border);
+}
+.memory-dialog__foot > div { display: flex; gap: 8px; }
+
+.memory-menu { position: relative; }
+.memory-menu__list {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 2;
+  display: grid;
+  min-width: 250px;
+  padding: 6px;
+  border: 1px solid var(--settings-border-strong);
+  border-radius: 12px;
+  background: var(--settings-canvas);
+  box-shadow: 0 14px 36px rgba(76, 41, 35, 0.18);
+}
+.memory-menu__item {
+  padding: 10px 12px;
+  border: 0;
+  border-radius: 8px;
+  color: var(--settings-text);
+  background: transparent;
+  font-size: 14px;
+  text-align: left;
+  cursor: pointer;
+}
+.memory-menu__item:hover { background: var(--settings-field-hover); }
+.memory-menu__item--danger { color: var(--settings-danger); }
+
+.memory-summary__text section + section { margin-top: 4px; }
+.memory-summary__text h3 { margin: 20px 0 8px; color: var(--settings-text); font-size: 18px; font-weight: 650; }
+.memory-summary__text p { margin: 0; color: var(--settings-text); font-size: 15.5px; line-height: 1.65; }
+.memory-pending {
+  margin: 22px 0 0;
+  padding: 12px 14px;
+  border: 1px dashed var(--settings-border-strong);
+  border-radius: 10px;
+  color: var(--settings-text);
+  font-size: 13.5px;
+  line-height: 1.5;
+}
+.memory-pending span { display: block; margin-top: 4px; color: var(--settings-faint); }
+
+.memory-edit { display: grid; gap: 22px; padding-top: 14px; }
+/* Title and paragraph share one column, so every box ends on the same edge; × sits in its own. */
+.memory-edit__section {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 32px;
+  gap: 8px;
+  align-items: center;
+}
+.memory-dialog input.memory-edit__title { width: 100%; min-width: 0; font-weight: 650; }
+.memory-dialog textarea.memory-edit__text {
+  grid-column: 1;
+  width: 100%;
+  min-height: 7.2em;
+  max-height: 18em;
+  field-sizing: content;
+  resize: none;
+  font: inherit;
+  line-height: 1.55;
+}
+.memory-edit__add { justify-self: start; }
+.memory-count { color: var(--settings-faint); font-size: 13px; }
+.memory-count--over { color: var(--settings-danger); }
+
+/* Empty, off and reading states: one heading, one plain sentence of what happens next. */
+.memory-empty {
+  display: grid;
+  justify-items: center;
+  gap: 8px;
+  padding: 40px 16px 32px;
+  text-align: center;
+}
+.memory-empty h3 { margin: 0; color: var(--settings-text); font-size: 17px; font-weight: 650; }
+.memory-empty p {
+  max-width: 46ch;
+  margin: 0;
+  color: var(--settings-muted);
+  font-size: 14.5px;
+  line-height: 1.6;
+  text-wrap: pretty;
+}
+.memory-empty .button { justify-self: center; margin-top: 10px; }
+
+/* "Reading 12 chats…": a quiet heartbeat beside text that is changing on its own. */
+.memory-live::before {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-right: 7px;
+  border-radius: 50%;
+  content: "";
+  background: var(--settings-accent);
+  vertical-align: 0.1em;
+  animation: memory-pulse 1.6s ease-in-out infinite;
+}
+@keyframes memory-pulse { 50% { opacity: 0.3; } }
+@media (prefers-reduced-motion: reduce) { .memory-live::before { animation: none; } }

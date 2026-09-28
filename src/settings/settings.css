@@ -73,6 +73,9 @@ button {
 
   display: grid;
   grid-template-columns: 224px minmax(0, 1fr);
+  /* One bounded row: without it the row grows to the sidebar's content and
+     overflow: hidden clips the bottom of the page list instead of scrolling it. */
+  grid-template-rows: minmax(0, 1fr);
   width: 100%;
   height: 100dvh;
   overflow: hidden;
@@ -85,6 +88,7 @@ button {
 .settings-sidebar {
   display: flex;
   min-width: 0;
+  min-height: 0;
   flex-direction: column;
   padding: 18px 14px 16px;
   border-right: 1px solid var(--settings-border);
@@ -191,7 +195,21 @@ button {
 
 .settings-nav {
   display: grid;
+  flex: 1 1 auto;
+  align-content: start;
+  /* Full height per item. Auto rows shrink to their minimum when space runs out,
+     and the description's overflow: hidden lets that minimum drop below its text,
+     clipping every item's second line instead of scrolling the list. */
+  grid-auto-rows: max-content;
   gap: 3px;
+  /* The sidebar is a fixed-height column: the page list scrolls under the pinned brand and search. */
+  min-height: 0;
+  margin: 0 -4px;
+  padding: 0 4px 12px;
+  overflow-y: auto;
+  /* Same thin scrollbar as the settings content panel. */
+  scrollbar-color: #c6a790 transparent;
+  scrollbar-width: thin;
 }
 
 .settings-nav__label {
@@ -876,6 +894,27 @@ input[type="range"] {
   cursor: pointer;
 }
 
+/* Select mode: the row is a <label>, checkbox first, count pushed right. The
+   selector matches `.settings-workspace label:not(.checkbox)`, which would
+   otherwise stack it as a bold form field, and wins by coming later. */
+.settings-workspace label.history-item--select {
+  display: flex;
+  gap: 14px;
+  align-items: center;
+  justify-content: flex-start;
+  font-size: inherit;
+  font-weight: 400;
+}
+
+.history-item--select input {
+  flex: 0 0 auto;
+  margin: 0;
+}
+
+.history-item--select .history-count {
+  margin-left: auto;
+}
+
 .history-item:hover,
 .history-item[aria-expanded="true"] {
   background: #f2e3d4;
@@ -1067,6 +1106,7 @@ input[type="range"] {
 
   .settings-shell {
     grid-template-columns: 1fr;
+    grid-template-rows: none;
     height: auto;
     min-height: 100dvh;
     border: 0;

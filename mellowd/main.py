@@ -17,7 +17,7 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 from mellowd import (
-    act, agents, capture, config, errors, guide, llm, locator, meetings, perf, point, remind, sessions, stt, transport, tts, writing,
+    act, agents, capture, config, errors, guide, llm, locator, meetings, memory, perf, point, remind, sessions, stt, transport, tts, writing,
 )
 from mellowd.version import PROTOCOL, SERVICE, VERSION
 
@@ -90,11 +90,17 @@ async def lifespan(_app: FastAPI):
         log.exception("session log sweep failed")
 
     await asyncio.to_thread(meetings.manager.store.recover)
+    try:
+        await asyncio.to_thread(memory.sweep_ledger)
+    except Exception:
+        log.exception("memory could not be prepared")
     task = asyncio.create_task(warm_models())
+    memory.learner.start(busy=_memory_busy)
     async with transport.lifespan():
         try:
             yield
         finally:
+            await memory.learner.stop()
             await meetings.manager.shutdown()
             task.cancel()
             with suppress(asyncio.CancelledError):
@@ -253,6 +259,9 @@ def _candidate(body: dict) -> dict:
     """Merge a settings form over the saved config, capability by capability."""
     current = config.load()
     submitted = dict(body)
+    # Owned by PUT /memory/settings. A settings form loaded before the Memory
+    # page changed it would otherwise quietly switch it back.
+    submitted.pop("memory_enabled", None)
     merged = {**current, **submitted}
     for name in config.CAPABILITIES:
         section = submitted.get(name)
@@ -605,7 +614,110 @@ async def new_session():
 @app.post("/history/clear")
 async def clear_history():
     n = await asyncio.to_thread(sessions.clear)
+    # Summaries came from those sessions, and a digest in flight must not
+    # recreate them. Saved notes stay; they are cleared in Memory.
+    await asyncio.to_thread(memory.on_history_cleared)
     return {"cleared": n}
+
+
+def _turn_running(exclude: asyncio.Task | None = None) -> bool:
+    return any(
+        s.turn is not None and not s.turn.done() and s.turn is not exclude
+        for s in list(_active_sessions.values())
+    )
+
+
+def _memory_busy() -> bool:
+    """Background learning waits for this: a live turn or a meeting always wins."""
+    return _turn_running() or meetings.manager.active
+
+
+async def _reset_conversations(reason: str) -> None:
+    """End the conversation in progress everywhere, like New conversation."""
+    for session in list(_active_sessions.values()):
+        try:
+            await session.abort()
+        except Exception:
+            log.exception("could not stop a session while resetting (%s)", reason)
+        finally:
+            session.history.clear()
+            session.destination = None
+        with suppress(WebSocketDisconnect, RuntimeError):
+            await send(session.ws, type="state", state="idle")
+    await asyncio.to_thread(sessions.close, reason=reason)
+
+
+@app.post("/history/delete")
+async def delete_history(body: dict):
+    """Delete the chosen conversations, screenshots included."""
+    ids = body.get("ids")
+    if not isinstance(ids, list) or not all(isinstance(i, str) for i in ids):
+        raise HTTPException(status_code=400, detail="ids must be a list of session ids")
+    current = sessions.current()
+    gone = await asyncio.to_thread(sessions.delete, ids)
+    if current and current in gone:
+        # Deleting the conversation in progress also takes it out of Mellow's context.
+        await _reset_conversations("deleted")
+    # Their summaries go too, and a digest in flight over them is discarded.
+    # Saved memories stay; they are managed in Personalization.
+    await asyncio.to_thread(memory.on_sessions_deleted, gone)
+    return {"deleted": gone}
+
+
+def _memory_view() -> dict:
+    today = memory.usage_today()
+    return {
+        **memory.view(),
+        "enabled": memory.enabled(),
+        "learning_queued": today["pending"],
+        "remember_conversations": bool(config.load().get("remember_conversations", True)),
+    }
+
+
+@app.get("/memory")
+async def get_memory():
+    return await asyncio.to_thread(_memory_view)
+
+
+@app.put("/memory/document")
+async def put_memory_document(body: dict):
+    """The user's own edit of their memory summary."""
+    try:
+        await asyncio.to_thread(memory.save_document, body.get("sections"))
+    except (TypeError, ValueError) as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return await asyncio.to_thread(_memory_view)
+
+
+
+@app.put("/memory/settings")
+async def put_memory_settings(body: dict):
+    enabled = body.get("enabled")
+    if not isinstance(enabled, bool):
+        raise HTTPException(status_code=400, detail="enabled must be true or false")
+    cfg = config.load()
+    if cfg.get("memory_enabled") != enabled:
+        cfg["memory_enabled"] = enabled
+        await asyncio.to_thread(config.save, cfg)
+        await asyncio.to_thread(memory.set_enabled_changed, enabled)
+        if not enabled:
+            memory.learner.turn_started()  # stops a digest in flight; the rev bump discards it
+        memory.learner.nudge()
+    return await asyncio.to_thread(_memory_view)
+
+
+@app.post("/memory/clear")
+async def clear_memory(body: dict | None = None):
+    """Forget everything; with {"disable": true}, also switch memory off."""
+    await asyncio.to_thread(memory.clear_all)
+    if (body or {}).get("disable"):
+        cfg = config.load()
+        cfg["memory_enabled"] = False
+        await asyncio.to_thread(config.save, cfg)
+        memory.learner.turn_started()
+    await _reset_conversations("memory_cleared")
+    return await asyncio.to_thread(_memory_view)
+
 
 
 async def send(ws: WebSocket, **msg) -> None:
@@ -1808,7 +1920,17 @@ async def answer(session: Session, prompt: str, prepared=None) -> None:
 
     session.history.append({"role": "user", "content": prompt})
     # Keep disk I/O off-loop.
-    await asyncio.to_thread(sessions.record, "user_said", text=prompt)
+    said = await asyncio.to_thread(sessions.record, "user_said", text=prompt)
+    # What Mellow knows about them for this turn: About you, the memory summary,
+    # and the result of any "remember that" or "forget that". Actions never carry it.
+    remembered = (
+        await asyncio.to_thread(memory.turn_context, cfg, prompt, said)
+        if cfg.get("ai_enabled", True)
+        else ""
+    )
+    if remembered:
+        # Metadata only: proves memory reached this answer without logging its text.
+        log.info("memory: %d chars in this answer", len(remembered))
     reply = ""
     # Preserve partial output.
     partial = {"text": ""}
@@ -1844,6 +1966,8 @@ async def answer(session: Session, prompt: str, prepared=None) -> None:
                     await session.speaker.finish()
                 await send(ws, type="state", state="idle")
                 return
+        if remembered:
+            cfg = {**cfg, "memory": remembered}
         if not asked:
             reply, asked, _ = await _pass(
                 session,
@@ -2140,6 +2264,7 @@ async def run_turn(session: Session, prompt: str) -> None:
         await send(session.ws, type="state", state="idle")
     finally:
         await _discard_preparation(prepared)
+        memory.learner.turn_ended()
 
 
 @perf.timed("transcription")
@@ -2261,6 +2386,8 @@ async def handle(session: Session, msg: dict) -> None:
         # Start hardware wake-up before cancelling the previous turn so both
         # operations overlap instead of adding their latency.
         session.wake_mic()
+        # A live turn wins over background learning, which retries later.
+        memory.learner.turn_started()
         cfg = config.load()
         if cfg.get("ai_enabled"):
             point.warm_ocr()
@@ -2310,6 +2437,7 @@ async def handle(session: Session, msg: dict) -> None:
         ))
 
     elif kind == "text":
+        memory.learner.turn_started()
         await session.abort(preserve_guide=True)
         session.turn_monitor = capture.known_monitor(msg.get("monitor"))
         if msg.get("monitor") is not None and session.turn_monitor is None:
@@ -2350,6 +2478,8 @@ async def handle(session: Session, msg: dict) -> None:
         await writing.status(session, send, "idle")
         await asyncio.to_thread(sessions.close)
         await send(ws, type="state", state="idle")
+        # The conversation just finished: it can be learned from once idle.
+        memory.learner.nudge()
 
     else:
         await send(ws, type="error", message=f"unknown message: {kind!r}")

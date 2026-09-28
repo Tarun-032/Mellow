@@ -352,10 +352,13 @@ CORE = (
 
 
 def persona(cfg: dict, model: str | None = None) -> str:
-    """CORE, plus whatever they added in Settings."""
+    """CORE, then their own instructions. Who they are rides with each question (memory.turn_context)."""
+    shown = cfg["llm"]["model"] if model is None else model
     extra = str(cfg.get("system_prompt") or "").strip()
-    whole = CORE + ("\n" + extra if extra else "")
-    return whole.replace("{model}", cfg["llm"]["model"] if model is None else model)
+    parts = [CORE.replace("{model}", shown)]
+    if extra:
+        parts.append(extra.replace("{model}", shown))
+    return "\n".join(parts)
 
 
 # Step 14c: pointing The second marker
@@ -650,6 +653,9 @@ async def _openai(
     }
     if cfg["provider"] == "ollama":
         payload["keep_alive"] = "30m"
+    if cfg["provider"] in _USAGE_PROVIDERS:
+        # Without this a stream never reports tokens or whether the cache engaged.
+        payload["stream_options"] = {"include_usage": True}
     effort = cfg.get("reasoning_effort")
     if cfg["provider"] == "openrouter":
         # Don't send the thinking at all. The model still reasons
@@ -679,6 +685,15 @@ async def _openai(
         {"Authorization": f"Bearer {cfg['api_key']}"} if cfg.get("api_key") else {}
     )
 
+    usage: dict = cfg.get("_usage") if isinstance(cfg.get("_usage"), dict) else {}
+    try:
+        async for chunk in _openai_stream(cfg, payload, headers, usage):
+            yield chunk
+    finally:
+        perf.record_model(provider=cfg["provider"], prompt_bytes=_payload_bytes(payload), usage=usage)
+
+
+async def _openai_stream(cfg: dict, payload: dict, headers: dict, usage: dict) -> AsyncIterator[str]:
     async with transport.client() as client:
         async with client.stream(
             "POST",
@@ -707,6 +722,8 @@ async def _openai(
                     )
                     raise RuntimeError(f"provider stream failed: {detail[:300]}")
                 seen.model = event.get("model") or seen.model
+                if isinstance(event.get("usage"), dict):
+                    usage.update(_openai_usage(event["usage"]))
                 choices = event.get("choices") or []
                 if not choices:
                     continue
@@ -734,6 +751,28 @@ async def _openai(
                 seen.chunks += 1
                 yield rest
             seen.done(cfg)
+
+
+# Providers known to accept stream_options.include_usage. Others are parsed if they report.
+_USAGE_PROVIDERS = {"openai", "openrouter", "groq"}
+
+
+def _openai_usage(raw: dict) -> dict:
+    """OpenAI-style usage, in the field names the rest of Mellow uses."""
+    details = raw.get("prompt_tokens_details") or {}
+    return {
+        "input_tokens": raw.get("prompt_tokens", 0),
+        "output_tokens": raw.get("completion_tokens", 0),
+        "cached_input_tokens": (details.get("cached_tokens", 0) if isinstance(details, dict) else 0),
+    }
+
+
+def _payload_bytes(payload: dict) -> int:
+    try:
+        return len(json.dumps(payload.get("messages", []), default=str).encode()) + len(
+            json.dumps(payload.get("system", ""), default=str).encode())
+    except (TypeError, ValueError):
+        return 0
 
 
 def _with_image_anthropic(messages: list[dict], image_b64: str) -> list[dict]:
@@ -786,7 +825,20 @@ async def _anthropic(
         "content-type": "application/json",
     }
     base = cfg.get("base_url") or "https://api.anthropic.com/v1"
+    if not raw and base.rstrip("/").startswith("https://api.anthropic.com"):
+        # Automatic prompt caching: the breakpoint follows the conversation. A
+        # custom proxy may reject the field, so only the official host gets it.
+        payload["cache_control"] = {"type": "ephemeral"}
+    usage: dict = cfg.get("_usage") if isinstance(cfg.get("_usage"), dict) else {}
+    try:
+        async for chunk in _anthropic_stream(cfg, payload, headers, base, usage):
+            yield chunk
+    finally:
+        perf.record_model(provider="anthropic", prompt_bytes=_payload_bytes(payload), usage=usage)
 
+
+async def _anthropic_stream(cfg: dict, payload: dict, headers: dict, base: str,
+                            usage: dict) -> AsyncIterator[str]:
     async with transport.client() as client:
         async with client.stream(
             "POST", f"{base.rstrip('/')}/messages", json=payload, headers=headers
@@ -799,7 +851,10 @@ async def _anthropic(
                 event = json.loads(line[6:])
                 if event.get("type") == "message_start":
                     seen.model = event.get("message", {}).get("model") or seen.model
+                    usage.update(event.get("message", {}).get("usage") or {})
                 if event.get("type") == "message_delta":
+                    # Cumulative, so the last one wins.
+                    usage.update(event.get("usage") or {})
                     seen.finish = (
                         event.get("delta", {}).get("stop_reason") or seen.finish
                     )
@@ -930,12 +985,30 @@ def vision_ok(section: dict) -> bool:
 
 def _settings(cfg: dict) -> dict:
     """The flat view the adapters read: the `llm` section plus the shared prompt."""
+    # What Mellow knows about them arrives from main.answer, computed for this
+    # turn, and rides in the latest user message (see memory.turn_context).
     return {
         **cfg["llm"],
         "system_prompt": persona(cfg),
+        "memory_turn": str(cfg.get("memory") or ""),
         # Which screen rule the adapters should inject.
         "vision_ok": vision_ok(cfg["llm"]),
     }
+
+
+def _with_memory(messages: list[dict], text: str) -> list[dict]:
+    """This turn's memory text ahead of the latest question, on a copy.
+
+    session.history never sees it, so nothing injected accumulates across turns.
+    """
+    if not text:
+        return messages
+    out = list(messages)
+    for i in range(len(out) - 1, -1, -1):
+        if out[i].get("role") == "user" and isinstance(out[i].get("content"), str):
+            out[i] = {**out[i], "content": f"{text}\n\n{out[i]['content']}"}
+            break
+    return out
 
 
 # A past turn where Mellow said it couldn't see.
@@ -989,6 +1062,7 @@ async def chat(
     # Only when it can see now: if the model still takes no images
     if section.get("vision_ok"):
         messages = _drop_stale_refusals(messages)
+    messages = _with_memory(messages, section.get("memory_turn") or "")
     adapter = _anthropic if section["provider"] == "anthropic" else _openai
     log.info(
         "chat via %s model=%s%s",
@@ -1002,7 +1076,8 @@ async def chat(
 
 
 async def complete_text(prompt: str, cfg: dict, system: str, image: bytes | None = None,
-                        temperature: float = 0.2) -> str:
+                        temperature: float = 0.2, max_tokens: int = 4096,
+                        usage: dict | None = None) -> str:
     """A text-only completion with no persona, anchoring or tool execution.
 
     0.2 suits classifying and note-taking, where the same input should give the
@@ -1010,7 +1085,9 @@ async def complete_text(prompt: str, cfg: dict, system: str, image: bytes | None
     draft an email came back as the user's own sentence in tidier English.
     """
     section = {**cfg["llm"], "raw": True, "anchor": False, "system_prompt": system,
-               "max_tokens": 4096, "temperature": temperature}
+               "max_tokens": max_tokens, "temperature": temperature}
+    if usage is not None:
+        section["_usage"] = usage
     adapter = _anthropic if section["provider"] == "anthropic" else _openai
     import base64
     image_b64 = base64.b64encode(image).decode("ascii") if image else None
