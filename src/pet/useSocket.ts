@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { emit, listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
+import type { GuideOutcome } from "./guidePresentation";
 
 const URL = "ws://127.0.0.1:8765/ws";
 
@@ -31,12 +32,15 @@ type Incoming =
   | { type: "remind"; text: string; id: string }
   | { type: "pong"; echo: string }
   | { type: "capture"; phase: "begin" | "end" }
-  | { type: "point"; nx: number | null; ny?: number; label?: string; monitor?: Monitor }
+  | { type: "point"; nx: number | null; ny?: number; label?: string; monitor?: Monitor; presentation_id?: string }
   | { type: "pomodoro"; action: "start" | "stop"; minutes?: number | null }
   | { type: "error"; message: string };
 
 /** Normalized bone target. */
-export type Point = { nx: number; ny: number; label: string; monitor?: Monitor };
+export type Point = {
+  nx: number; ny: number; label: string; monitor?: Monitor;
+  acknowledge: (outcome: GuideOutcome) => void;
+};
 
 /** Sidecar connection. */
 export function useSocket() {
@@ -58,6 +62,12 @@ export function useSocket() {
   const [reminder, setReminder] = useState("");
   // Current point target.
   const [point, setPoint] = useState<Point | null>(null);
+  const activePoint = useRef<Point | null>(null);
+  const retirePoint = useCallback(() => {
+    activePoint.current?.acknowledge("failed");
+    activePoint.current = null;
+    setPoint(null);
+  }, []);
   const [guideWaiting, setGuideWaiting] = useState(false);
   // Spoken pomodoro request.
   const [timer, setTimer] = useState<{ action: "start" | "stop"; minutes: number | null; n: number } | null>(null);
@@ -71,7 +81,7 @@ export function useSocket() {
       if (!alive) return;
       aiEnabledRef.current = enabled;
       setAiEnabled(enabled);
-      if (!enabled) setPoint(null);
+      if (!enabled) retirePoint();
     };
     const stop = listen<boolean>("ai-enabled", ({ payload }) => {
       if (typeof payload !== "boolean") return;
@@ -93,7 +103,7 @@ export function useSocket() {
       alive = false;
       void stop.then((off) => off()).catch(() => {});
     };
-  }, [connected]);
+  }, [connected, retirePoint]);
 
   useEffect(() => {
     let disposed = false;
@@ -109,6 +119,7 @@ export function useSocket() {
       };
 
       sock.onmessage = async (e) => {
+        if (disposed || ws.current !== sock) return;
         const msg: Incoming = JSON.parse(e.data);
         switch (msg.type) {
           case "guide":
@@ -165,16 +176,29 @@ export function useSocket() {
             }));
             break;
           case "point":
-            setPoint(
-              msg.nx === null || !aiEnabledRef.current
-                ? null
-                : {
-                    nx: msg.nx,
-                    ny: msg.ny ?? 0,
-                    label: msg.label ?? "",
-                    monitor: msg.monitor,
-                  },
-            );
+            // Bind receipts to this socket and object, never a replacement connection.
+            activePoint.current = null;
+            if (msg.nx === null || !aiEnabledRef.current) {
+              if (msg.nx !== null && msg.presentation_id && sock.readyState === WebSocket.OPEN) {
+                sock.send(JSON.stringify({ type: "guide_ack", presentation_id: msg.presentation_id, outcome: "failed" }));
+              }
+              setPoint(null);
+            } else {
+              let acknowledged = false;
+              const target: Point = {
+                nx: msg.nx,
+                ny: msg.ny ?? 0,
+                label: msg.label ?? "",
+                monitor: msg.monitor,
+                acknowledge: (outcome) => {
+                  if (acknowledged || activePoint.current !== target || ws.current !== sock || sock.readyState !== WebSocket.OPEN || !msg.presentation_id) return;
+                  acknowledged = true;
+                  sock.send(JSON.stringify({ type: "guide_ack", presentation_id: msg.presentation_id, outcome }));
+                },
+              };
+              activePoint.current = target;
+              setPoint(target);
+            }
             break;
           case "error":
             // Log visible errors.
@@ -186,11 +210,13 @@ export function useSocket() {
 
       sock.onerror = () => sock.close();
       sock.onclose = () => {
+        if (disposed || ws.current !== sock) return;
         setConnected(false);
         setWriting(null);
         setMicrophone("off");
         setMicLevel(0);
         // Clear disconnected guides.
+        activePoint.current = null;
         setPoint(null);
         setGuideWaiting(false);
         if (!disposed) timer = setTimeout(connect, 1000);
@@ -211,8 +237,8 @@ export function useSocket() {
     setReply("");
     setError("");
     setReminder("");
-    setPoint(null);
-  }, []);
+    retirePoint();
+  }, [retirePoint]);
 
   /** Dismiss a reminder. */
   const dismissReminder = useCallback(() => setReminder(""), []);

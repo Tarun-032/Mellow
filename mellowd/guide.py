@@ -6,6 +6,8 @@ import ctypes
 import ctypes.wintypes
 from dataclasses import dataclass, field
 import time
+import uuid
+from typing import Callable
 
 import numpy as np
 from PIL import Image
@@ -13,6 +15,49 @@ from PIL import Image
 POLL = .05
 TIMEOUT = 120.0
 MAX_SEGMENTS = 8
+
+# Current native target flights take at most 1.1s. This is a failure deadline,
+# not a pause added to every sentence. No model retry is made on expiry.
+ARRIVAL_TIMEOUT = 2.5
+
+
+@dataclass
+class Presentation:
+    """One dispatched pointer, owned by one connection and playback sequence."""
+
+    mark: Callable[[str], None] = field(default=lambda _: None, repr=False)
+    id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    deadline: float = field(default_factory=lambda: time.monotonic() + ARRIVAL_TIMEOUT)
+    settled: asyncio.Event = field(default_factory=asyncio.Event)
+    outcome: str | None = None
+    retired: bool = False
+
+    def acknowledge(self, outcome: str) -> None:
+        if self.retired or self.outcome is not None or outcome not in ("arrived", "failed"):
+            return
+        self.outcome = outcome if time.monotonic() <= self.deadline else "timeout"
+        self.mark("pointer_arrival_received" if self.outcome == "arrived" else f"pointer_{self.outcome}")
+        self.settled.set()
+
+    def retire(self) -> None:
+        # Even an already-arrived ticket cannot release old queued speech.
+        self.retired = True
+        self.settled.set()
+
+    async def wait(self) -> bool:
+        if not self.settled.is_set():
+            try:
+                await asyncio.wait_for(self.settled.wait(), max(0, self.deadline - time.monotonic()))
+            except TimeoutError:
+                self.outcome = "timeout"
+                self.mark("pointer_timeout")
+                self.settled.set()
+        if self.retired:
+            raise asyncio.CancelledError
+        if self.outcome == "arrived":
+            self.mark("pointer_playback_ready")
+            return True
+        return False
 
 
 @dataclass(frozen=True)

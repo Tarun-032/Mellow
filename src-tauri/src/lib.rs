@@ -363,7 +363,9 @@ fn show_pet(app: &tauri::AppHandle) {
         let _ = win.set_always_on_top(true);
         let _ = win.set_focusable(false);
         let _ = win.set_ignore_cursor_events(true);
-        let _ = win.show();
+        if win.show().is_ok() {
+            let _ = app.emit_to("pet", PET_WAKE, ());
+        }
         restore_topmost(&win);
     }
 }
@@ -689,7 +691,11 @@ pub fn run() {
                     }
                     "pet_hide" => {
                         if let Some(win) = app.get_webview_window("pet") {
-                            let _ = win.hide();
+                            if win.hide().is_ok() {
+                                // Only the pet owns the sidecar connection. It
+                                // cancels speech as well as clearing its point.
+                                let _ = app.emit_to("pet", "pet-hidden", ());
+                            }
                         }
                     }
                     "pet_quit" => app.exit(0),

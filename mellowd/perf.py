@@ -61,6 +61,12 @@ def mark(name):
         turn.mark(name)
 
 
+def marker():
+    """Bind timing to its owning turn, including receipts on the WS task."""
+    turn = _current.get()
+    return turn.mark if turn is not None else lambda _: None
+
+
 def outcome(value):
     if turn := _current.get():
         with turn.lock:

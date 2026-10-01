@@ -5,6 +5,7 @@ import { PomodoroPanel, ReminderPanel } from "./Panels";
 import { MeetingPanel } from "../meetings/MeetingPanel";
 import { clock as meetingClock, useMeeting, viewMeeting } from "../meetings/useMeeting";
 import { GUIDE_DIALOGUE_KEY, type GuideDialogue } from "./guideDialogue";
+import { GuidePresentation, type GuideAck } from "./guidePresentation";
 import { PHASE_LABEL, mmss, usePomodoro } from "./usePomodoro";
 import { useSocket } from "./useSocket";
 import { useCoat } from "../ui/coatApply";
@@ -47,8 +48,6 @@ type Nap = "awake" | "yawn" | "sleeping";
 
 /** Nap override. */
 type Hold = "awake" | "sleep" | null;
-
-type GuideAck = { accepted: boolean; arrived: boolean };
 
 // Monotonic guide revision.
 let lastGuideRevision = 0;
@@ -112,6 +111,7 @@ export default function Pet() {
     return () => window.clearTimeout(timeout);
   }, [completedMeetingId, dismissedMeetingId]);
   const [nap, setNap] = useState<Nap>("awake");
+  const [hidden, setHidden] = useState(false);
   const [panel, setPanel] = useState<Panel>(null);
   // Show only blocked drafts.
   const writingPanel = writing && writing.status === "blocked" ? writing : null;
@@ -156,11 +156,20 @@ export default function Pet() {
 
   // Wake after onboarding.
   useEffect(() => {
-    const stop = listen("pet-wake", wake);
+    const stop = listen("pet-wake", () => { setHidden(false); wake(); });
     return () => {
       stop.then((off) => off()).catch(() => {});
     };
   }, [wake]);
+
+  useEffect(() => {
+    const stop = listen("pet-hidden", () => {
+      held.current = false;
+      setHidden(true);
+      clear();
+    });
+    return () => { stop.then((off) => off()).catch(() => {}); };
+  }, [clear]);
 
   // Sidecar activity wakes Mellow.
   useEffect(() => {
@@ -286,7 +295,7 @@ export default function Pet() {
     if (meetingActive) { held.current = false; clear(); }
   }, [meetingActive, panel, setQuiet, clear]);
   // Disable pointing while hidden.
-  const pointing = aiEnabled && point !== null && !quiet && pose === "awake";
+  const pointing = aiEnabled && point !== null && !quiet && !hidden && pose === "awake";
   // Wait for bone arrival.
   const [landed, setLanded] = useState(false);
   // Track the pointing turn.
@@ -294,11 +303,12 @@ export default function Pet() {
   // Dismiss after playback.
   const spokeThisTurn = useRef(false);
   const guideRevision = useRef(0);
+  const presentation = useRef(new GuidePresentation());
   const dialogueRevision = useRef(0);
 
   useEffect(() => {
     const stop = listen<{ revision: number }>("guide-arrived", ({ payload }) => {
-      if (payload.revision === guideRevision.current) setLanded(true);
+      presentation.current.arrived(payload.revision);
     });
     return () => {
       stop.then((off) => off()).catch(() => {});
@@ -307,6 +317,7 @@ export default function Pet() {
 
   // Clear the guide on unmount.
   useEffect(() => () => {
+    presentation.current.clear();
     dialogueRevision.current += 1;
     localStorage.removeItem(GUIDE_DIALOGUE_KEY);
     void invoke("guide_set_dialogue", { visible: false }).catch(() => {});
@@ -316,6 +327,7 @@ export default function Pet() {
   useEffect(() => {
     const revision = nextGuideRevision();
     guideRevision.current = revision;
+    presentation.current.clear();
     setLanded(false);
 
     if (!point) {
@@ -326,6 +338,16 @@ export default function Pet() {
     }
 
     pointed.current = true;
+    presentation.current.start(revision, (outcome) => {
+      if (revision !== guideRevision.current) return;
+      point.acknowledge(outcome);
+      // A command failure can still show the explanation, but is not arrival.
+      setLanded(true);
+    });
+    if (!aiEnabled || quiet !== null || hidden || pose !== "awake") {
+      presentation.current.failed(revision);
+      return;
+    }
     void invoke<GuideAck>("guide_set_target", {
       revision,
       nx: point.nx,
@@ -333,20 +355,22 @@ export default function Pet() {
       monitor: point.monitor,
     })
       .then((ack) => {
-        if (revision === guideRevision.current && ack.arrived) setLanded(true);
+        presentation.current.result(revision, ack);
       })
       .catch((error) => {
         console.error("[mellow] guide target failed:", error);
-        // Fall back to dialogue.
-        if (revision === guideRevision.current) setLanded(true);
+        presentation.current.failed(revision);
       });
   }, [point]);
 
   useEffect(() => {
-    void invoke("guide_set_quiet", { quiet: !aiEnabled || quiet !== null }).catch((error) =>
+    if (!aiEnabled || quiet !== null || hidden || pose !== "awake") {
+      presentation.current.failed(guideRevision.current);
+    }
+    void invoke("guide_set_quiet", { quiet: !aiEnabled || quiet !== null || hidden }).catch((error) =>
       console.error("[mellow] guide visibility failed:", error),
     );
-  }, [quiet, aiEnabled]);
+  }, [quiet, aiEnabled, pose, hidden]);
 
   // Track turn playback.
   useEffect(() => {
@@ -380,7 +404,7 @@ export default function Pet() {
   // Handle the PTT hotkey.
   useEffect(() => {
     const stop = listen<boolean>("ptt", ({ payload: down }) => {
-      if (meetingActive) return;
+      if (meetingActive || hidden) return;
       // The sidecar keeps this press pending while the microphone wakes.
       if (!down && !held.current) return;
       // Ignore key-repeat.
@@ -400,10 +424,10 @@ export default function Pet() {
     return () => {
       stop.then((off) => off()).catch(() => {});
     };
-  }, [send, wake, clear, setQuiet, meetingActive]);
+  }, [send, wake, clear, setQuiet, meetingActive, hidden]);
 
   // Keep the mic ready while awake.
-  const listening = !meetingActive && nap !== "sleeping" && !quiet;
+  const listening = !hidden && !meetingActive && nap !== "sleeping" && !quiet;
   useEffect(() => {
     if (connected) send({ type: "awake", value: listening });
   }, [connected, listening, send]);

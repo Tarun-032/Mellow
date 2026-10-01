@@ -740,6 +740,7 @@ class Session:
     turn: asyncio.Task | None = None
     guide_pending: guide.Pending | None = None
     guide_task: asyncio.Task | None = None
+    presentation: guide.Presentation | None = None
     awake: bool = False
     warmup: asyncio.Task | None = None
     meter: asyncio.Task | None = None
@@ -948,6 +949,7 @@ class Session:
 
     async def abort(self, *, preserve_guide: bool = False) -> None:
         """Stop whatever the pet is doing, right now."""
+        _retire_point(self)
         self.writer.cancel()
         if self.turn and not self.turn.done():
             self.turn.cancel()
@@ -961,6 +963,8 @@ class Session:
                 await self.turn
         self.turn = None
         await self.speaker.stop()
+        if self.alive:
+            await _hide_point(self)
 
 
 # Per-shell histories.
@@ -1187,6 +1191,7 @@ async def _pass(
     partial: dict | None = None,
     on_point=None,
     token=None,
+    presentation: guide.Presentation | None = None,
 ) -> tuple[str, bool, Pick | Deed | None]:
     """One streaming pass of the model, into the bubble and the voice."""
     ws = session.ws
@@ -1197,6 +1202,25 @@ async def _pass(
     # Hold a possible point marker.
     tail = ""
     point: Pick | None = None
+    pointer_failed = False
+
+    async def before_speech():
+        nonlocal pointer_failed
+        if presentation is not None and not await presentation.wait():
+            pointer_failed = True
+            return False
+        return True
+
+    async def queue(sentence):
+        if presentation is None:
+            await session.speaker.speak(sentence)
+        else:
+            await session.speaker.speak_beat(sentence, before_speech)
+
+    if not speak and presentation is not None and not await presentation.wait():
+        await _stop_guide(session)
+        await _hide_point(session)
+        return await _deliver(session, _POINTER_UNAVAILABLE, False, partial), False, None
 
     async def emit(text: str, final: bool = False) -> None:
         nonlocal reply, tail, point
@@ -1220,7 +1244,7 @@ async def _pass(
         await send(ws, type="reply_chunk", text=text)
         if speak:
             for sentence in sentences.feed(text):
-                await session.speaker.speak(sentence)
+                await queue(sentence)
 
     def resolve(text: str) -> tuple[str, bool]:
         """(what to emit, whether the model asked for eyes) for a held opening."""
@@ -1279,7 +1303,13 @@ async def _pass(
 
     if speak:
         for sentence in sentences.flush():
-            await session.speaker.speak(sentence)
+            await queue(sentence)
+        if presentation is not None:
+            await _played(session)
+            if pointer_failed:
+                await _stop_guide(session)
+                await _hide_point(session)
+                reply += await _deliver(session, _POINTER_UNAVAILABLE, True, partial)
     return reply, False, point
 
 
@@ -1318,13 +1348,7 @@ async def _deliver(
 # belongs is written by the model as a narration beat.
 _CUT_SHORT = "That's moved, so I'll stop there rather than point at the wrong thing."
 
-# The bone's flight is 0.50-1.10s (src-tauri/src/cursor.rs). The sidecar is not
-# told when it lands - `guide-arrived` goes to the frontend - so a step waits
-# this long before speaking, which puts the bone in motion toward the control
-# before the sentence about it starts.
-# ponytail: a fixed delay, not an acknowledgement. Tune it here; a real arrival
-# signal would cost a new WebSocket message for one feature.
-FLIGHT_SETTLE = 0.35
+_POINTER_UNAVAILABLE = "I couldn't get the pointer into place, so I'll stop pointing there."
 
 
 def _dwell(sentence: str) -> float:
@@ -1386,8 +1410,10 @@ async def _narrate(
     shown = 0      # bones actually put on screen: what latency.md counts
     up = True      # answer() already showed and verified the first bone
     spoke_bone = False
+    presentation = getattr(session, "presentation", None)
+    obstacle = _CUT_SHORT
     async def present(target, sentence):
-        nonlocal shown, up, spoke_bone, shot, cut
+        nonlocal shown, up, spoke_bone, shot, cut, presentation, obstacle
         if target is None:
             # Narration. Take the bone away first, or unrelated prose is read
             # beside a control it is no longer about. Before the first bone
@@ -1405,13 +1431,15 @@ async def _narrate(
                 if target is None:
                     cut = True
                     return False
-                await _aim(session, target)
+                presentation = await _aim(session, target)
                 # _aim's own mark keeps the first dispatch, which latency.md
                 # keys on; number the rest by bone, never by beat.
                 perf.mark(f"pointer_dispatched_{shown}")
                 up = True
-                # The bone is moving before its clause starts.
-                await asyncio.sleep(FLIGHT_SETTLE)
+            if presentation is None or not await presentation.wait():
+                cut = True
+                obstacle = _POINTER_UNAVAILABLE
+                return False
             spoke_bone = True
             await _arm_guide(session, target, shot)
         said.append(await _deliver(session, sentence, False, partial))
@@ -1427,14 +1455,17 @@ async def _narrate(
             await session.speaker.speak_beat(sentence, before)
         await _played(session)
     else:
-        for target, sentence in beats:
+        for index, (target, sentence) in enumerate(beats):
             if not await present(target, sentence):
                 break
-            await asyncio.sleep(_dwell(sentence))
+            # The frontend gives the final silent reply its existing reading
+            # timeout; dwell here only while another pointer beat is waiting.
+            if index < len(beats) - 1:
+                await asyncio.sleep(_dwell(sentence))
     if cut:
         await _stop_guide(session)
         await _hide_point(session)
-        said.append(await _deliver(session, _CUT_SHORT, speak, partial))
+        said.append(await _deliver(session, obstacle, speak, partial))
     # A narration that ends on a bone leaves it up; the turn's `idle` retires it.
     return "".join(said)
 
@@ -1454,7 +1485,8 @@ async def _stop_guide(session, *, preserve=False):
     if pending:
         pending.observer = None
         await _hide_point(session)
-        await send(session.ws, type="guide", waiting=False)
+        if getattr(session, "alive", True):
+            await send(session.ws, type="guide", waiting=False)
 
 
 async def _arm_guide(session, target, shot):
@@ -1537,7 +1569,10 @@ async def _guide_loop(session, *, force=False):
                     await _guide_handover(session, pending)
                     break
                 pending.target, pending.shot = target, shot
-                await _aim(session, target)
+                presentation = await _aim(session, target)
+                if not await presentation.wait():
+                    await _guide_handover(session, pending)
+                    break
                 await _arm_guide(session, pending.target, pending.shot)
                 await send(session.ws, type="state", state="idle")
                 continue
@@ -1575,12 +1610,8 @@ async def _guide_loop(session, *, force=False):
             else:
                 next_pending = _pending_guide(session, pending.goal, result, beats, fresh, pending.partial, pending)
                 await _aim(session, target)
-                if len(beats) > 1:
-                    reply = await _narrate(session, beats, speak, pending.partial, fresh)
-                else:
-                    await _arm_guide(session, target, fresh)
-                    reply = await _deliver(session, beats[0][1], speak, pending.partial)
-                if next_pending:
+                reply = await _narrate(session, beats, speak, pending.partial, fresh)
+                if next_pending and session.guide_pending is next_pending:
                     next_pending.ready.set()
             if speak:
                 await session.speaker.finish()
@@ -1626,14 +1657,27 @@ def _seen_cfg(
     }
 
 
+def _retire_point(session: Session) -> None:
+    if presentation := getattr(session, "presentation", None):
+        presentation.retire()
+    session.presentation = None
+
+
 async def _hide_point(session: Session) -> None:
     """Take the bone away."""
-    await send(session.ws, type="point", nx=None)
+    _retire_point(session)
+    if getattr(session, "alive", True):
+        await send(session.ws, type="point", nx=None)
 
 
-async def _aim(session: Session, target: point.Target) -> None:
+async def _aim(session: Session, target: point.Target) -> guide.Presentation:
     """Put the bone on a row of the list."""
     log.info("pointing at %r via %s", target.label, target.source)
+    _retire_point(session)
+    # Register before send: an event can arrive before send_text returns.
+    presentation = guide.Presentation(mark=perf.marker())
+    session.presentation = presentation
+    perf.mark("pointer_dispatched")
     await send(
         session.ws,
         type="point",
@@ -1641,8 +1685,9 @@ async def _aim(session: Session, target: point.Target) -> None:
         ny=target.ny,
         label=target.label,
         monitor=target.monitor,
+        presentation_id=presentation.id,
     )
-    perf.mark("pointer_dispatched")
+    return presentation
 
 
 def _declined(text: str) -> bool:
@@ -2156,13 +2201,7 @@ async def answer(session: Session, prompt: str, prepared=None) -> None:
                 )
                 if beats:
                     _pending_guide(session, prompt, grounded, beats, shot, partial)
-                if len(beats) > 1:
                     reply = await _narrate(session, beats, speak, partial, shot)
-                elif beats:
-                    await _arm_guide(session, aimed, shot)
-                    reply = await _deliver(
-                        session, beats[0][1], speak, partial=partial
-                    )
                 else:
                     reply, _, _ = await _pass(
                         session,
@@ -2180,6 +2219,7 @@ async def answer(session: Session, prompt: str, prepared=None) -> None:
                         image=shot.data,
                         look="strip",
                         partial=partial,
+                        presentation=getattr(session, "presentation", None) if aimed else None,
                     )
             else:
                 # Report capture failure.
@@ -2350,6 +2390,11 @@ async def handle(session: Session, msg: dict) -> None:
 
     if kind == "ping":
         await send(ws, type="pong", echo=msg.get("text", ""))
+
+    elif kind == "guide_ack":
+        presentation = getattr(session, "presentation", None)
+        if presentation is not None and msg.get("presentation_id") == presentation.id:
+            presentation.acknowledge(msg.get("outcome"))
 
     elif kind == "capture_ready":
         # Capture is ready.

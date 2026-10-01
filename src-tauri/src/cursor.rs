@@ -117,6 +117,7 @@ struct GuideMotion {
     reduced_motion: bool,
     revision: u64,
     width: f64,
+    arrival_pending: Option<u64>,
     height: f64,
     tip_x: f64,
     tip_y: f64,
@@ -135,6 +136,7 @@ impl Default for GuideMotion {
             quiet: false,
             reduced_motion: false,
             revision: 0,
+            arrival_pending: None,
             width: 36.0,
             height: 36.0,
             tip_x: 10.0,
@@ -142,6 +144,22 @@ impl Default for GuideMotion {
             side_x: 1.0,
             side_y: 1.0,
             phase: Phase::Following,
+        }
+    }
+}
+
+impl GuideMotion {
+    // Call only after this tick successfully submits placement and visibility.
+    fn take_arrival(&mut self, submitted_revision: u64) -> Option<u64> {
+        if self.ready
+            && !self.quiet
+            && matches!(self.phase, Phase::Dwelling { .. })
+            && self.revision == submitted_revision
+            && self.arrival_pending == Some(self.revision)
+        {
+            self.arrival_pending.take()
+        } else {
+            None
         }
     }
 }
@@ -474,6 +492,7 @@ pub fn guide_ready(
     guide.ready = true;
     // First ready only: reset to follow (StrictMode must not clear a live point).
     if first_ready {
+        guide.arrival_pending = None;
         guide.phase = Phase::Following;
         guide.velocity = Point::default();
         guide.initialized = false;
@@ -519,19 +538,24 @@ pub fn guide_set_target(
             arrived: false,
         });
     }
+    if !guide.ready {
+        return Err("guide is not ready".into());
+    }
     guide.revision = revision;
+    guide.arrival_pending = None;
     initialize_at_cursor(cursor, &mut guide, &all_screens);
     let destination = target_destination(nx, ny, target_screen, &guide);
     if guide.position.distance(destination) <= 2.0 * target_screen.scale {
         guide.position = destination;
         guide.velocity = Point::default();
         guide.phase = Phase::Dwelling { at: destination };
+        guide.arrival_pending = Some(revision);
         drop(guide);
         hide_dialogue(&app);
-        let _ = app.emit(GUIDE_ARRIVED, GuideArrived { revision });
         return Ok(GuideAck {
             accepted: true,
-            arrived: true,
+            // Even a repeated target needs a successful visible native tick.
+            arrived: false,
         });
     }
     begin_flight(
@@ -558,9 +582,6 @@ pub fn guide_clear(
     revision: u64,
 ) -> Result<GuideAck, String> {
     let all_screens = screens(&app);
-    let cursor = current_cursor(&app)?;
-    let cursor_screen =
-        screen_for(cursor, &all_screens).ok_or_else(|| "no monitor is available".to_string())?;
     let mut guide = state.motion.lock().map_err(|_| "guide state poisoned")?;
     if revision <= guide.revision {
         return Ok(GuideAck {
@@ -569,6 +590,24 @@ pub fn guide_clear(
         });
     }
     guide.revision = revision;
+    guide.arrival_pending = None;
+    // Invalidate before querying the OS: a cursor failure must not preserve an
+    // old target that can announce arrival after the backend cancelled it.
+    let cursor = match current_cursor(&app) {
+        Ok(cursor) => cursor,
+        Err(error) => {
+            guide.phase = Phase::Following;
+            drop(guide);
+            hide_dialogue(&app);
+            return Err(error);
+        }
+    };
+    let Some(cursor_screen) = screen_for(cursor, &all_screens) else {
+        guide.phase = Phase::Following;
+        drop(guide);
+        hide_dialogue(&app);
+        return Err("no monitor is available".into());
+    };
     initialize_at_cursor(cursor, &mut guide, &all_screens);
     let destination = follow_destination(cursor, cursor_screen, &mut guide);
     if matches!(guide.phase, Phase::Following)
@@ -785,8 +824,7 @@ fn tick(app: &AppHandle, state: &GuideState) {
         runtime.last_tick = now;
         dt
     };
-    let mut arrival = None;
-    let (position, ready, quiet, width, height) = {
+    let (position, ready, quiet, width, height, revision) = {
         let mut motion = state
             .motion
             .lock()
@@ -881,7 +919,7 @@ fn tick(app: &AppHandle, state: &GuideState) {
                         motion.velocity = Point::default();
                         if kind == FlightKind::Target {
                             motion.phase = Phase::Dwelling { at: end };
-                            arrival = Some(revision);
+                            motion.arrival_pending = Some(revision);
                         } else {
                             motion.phase = Phase::Following;
                         }
@@ -897,12 +935,9 @@ fn tick(app: &AppHandle, state: &GuideState) {
             motion.quiet,
             motion.width,
             motion.height,
+            motion.revision,
         )
     };
-
-    if let Some(revision) = arrival {
-        let _ = app.emit(GUIDE_ARRIVED, GuideArrived { revision });
-    }
 
     let should_show = ready && !quiet && pet.is_visible().unwrap_or(false);
     let currently_visible = guide_window.is_visible().unwrap_or(false);
@@ -917,19 +952,28 @@ fn tick(app: &AppHandle, state: &GuideState) {
     let x = position.x.round() as i32;
     let y = position.y.round() as i32;
     let move_window = {
-        let mut runtime = state
+        let runtime = state
             .runtime
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if (x, y) == runtime.last_window_position {
             false
         } else {
-            runtime.last_window_position = (x, y);
             true
         }
     };
     if move_window {
-        let _ = guide_window.set_position(PhysicalPosition::new(x, y));
+        if guide_window
+            .set_position(PhysicalPosition::new(x, y))
+            .is_err()
+        {
+            return;
+        }
+        state
+            .runtime
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .last_window_position = (x, y);
     }
 
     let guide_center = Point {
@@ -938,26 +982,47 @@ fn tick(app: &AppHandle, state: &GuideState) {
     };
     if let Some(screen) = screen_for(guide_center, &all_screens) {
         let resize = {
-            let mut runtime = state
+            let runtime = state
                 .runtime
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if (screen.scale - runtime.last_scale).abs() <= 0.001 {
                 false
             } else {
-                runtime.last_scale = screen.scale;
                 true
             }
         };
         if resize {
-            let _ = guide_window.set_size(LogicalSize::new(width, height));
+            if guide_window
+                .set_size(LogicalSize::new(width, height))
+                .is_err()
+            {
+                return;
+            }
+            state
+                .runtime
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .last_scale = screen.scale;
         }
     }
 
     // Showing a hidden window can put it below the currently active application.
     if !currently_visible {
-        let _ = guide_window.show();
+        if guide_window.show().is_err() {
+            return;
+        }
         restore_topmost(&guide_window);
+    }
+    // Arrival means successful native placement and visibility submission,
+    // not merely an elapsed flight. It does not measure display scanout.
+    let arrival = state
+        .motion
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .take_arrival(revision);
+    if let Some(revision) = arrival {
+        let _ = app.emit(GUIDE_ARRIVED, GuideArrived { revision });
     }
 }
 
