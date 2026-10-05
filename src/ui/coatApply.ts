@@ -8,7 +8,7 @@ import { useEffect } from "react";
 import { listen } from "@tauri-apps/api/event";
 
 import { API } from "./fields";
-import { ROLES, type Coat, type Role, isCoat, mapPixel, nearestSource } from "./coat";
+import { DEFAULT_COAT, ROLES, type Coat, type Role, isCoat, mapPixel, nearestSource } from "./coat";
 import sheet from "../pet/sprites.json" with { type: "json" };
 import spritesUrl from "../pet/sprites.png";
 import writingUrl from "../pet/writing.png";
@@ -88,6 +88,17 @@ async function recolour(url: string, coat: Coat): Promise<string> {
   const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/png"));
   if (!blob) throw new Error(`could not encode ${url}`);
   return URL.createObjectURL(blob);
+}
+
+/** The bone with its cream filled in another colour, outline kept. One blob per colour, kept for the session. */
+const tinted = new Map<string, Promise<string>>();
+export function tintedBone(fill: string): Promise<string> {
+  let url = tinted.get(fill);
+  if (!url) {
+    url = recolour(boneUrl, { ...DEFAULT_COAT, cream: fill });
+    tinted.set(fill, url);
+  }
+  return url;
 }
 
 /** Blob URLs currently in use, per element, so superseded ones get revoked. */

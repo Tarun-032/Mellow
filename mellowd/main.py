@@ -7,6 +7,7 @@ import re
 import sys
 import threading
 import time
+import uuid
 from contextlib import aclosing, asynccontextmanager, suppress
 from dataclasses import dataclass, field, replace
 from datetime import datetime
@@ -17,7 +18,7 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 from mellowd import (
-    act, agents, capture, config, drawing, errors, guide, llm, locator, meetings, memory, perf, point, remind, sessions, stt, transport, tts, visual_explanation, writing,
+    act, agents, capture, config, drawing, errors, guide, llm, locator, meetings, memory, perf, point, remind, research, sessions, stt, transport, tts, visual_explanation, writing,
 )
 from mellowd.version import PROTOCOL, SERVICE, VERSION
 
@@ -996,6 +997,66 @@ class Session:
 # Per-shell histories.
 _active_sessions: dict[int, Session] = {}
 _engine_revision = 0
+
+# Research outlives the turn that asked for it: barge-in cancels session.turn,
+# never these. Each job's last message is replayed to a shell that reconnects.
+MAX_RESEARCH = 3
+_research_tasks: dict[str, asyncio.Task] = {}
+_research_state: dict[str, dict] = {}
+
+
+async def _publish_research(job: str, **fields) -> None:
+    _research_state[job] = {"type": "research", "id": job, **fields}
+    for session in list(_active_sessions.values()):
+        with suppress(WebSocketDisconnect, RuntimeError):
+            await send(session.ws, **_research_state[job])
+
+
+async def _research_job(job: str, question: str, cfg: dict) -> None:
+    revision = _engine_revision
+    await _publish_research(job, status="working", question=question)
+    try:
+        found = await research.run(question, cfg)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        log.warning("research failed: %s", e)
+        perf.outcome("failed")
+        if job in _research_state:
+            await _publish_research(job, status="failed", question=question, message=errors.message(e))
+        return
+    finally:
+        _research_tasks.pop(job, None)
+    if job not in _research_state:  # dismissed while the answer was on its way
+        return
+    await _publish_research(job, status="done", question=question, title=found.title,
+                            paragraphs=found.paragraphs, sources=found.sources)
+    await asyncio.to_thread(sessions.record, "tool_result", what="research", detail=question, title=found.title)
+    # Into the conversation, so "what did it say about pricing?" has an answer.
+    for session in list(_active_sessions.values()):
+        if session.turn is not None and not session.turn.done():
+            # A live turn's user/assistant pair stays together.
+            await asyncio.wait({session.turn})
+        if revision != _engine_revision:
+            return
+        session.history += [
+            {"role": "user", "content": f"(Earlier I asked you to research: {question})"},
+            {"role": "assistant", "content": f"My research found this.\n\n{found.plain}"},
+        ]
+        del session.history[: max(0, len(session.history) - HISTORY_TURNS * 2)]
+
+
+async def _start_research(session: "Session", cfg: dict, speak: bool, partial: dict, prompt: str) -> str:
+    if not research.supported(cfg):
+        return await _deliver(session, research.UNSUPPORTED, speak, partial)
+    if len(_research_tasks) >= MAX_RESEARCH:
+        return await _deliver(session, "I'm already researching three things. Give me a moment.", speak, partial)
+    job = uuid.uuid4().hex[:12]
+    _research_tasks[job] = asyncio.create_task(
+        perf.run(_research_job(job, prompt, cfg), perf.Turn("research"))
+    )
+    return await _deliver(session, "On it. I'll leave the report in the corner.", speak, partial)
+
 
 async def _meeting_started():
     await agents.stop()
@@ -2548,13 +2609,21 @@ async def answer(session: Session, prompt: str, prepared=None) -> None:
         and not wants_pointer
         and capture.wants_action(prompt)
     )
+    researching = (
+        cfg.get("research_enabled", True)
+        and not wants_pointer
+        and not asked
+        and capture.wants_research(prompt)
+    )
     drawing_route = visual_explanation.request_kind(prompt, automatic=cfg.get("drawing_enabled", False) and sighted,
                                                    history=session.history[:-1])
     draw_requested = drawing_route in ("explicit", "automatic")
     perf.mark("drawing_route_" + drawing_route)
     try:
         did = False
-        if draw_requested:
+        if researching:
+            reply, did = await _start_research(session, cfg, speak, partial, prompt), True
+        elif draw_requested:
             reply = await _visual_answer(session, prompt, {**cfg, "memory": remembered}, speak, partial)
             # Normal history/logging and final speech cleanup still apply.
             asked = False
@@ -3136,6 +3205,12 @@ async def handle(session: Session, msg: dict) -> None:
             await writing.status(session, send, "idle")
             await send(ws, type="state", state="idle")
 
+    elif kind == "research_dismiss":
+        job = str(msg.get("id", ""))
+        _research_state.pop(job, None)
+        if (task := _research_tasks.pop(job, None)) is not None:
+            task.cancel()
+
     elif kind == "new_conversation":
         # Reset both histories.
         await session.abort()
@@ -3177,6 +3252,10 @@ async def ws_endpoint(ws: WebSocket):
         session.history.clear()
         session.destination = None
     _active_sessions[id(session)] = session
+    # A reloaded shell gets its parked research bones back.
+    for state in list(_research_state.values()):
+        with suppress(WebSocketDisconnect, RuntimeError):
+            await send(ws, **state)
     if session.history:
         log.info("resumed %d message(s) from the open session", len(session.history))
     # Reminders stay independent.

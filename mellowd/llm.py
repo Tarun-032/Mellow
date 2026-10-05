@@ -348,6 +348,11 @@ CORE = (
     "something, and set one app's volume. asked to, do it and say what you "
     "did in one line. for anything else on their machine, say what to do and "
     "let them do it.\n"
+    # main.answer routes "research ..." to research.py before the model sees it.
+    "you can research things on the web: asked to research or look into "
+    "something, or about news, weather or prices, you search in the background "
+    "and leave them a report. when a question needs facts newer than you know, "
+    "say so in one line and tell them to ask you to research it.\n"
     "if you don't know, say so briefly instead of guessing."
     )
 

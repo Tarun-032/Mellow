@@ -193,6 +193,8 @@ DEFAULTS = {
     "ai_enabled": True,
     "writing_enabled": False,
     "drawing_enabled": False,
+    # "Research X": one web-searching model call, shown as a parked bone and a card.
+    "research_enabled": True,
     # Long-term memory of the user: saved notes in answers plus background learning.
     "memory_enabled": False,
     # About you (Settings, Personalization): used in every answer, memory on or off.
@@ -333,6 +335,8 @@ def validate(candidate: dict) -> dict:
         raise ValueError("writing_enabled must be true or false")
     if not isinstance(cfg.get("drawing_enabled"), bool):
         raise ValueError("drawing_enabled must be true or false")
+    if not isinstance(cfg.get("research_enabled"), bool):
+        raise ValueError("research_enabled must be true or false")
     if not isinstance(cfg.get("memory_enabled"), bool):
         raise ValueError("memory_enabled must be true or false")
     cfg["profile"] = validate_profile(cfg.get("profile"))

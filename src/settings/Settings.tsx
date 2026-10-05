@@ -57,6 +57,7 @@ type SettingsData = {
   ai_enabled: boolean;
   writing_enabled: boolean;
   drawing_enabled: boolean;
+  research_enabled?: boolean;
   /** Mellow's five-colour coat. */
   coat: Coat;
 };
@@ -125,6 +126,7 @@ type SettingsPage =
   | "tts"
   | "writing"
   | "guidance"
+  | "research"
   | "sessions"
   | "personalization"
   | "meetings"
@@ -132,7 +134,7 @@ type SettingsPage =
   | "advanced";
 
 /** Pages that save as you go, so they get no Save changes bar. */
-const SAVES_ITSELF = new Set<SettingsPage>(["meetings", "updates", "writing", "guidance", "sessions"]);
+const SAVES_ITSELF = new Set<SettingsPage>(["meetings", "updates", "writing", "guidance", "research", "sessions"]);
 
 const SETTINGS_PAGES: Array<{
   id: SettingsPage;
@@ -171,6 +173,7 @@ const SETTINGS_PAGES: Array<{
   },
   { id: "personalization", label: "Personalization", description: "About you, personality and memory" },
   { id: "guidance", label: "Screen guidance", description: "Draw while explaining" },
+  { id: "research", label: "Web research", description: "Reports from the web" },
   { id: "meetings", label: "Meetings", description: "Transcripts and meeting notes" },
   {
     id: "updates",
@@ -601,6 +604,11 @@ export default function Settings() {
       </main>
     );
   }
+
+  // Mirrors research.kind in the sidecar.
+  const researchReady = form.llm.mode === "cloud" && (
+    ["openai", "anthropic", "openrouter"].includes(form.llm.provider) ||
+    form.llm.base_url.toLowerCase().includes("generativelanguage.googleapis.com"));
 
   /** Keep mode and provider aligned (LLM local preset only). */
   const chooseMode = (name: Capability, mode: Mode | "pet") => {
@@ -1341,6 +1349,41 @@ export default function Settings() {
                 <h3>Your engine and screen</h3>
                 <p>Your selected engine must support images. Each drawing request sends a screen image and makes one planning call, with at most one closer-look call if needed. Ordinary answers use no drawing calls.</p>
                 <p className="field-note">If Mellow cannot place a drawing reliably, it stops. Model placement accuracy varies; this feature does not click or operate apps.</p>
+              </div>
+            </section>
+          )}
+
+          {activePage === "research" && (
+            <section className="settings-page" aria-labelledby="research-heading">
+              <div className="page-heading">
+                <h2 id="research-heading">Web research</h2>
+                <p>Ask Mellow to research something and it searches the web in the background. A coloured bone parks in the top-right corner and turns green when the report is ready.</p>
+              </div>
+              <div className="settings-group">
+                <label className="switch">
+                  <span className="switch__text">
+                    <b>Research on request</b>
+                    <small>Questions about news, weather, prices and anything you ask Mellow to research or look into.</small>
+                  </span>
+                  <input type="checkbox" role="switch" disabled={!form.ai_enabled}
+                    checked={form.research_enabled ?? true}
+                    onChange={(event) => saveSetting({ research_enabled: event.target.checked })} />
+                  <i className="switch__track" aria-hidden="true" />
+                </label>
+                {settingError && <p className="notice notice--error" role="alert">{settingError}</p>}
+                {!researchReady && <p className="field-note">Research needs a cloud engine from Gemini, OpenAI, Anthropic or OpenRouter. Choose one under Engine.</p>}
+              </div>
+              <div className="settings-group">
+                <h3>Try asking</h3>
+                <p>&ldquo;Research the best budget mechanical keyboards.&rdquo;</p>
+                <p>&ldquo;What&rsquo;s the weather in Boston right now?&rdquo;</p>
+                <p>&ldquo;What&rsquo;s the latest news on the Mars mission?&rdquo;</p>
+                <p className="field-note">Keep talking while it works. Click the bone to read the report and its sources. Ask a follow-up and Mellow remembers what it found.</p>
+              </div>
+              <div className="settings-group">
+                <h3>What it sends</h3>
+                <p>Only your question goes to the provider you chose under Engine, which runs the web search. Nothing on your screen is sent.</p>
+                <p className="field-note">Providers may charge for each search on top of the usual model cost.</p>
               </div>
             </section>
           )}

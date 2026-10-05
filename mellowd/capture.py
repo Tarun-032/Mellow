@@ -170,6 +170,24 @@ def wants_action(text: str) -> bool:
     return bool(DO_RE.search(text))
 
 
+# Does this want fresh facts from the web? `\bsearch\b` in ERRAND_DO never
+# matches inside "research", so "look up" and "google" still open a browser.
+RESEARCH = r"""
+    \bresearch\b | \b(?:look|dig)\s+into\b
+  | \bfind\s+out\s+(?:about|what|whether|if|how|why|when|who|where|which)\b
+  | \bsearch\s+(?:the\s+)?(?:web|internet|online)\b | \b(?:on|from)\s+the\s+(?:web|internet)\b
+  | \blatest\b | \bnews\b | \bheadlines?\b
+  | \bweather\b | \bforecast\b | \btemperature\s+(?:in|outside|today|tomorrow)\b
+  | \b(?:current|today'?s|live)\s+(?:price|score|rate|exchange\s+rate|standings)\b
+  | \bstock\s+price\b | \bprice\s+of\b | \bwho\s+won\b | \bscore\s+of\b
+"""
+RESEARCH_RE = re.compile(RESEARCH, _F)
+
+
+def wants_research(text: str) -> bool:
+    return bool(RESEARCH_RE.search(text))
+
+
 def _intersection(a: dict, b: tuple[int, int, int, int]) -> int:
     """Area shared by an mss monitor and a physical desktop rectangle."""
     left = max(a["left"], b[0])
