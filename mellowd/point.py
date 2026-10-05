@@ -110,6 +110,12 @@ class Target:
     visible: bool = True
     # A collapsed expander: opening it reveals controls not on screen yet.
     expands: bool = False
+    # UIA's document viewport from this same screen snapshot. Drawing can
+    # distinguish browser content without a second accessibility walk.
+    page_bounds: tuple[float, float, float, float] | None = None
+    # Visual media is measured separately from controls; it is not clickable
+    # merely because UIA exposes an image rectangle.
+    is_image: bool = False
 
 
 # OCR whitespace is unreliable, so matching uses alphanumerics only.
@@ -328,7 +334,7 @@ def uia_candidates(hwnd: int = 0) -> tuple[list[tuple], tuple | None]:
                 except Exception:
                     visible = True
                 # Icon-only controls are exactly the things OCR cannot save.
-                if box.width() > 0 and visible and (name or role):
+                if box.width() > 0 and visible and (name or role or kind == "ImageControl"):
                     automation = ""
                     help_text = ""
                     if not name:
@@ -340,11 +346,11 @@ def uia_candidates(hwnd: int = 0) -> tuple[list[tuple], tuple | None]:
                             help_text = str(node.HelpText or "")
                         except Exception:
                             pass
-                    label = str(name or help_text or automation or role)
+                    label = str(name or help_text or automation or role or "Image")
                     out.append(
                         (
                             label, box.left, box.top, box.width(), box.height(),
-                            role, "uia", enabled, visible, _expands(node, auto),
+                            role, "uia", enabled, visible, _expands(node, auto), kind == "ImageControl",
                         )
                     )
                 # The biggest document in the tree is the page being read.
@@ -703,6 +709,7 @@ def candidates(
         enabled = bool(row[7]) if len(row) > 7 else True
         visible = bool(row[8]) if len(row) > 8 else True
         expands = bool(row[9]) if len(row) > 9 else False
+        is_image = bool(row[10]) if source == "uia" and len(row) > 10 else False
         if not name or not name.strip():
             continue
         # OCR boxes are local to the captured bitmap
@@ -712,7 +719,7 @@ def candidates(
         raw.append(
             (
                 _display(name, source), left, top, width, height, kind, source,
-                enabled, visible, expands,
+                enabled, visible, expands, is_image,
             )
         )
 
@@ -730,7 +737,7 @@ def candidates(
     keep = []
     for row in raw:
         name, left, top, width, height, _, _ = row[:7]
-        if width <= 0 or height <= 0 or not _fit(name, row[5], row[6]):
+        if width <= 0 or height <= 0 or not (row[10] or _fit(name, row[5], row[6])):
             continue
         if width > mon["width"] * MAX_SPAN[0] and height > mon["height"] * MAX_SPAN[1]:
             # The window, or a pane repeating a child's name. Never the thing to click
@@ -750,10 +757,16 @@ def candidates(
     for row in sorted(keep, key=lambda r: (r[6] != "uia", not r[5], r[3] * r[4])):
         text = squash(row[0])
         matching = by_text.setdefault(text, [])
-        if any(
-            _covers(other, row) or _covers(row, other)
-            for other in matching
-        ):
+        duplicate = next((other for other in matching
+                          if _covers(other, row) or _covers(row, other)), None)
+        if duplicate is not None:
+            # An image can also be exposed as its enclosing hyperlink. Keep
+            # the original candidate/rank and carry image identity only when
+            # both measured rectangles agree, not for an arbitrary parent.
+            if row[10] and not duplicate[10] and _covers(duplicate, row) and _covers(row, duplicate):
+                media = (*duplicate[:10], True)
+                merged[merged.index(duplicate)] = media
+                matching[matching.index(duplicate)] = media
             continue
         merged.append(row)
         matching.append(row)
@@ -795,9 +808,11 @@ def candidates(
             enabled=enabled,
             visible=visible,
             expands=expands,
+            page_bounds=page,
+            is_image=is_image,
         )
         for row in ranked
-        for name, left, top, width, height, kind, source, enabled, visible, expands in [row]
+        for name, left, top, width, height, kind, source, enabled, visible, expands, is_image in [row]
     ]
 
 

@@ -1,6 +1,8 @@
 #[cfg(desktop)]
 mod cursor;
 #[cfg(desktop)]
+mod annotations;
+#[cfg(desktop)]
 mod sidecar;
 
 #[cfg(desktop)]
@@ -56,6 +58,88 @@ pub(crate) fn restore_topmost(window: &tauri::WebviewWindow) {
     let _ = window.set_always_on_top(true);
 }
 
+/// Show ink directly below the pet without first promoting it above the pet.
+/// Visible ink stays in place during clean captures and readiness receipts.
+#[cfg(all(desktop, any(windows, test)))]
+fn place_annotation_below_pet(
+    visible: bool, ink: isize, pet: isize,
+    mut place: impl FnMut(isize, isize, u32) -> bool,
+) -> Result<(), String> {
+    if visible { return Ok(()); }
+    if ink == 0 || pet == 0 || ink == pet { return Err("invalid annotation layers".into()); }
+    // Preserve position, size, focus, and owner ordering; reveal and order the
+    // ink in the same native call. The pet is the preceding topmost window.
+    const FLAGS: u32 = 0x0001 | 0x0002 | 0x0010 | 0x0040 | 0x0200;
+    if !place(ink, pet, FLAGS) { return Err("could not restore annotation layer".into()); }
+    Ok(())
+}
+
+#[cfg(all(desktop, windows))]
+pub(crate) fn show_annotation_below_pet(
+    app: &tauri::AppHandle, window: &tauri::WebviewWindow,
+) -> Result<(), String> {
+    let visible = window.is_visible().map_err(|e| e.to_string())?;
+    if visible { return Ok(()); }
+    let pet = app.get_webview_window("pet").ok_or("pet window is missing")?;
+    let ink = window.hwnd().map_err(|e| e.to_string())?.0 as isize;
+    let pet = pet.hwnd().map_err(|e| e.to_string())?.0 as isize;
+    #[link(name = "user32")]
+    extern "system" {
+        fn SetWindowPos(hwnd: isize, insert_after: isize, x: i32, y: i32,
+                        width: i32, height: i32, flags: u32) -> i32;
+    }
+    place_annotation_below_pet(visible, ink, pet, |hwnd, insert_after, flags| unsafe {
+        SetWindowPos(hwnd, insert_after, 0, 0, 0, 0, flags) != 0
+    })
+}
+
+#[cfg(all(desktop, not(windows)))]
+pub(crate) fn show_annotation_below_pet(
+    app: &tauri::AppHandle, window: &tauri::WebviewWindow,
+) -> Result<(), String> {
+    if !window.is_visible().map_err(|e| e.to_string())? {
+        window.show().map_err(|e| e.to_string())?;
+        if let Some(pet) = app.get_webview_window("pet") { restore_topmost(&pet); }
+    }
+    Ok(())
+}
+
+#[cfg(all(desktop, test))]
+mod annotation_layer_tests {
+    use super::place_annotation_below_pet;
+    #[test]
+    fn captures_and_readiness_never_repromote_visible_ink() {
+        let mut stack = vec![10, 20, 30]; // pet, ink, source, top to bottom.
+        let mut calls = Vec::new();
+        let mut place = |ink, pet, flags| {
+            calls.push((ink, pet, flags));
+            stack.retain(|&hwnd| hwnd != ink);
+            let at = stack.iter().position(|&hwnd| hwnd == pet).unwrap();
+            stack.insert(at + 1, ink);
+            true
+        };
+        // First presentation is one combined show/order operation.
+        place_annotation_below_pet(false, 20, 10, &mut place).unwrap();
+        // Supported clean captures and duplicate painted receipts are no-ops.
+        for _ in 0..20 { place_annotation_below_pet(true, 20, 10, &mut place).unwrap(); }
+        // Unsupported capture's hide/restore uses the same ordering operation.
+        place_annotation_below_pet(false, 20, 10, &mut place).unwrap();
+        assert_eq!(calls.len(), 2);
+        assert!(calls.iter().all(|&(ink, after, flags)| ink == 20 && after == 10
+            && flags & 0x0010 != 0 && flags & 0x0040 != 0 && flags & 0x0200 != 0));
+        assert_eq!(stack, vec![10, 20, 30]);
+    }
+    #[test]
+    fn missing_layers_and_native_failure_do_not_show_ink() {
+        let mut calls = 0;
+        for (ink, pet) in [(0, 10), (20, 0), (10, 10)] {
+            assert!(place_annotation_below_pet(false, ink, pet, |_, _, _| { calls += 1; true }).is_err());
+        }
+        assert_eq!(calls, 0);
+        assert!(place_annotation_below_pet(false, 20, 10, |_, _, _| false).is_err());
+    }
+}
+
 /// True while a panel has borrowed real focus (see `PET_FOCUS`). The one-second
 /// topmost refresh must stand down then: `SetWindowPos` on the owner window
 /// dismisses an open native `<select>` popup out from under the user.
@@ -95,10 +179,6 @@ const PET_QUIET: &str = "pet-quiet";
 /// Frontend -> Rust: lend focus while a panel needs typing (`{ focus }`).
 #[cfg(desktop)]
 const PET_FOCUS: &str = "pet-focus";
-
-/// Frontend -> Rust: hide Mellow windows from the next screen capture (`{ hidden }`).
-#[cfg(desktop)]
-const PET_CAPTURE: &str = "pet-capture";
 
 /// Rust -> frontend: onboarding done; discard nap state from the hidden wait.
 #[cfg(desktop)]
@@ -215,26 +295,105 @@ fn move_pet_to_cursor_monitor(app: tauri::AppHandle) -> Result<Option<PetMonitor
     }))
 }
 
-/// Hide/unhide Mellow windows from screen capture (WDA_EXCLUDEFROMCAPTURE).
+/// Exclude/include Mellow windows in capture without changing their visibility.
 #[cfg(all(desktop, windows))]
-fn set_capture_hidden(app: &tauri::AppHandle, hidden: bool) {
+fn capture_affinity(window: &tauri::WebviewWindow, hidden: bool) -> bool {
     // WDA_EXCLUDEFROMCAPTURE / WDA_NONE, from winuser.h.
     const EXCLUDE: u32 = 0x0000_0011;
     const NONE: u32 = 0x0000_0000;
     #[link(name = "user32")]
     extern "system" {
         fn SetWindowDisplayAffinity(hwnd: isize, affinity: u32) -> i32;
+        fn GetWindowDisplayAffinity(hwnd: isize, affinity: *mut u32) -> i32;
     }
-    for (_, window) in app.webview_windows() {
-        if let Ok(hwnd) = window.hwnd() {
-            // Safe: an HWND we own, and the call only reads a flag on it.
-            unsafe { SetWindowDisplayAffinity(hwnd.0 as isize, if hidden { EXCLUDE } else { NONE }) };
+    if let Ok(hwnd) = window.hwnd() {
+        let wanted = if hidden { EXCLUDE } else { NONE };
+        let mut actual = u32::MAX;
+        unsafe {
+            return SetWindowDisplayAffinity(hwnd.0 as isize, wanted) != 0
+                && GetWindowDisplayAffinity(hwnd.0 as isize, &mut actual) != 0 && actual == wanted;
         }
     }
+    false
 }
 
 #[cfg(all(desktop, not(windows)))]
-fn set_capture_hidden(_app: &tauri::AppHandle, _hidden: bool) {}
+fn capture_affinity(_window: &tauri::WebviewWindow, _hidden: bool) -> bool { false }
+
+#[cfg(desktop)]
+#[derive(Default)]
+struct CaptureState {
+    revision: u64,
+    id: Option<String>,
+    restore: std::collections::HashSet<String>,
+    dialogue_revision: Option<u64>,
+}
+
+#[cfg(windows)]
+fn flush_capture() -> Result<(), String> {
+    #[link(name = "dwmapi")]
+    extern "system" { fn DwmFlush() -> i32; }
+    let result = unsafe { DwmFlush() };
+    if result >= 0 { Ok(()) } else { Err(format!("capture compositor flush failed: {result}")) }
+}
+
+#[cfg(not(windows))]
+fn flush_capture() -> Result<(), String> { Ok(()) }
+
+#[cfg(desktop)]
+#[tauri::command]
+async fn capture_prepare(app: tauri::AppHandle, window: tauri::WebviewWindow,
+    revision: u64, capture_id: String, hidden: bool) -> Result<bool, String> {
+    if window.label() != "pet" || capture_id.len() != 32 { return Err("invalid capture owner or id".into()); }
+    annotations::on_main(app, move |app| {
+        let storage = app.state::<std::sync::Mutex<CaptureState>>();
+        let mut capture = storage.lock().map_err(|_| "capture state poisoned")?;
+        if revision <= capture.revision { return Ok(false); }
+        capture.revision = revision;
+        if !hidden && capture.id.as_deref() != Some(&capture_id) { return Ok(false); }
+        let guide = app.state::<cursor::GuideState>();
+        let drawings = app.state::<annotations::State>();
+        if hidden {
+            capture.id = Some(capture_id);
+            capture.dialogue_revision = guide.dialogue_revision();
+            guide.set_capturing(true);
+            // Pause scene validation during the local clean capture. Supported
+            // affinity leaves visible ink alone; hide only the fallback below.
+            drawings.capture(&app, true);
+            for (label, window) in app.webview_windows() {
+                let excluded = capture_affinity(&window, true);
+                // Local development can exercise unsupported-affinity fallback.
+                let forced = cfg!(debug_assertions) && std::env::var_os("MELLOW_CAPTURE_HIDE_FALLBACK").is_some();
+                if !excluded || forced {
+                    if window.is_visible().map_err(|e| e.to_string())? {
+                        capture.restore.insert(label);
+                        window.hide().map_err(|e| e.to_string())?;
+                    }
+                    if window.is_visible().map_err(|e| e.to_string())? { return Err("capture fallback did not hide window".into()); }
+                }
+            }
+            flush_capture()?;
+        } else {
+            capture.id = None;
+            let mut restored = true;
+            for (_, window) in app.webview_windows() { restored &= capture_affinity(&window, false); }
+            let restore_dialogue = capture.dialogue_revision.is_some()
+                && capture.dialogue_revision == guide.dialogue_revision();
+            for label in capture.restore.drain() {
+                // Moving/annotation windows restore from their current valid state.
+                if label == "guide" || (label == "guide-bubble" && !restore_dialogue) || label.starts_with("annotation-") { continue; }
+                if let Some(window) = app.get_webview_window(&label) {
+                    window.show().map_err(|e| e.to_string())?;
+                    restore_topmost(&window);
+                }
+            }
+            guide.set_capturing(false);
+            drawings.capture(&app, false);
+            if !restored { return Err("could not restore capture affinity".into()); }
+        }
+        Ok(true)
+    }).await
+}
 
 #[cfg(desktop)]
 fn open_settings(app: &tauri::AppHandle) {
@@ -531,7 +690,8 @@ pub fn run() {
     }
 
     #[cfg(desktop)]
-    let builder = builder.manage(guide_state);
+    let builder = builder.manage(guide_state).manage(annotations::State::default())
+        .manage(std::sync::Mutex::new(CaptureState::default()));
 
     builder
         .invoke_handler(tauri::generate_handler![
@@ -545,7 +705,17 @@ pub fn run() {
             cursor::guide_clear,
             cursor::guide_set_dialogue,
             cursor::guide_set_quiet,
-            cursor::guide_set_reduced_motion
+            cursor::guide_set_reduced_motion,
+            capture_prepare,
+            annotations::annotation_present,
+            annotations::annotation_clear,
+            annotations::annotation_snapshot,
+            annotations::annotation_occlusion,
+            annotations::annotation_painted,
+            annotations::annotation_complete,
+            annotations::annotation_pen_position,
+            annotations::annotation_finish,
+            annotations::annotation_renew
         ])
         .setup(move |_app| {
             // Size the screen-sized overlay to the primary monitor at runtime.
@@ -607,6 +777,7 @@ pub fn run() {
                 guide_bubble.set_focusable(false)?;
 
                 cursor::spawn(_app.handle().clone(), guide_motion.clone());
+                annotations::spawn(_app.handle().clone(), _app.state::<annotations::State>().inner().clone());
 
                 // Start sidecar before the frontend connects.
                 *started.lock().unwrap() = sidecar::spawn(_app.handle())
@@ -632,19 +803,6 @@ pub fn run() {
                     };
                     // Malformed: assume not quiet.
                     popup_pet_menu(&handle, flag("speak", true), flag("quiet", false), flag("meeting", false));
-                });
-
-                let capture_handle = _app.handle().clone();
-                _app.listen(PET_CAPTURE, move |event| {
-                    // Malformed: default to visible in captures.
-                    let hidden = serde_json::from_str::<serde_json::Value>(event.payload())
-                        .ok()
-                        .and_then(|v| v.get("hidden").and_then(|h| h.as_bool()))
-                        .unwrap_or(false);
-                    let app = capture_handle.clone();
-                    let _ = capture_handle.run_on_main_thread(move || {
-                        set_capture_hidden(&app, hidden);
-                    });
                 });
 
                 let focus_handle = _app.handle().clone();
@@ -690,6 +848,9 @@ pub fn run() {
                         let _ = app.emit(PET_QUIET, ());
                     }
                     "pet_hide" => {
+                        if let Ok(mut capture) = app.state::<std::sync::Mutex<CaptureState>>().lock() {
+                            capture.restore.remove("pet");
+                        }
                         if let Some(win) = app.get_webview_window("pet") {
                             if win.hide().is_ok() {
                                 // Only the pet owns the sidecar connection. It

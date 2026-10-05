@@ -132,6 +132,20 @@ class SentenceBuffer:
         return [rest] if rest else []
 
 
+def _beat_chunks(text):
+    """Natural spoken sentences, with bounded word breaks for long beats."""
+    buffer = SentenceBuffer()
+    for sentence in [*buffer.feed(text), *buffer.flush()]:
+        while len(sentence) > MAX_CHARS:
+            cut = sentence.rfind(" ", 0, MAX_CHARS + 1)
+            if cut < 1:
+                cut = MAX_CHARS
+            yield sentence[:cut].strip()
+            sentence = sentence[cut:].lstrip()
+        if sentence:
+            yield sentence
+
+
 def _pcm_rate(content_type: str) -> int:
     """`audio/pcm; rate=44100` if the provider bothered to say, else the guess."""
     for part in content_type.split(";")[1:]:
@@ -286,24 +300,37 @@ class Speaker:
     async def speak_beat(self, text: str, before: Callable[[], Awaitable[bool]]) -> None:
         """Prebuffer speech, but verify/move its pointer only at playback time.
 
-        Returning False from `before` ends the sequence without playing this
-        clip or any later one. The ordinary sentence pipeline is unchanged.
+        Long explanations use the existing sentence/lookahead pipeline so the
+        first audio need not wait for the whole paragraph to be synthesized.
+        `before` runs exactly once before its first clip; returning False ends
+        the sequence without playing this clip or any prefetched later one.
         """
         if text := clean_for_speech(text):
-            await self._queue.put(_Beat(text, before))
+            for index, chunk in enumerate(_beat_chunks(text)):
+                await self._queue.put(_Beat(chunk, before) if index == 0 else chunk)
 
     async def finish(self) -> None:
         """Wait until every queued sentence has actually finished playing."""
         if self._task is None:
             return
+        task = self._task
         await self._queue.put(None)
-        with suppress(asyncio.CancelledError):
-            await self._task
-        self._task = None
+        try:
+            with suppress(asyncio.CancelledError):
+                await task
+        finally:
+            if self._task is task:
+                self._task = None
 
     async def stop(self) -> None:
         """Barge-in. Cuts off playback immediately."""
         if self._task is None or self._task.done():
+            if self._task is not None:
+                # An explicit interruption discards a completed failure, but
+                # still retrieves it so the worker cannot log an unhandled
+                # exception after this connection is closed.
+                with suppress(asyncio.CancelledError):
+                    self._task.exception()
             self._task = None
             return
         # sd.stop() FIRST
@@ -318,13 +345,22 @@ class Speaker:
         """Runs the two stages and owns the cleanup of both."""
         clips: asyncio.Queue = asyncio.Queue(maxsize=LOOKAHEAD)
         fetch = asyncio.create_task(self._fetch(clips))
+        play = asyncio.create_task(self._play(clips))
         try:
-            await self._play(clips)
+            done, _ = await asyncio.wait((fetch, play), return_when=asyncio.FIRST_COMPLETED)
+            # A synth error ends fetch without a sentinel. Propagate its
+            # original exception instead of leaving playback waiting forever.
+            # If playback ends first (a failed visual gate), the finally block
+            # cancels its producer rather than waiting for a full clip queue.
+            if fetch in done:
+                await fetch
+            await play
         finally:
             fetch.cancel()
-            with suppress(asyncio.CancelledError):
-                await fetch
+            play.cancel()
             sd.stop()
+            await asyncio.gather(fetch, play, return_exceptions=True)
+            self._talking = False
 
     async def _fetch(self, clips: asyncio.Queue) -> None:
         """Text in, audio out. Blocks on `clips` once the lookahead is full."""
@@ -335,10 +371,6 @@ class Speaker:
                 return
             text = item.text if isinstance(item, _Beat) else item
             before = item.before if isinstance(item, _Beat) else None
-            # Before the synth, not after. Locally that was a 30ms difference nobody could see
-            if not self._talking:
-                self._talking = True
-                await self._send(self._ws, type="state", state="talking")
             await clips.put((await asyncio.to_thread(synth, text), before))
 
     async def _play(self, clips: asyncio.Queue) -> None:
@@ -347,8 +379,19 @@ class Speaker:
             if clip is None:
                 return
             (samples, rate), before = clip
-            if before is not None and not await before():
-                return
+            if before is not None:
+                # Each guided beat can put the pet into its preparation pose
+                # while its final-stroke/source/arrival gate runs. Reset only
+                # the playback flag here, so its speaking pose is restored
+                # after that gate even within one continuous audio pipeline.
+                self._talking = False
+                if not await before():
+                    return
+            # Preparing audio can take seconds. A guided beat must also reach
+            # its visual target before Mellow adopts the speaking pose.
+            if not self._talking:
+                self._talking = True
+                await self._send(self._ws, type="state", state="talking")
             await asyncio.to_thread(self._submit, samples, rate)
 
     @staticmethod

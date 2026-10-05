@@ -5,7 +5,9 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 const label = getCurrentWindow().label;
 
 const entry =
-  label === "settings"
+  label.startsWith("annotation-")
+    ? import("./pet/Annotations")
+    : label === "settings"
     ? import("./settings/Settings")
     : label === "welcome"
       ? import("./onboarding/Onboarding")

@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { emit, listen } from "@tauri-apps/api/event";
+import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import type { GuideOutcome } from "./guidePresentation";
+import { nextAnnotationRevision, type AnnotationScene } from "./annotationScene";
 
 const URL = "ws://127.0.0.1:8765/ws";
 
@@ -23,7 +24,7 @@ export type WritingStatus = {
 type Incoming =
   | WritingStatus
   | { type: "guide"; waiting: boolean }
-  | { type: "state"; state: PetState }
+  | { type: "state"; state: PetState; interrupted?: boolean }
   | { type: "microphone"; state: MicrophoneState }
   | { type: "mic_level"; level: number }
   | { type: "transcript"; text: string }
@@ -31,7 +32,10 @@ type Incoming =
   | { type: "speak"; value: boolean }
   | { type: "remind"; text: string; id: string }
   | { type: "pong"; echo: string }
-  | { type: "capture"; phase: "begin" | "end" }
+  | { type: "capture"; phase: "begin" | "end"; capture_id: string }
+  | { type: "drawing"; scene: AnnotationScene | null; preserve_pen?: boolean }
+  | { type: "drawing_finish" }
+  | { type: "drawing_keepalive"; presentation_id: string }
   | { type: "point"; nx: number | null; ny?: number; label?: string; monitor?: Monitor; presentation_id?: string }
   | { type: "pomodoro"; action: "start" | "stop"; minutes?: number | null }
   | { type: "error"; message: string };
@@ -47,6 +51,26 @@ export function useSocket() {
   const [connected, setConnected] = useState(false);
   const [aiEnabled, setAiEnabled] = useState(false);
   const aiEnabledRef = useRef(false);
+  const drawingAllowed = useRef(false);
+  const drawing = useRef<{ revision: number; id: string; socket: WebSocket; finished: boolean;
+    readyPending?: boolean; readyForwarded?: boolean; completePending?: boolean } | null>(null);
+  const drawingRevision = useRef(0);
+  const [drawingPen, setDrawingPen] = useState(false);
+  const clearDrawing = useCallback((keepPen = false, reason = "cleared") => {
+    const previous = drawing.current;
+    drawing.current = null;
+    if (previous && previous.socket.readyState === WebSocket.OPEN) {
+      previous.socket.send(JSON.stringify({ type: "drawing_ack", presentation_id: previous.id, outcome: "failed", reason }));
+    }
+    if (!keepPen) setDrawingPen(false);
+    drawingRevision.current = nextAnnotationRevision();
+    void invoke("annotation_clear", { revision: drawingRevision.current, keepPen })
+      .catch((error) => console.error("[mellow] could not clear drawings", error));
+  }, []);
+  const setDrawingAllowed = useCallback((allowed: boolean) => {
+    drawingAllowed.current = allowed;
+    if (!allowed) clearDrawing();
+  }, [clearDrawing]);
   const [state, setState] = useState<PetState>("idle");
   // Microphone readiness.
   const [microphone, setMicrophone] = useState<MicrophoneState>("warming");
@@ -81,7 +105,7 @@ export function useSocket() {
       if (!alive) return;
       aiEnabledRef.current = enabled;
       setAiEnabled(enabled);
-      if (!enabled) retirePoint();
+      if (!enabled) { retirePoint(); clearDrawing(); }
     };
     const stop = listen<boolean>("ai-enabled", ({ payload }) => {
       if (typeof payload !== "boolean") return;
@@ -103,7 +127,60 @@ export function useSocket() {
       alive = false;
       void stop.then((off) => off()).catch(() => {});
     };
-  }, [connected, retirePoint]);
+  }, [connected, retirePoint, clearDrawing]);
+
+  useEffect(() => {
+    const stop = listen<{ revision: number; presentation_id: string; outcome: string; reason?: string; scale?: number; remaining_ms?: number; occlusions?: number[][] }>("drawing-receipt", ({ payload }) => {
+      const active = drawing.current;
+      if (!active || active.revision !== payload.revision || active.id !== payload.presentation_id
+        || ws.current !== active.socket || active.socket.readyState !== WebSocket.OPEN) return;
+      if (payload.outcome === "position") {
+        active.socket.send(JSON.stringify({ type: "drawing_ack", presentation_id: active.id, outcome: "position", occlusions: payload.occlusions }));
+        return;
+      }
+      if (!["ready", "complete", "failed"].includes(payload.outcome)) return;
+      if (payload.outcome === "complete" && !active.readyForwarded) {
+        // Measuring the pet's bounds is asynchronous. A short/reduced-motion
+        // drawing can finish first; forward its completion only after ready.
+        if (active.readyPending) active.completePending = true;
+        return;
+      }
+      if (payload.outcome === "ready") {
+        if (active.readyPending || active.readyForwarded) return;
+        active.readyPending = true;
+        const rects: number[][] = [];
+        const body = document.querySelector(".pet-body")?.getBoundingClientRect();
+        if (body) rects.push([body.x - 12, body.y - 12, body.width + 24, body.height + 24]);
+        const bubble = document.querySelector(".pet-root > .bubble")?.getBoundingClientRect();
+        const root = document.querySelector(".pet-root")?.getBoundingClientRect();
+        // The reply arrives after readiness; reserve the existing CSS maximum
+        // bubble width/reading height rather than just its initial dots.
+        // A reply can create the bubble after this receipt. Pet.css anchors it
+        // 91px from the root's right and 34px below its top, even when absent.
+        const right = bubble?.right ?? (root ? root.right - 91 : null);
+        const bottom = bubble?.bottom ?? (root ? root.top + 34 : null);
+        if (right !== null && bottom !== null) rects.push([right - 432, bottom - 232, 444, 244]);
+        void invoke<number[][]>("annotation_occlusion", { rects }).then((occlusions) => {
+          if (drawing.current !== active || ws.current !== active.socket || active.socket.readyState !== WebSocket.OPEN) return;
+          active.socket.send(JSON.stringify({ type: "drawing_ack", presentation_id: active.id, outcome: "ready", occlusions, scale: payload.scale, remaining_ms: payload.remaining_ms }));
+          active.readyForwarded = true;
+          if (active.completePending) {
+            active.socket.send(JSON.stringify({ type: "drawing_ack", presentation_id: active.id, outcome: "complete" }));
+          }
+        }).catch((error) => {
+          console.error("[mellow] could not measure pet bounds", error);
+          if (drawing.current === active) clearDrawing(false, "presentation_failed");
+        });
+        return;
+      }
+      const reason = payload.outcome === "failed"
+        ? (["expired", "source_changed", "pet_hidden", "display_changed", "replaced", "cleared"].includes(payload.reason ?? "") ? payload.reason : "native_failure")
+        : undefined;
+      active.socket.send(JSON.stringify({ type: "drawing_ack", presentation_id: active.id, outcome: payload.outcome, reason }));
+      if (payload.outcome === "failed") { drawing.current = null; setDrawingPen(false); }
+    });
+    return () => { void stop.then((off) => off()).catch(() => {}); };
+  }, [clearDrawing]);
 
   useEffect(() => {
     let disposed = false;
@@ -130,6 +207,16 @@ export function useSocket() {
             break;
           case "state":
             setState(msg.state);
+            if (msg.state === "idle" && msg.interrupted) {
+              // A stopped visual explanation has no final playback/reading
+              // event. Clear its old dialogue even if audio never began.
+              setTranscript("");
+              setReply("");
+              setError("");
+              setGuideWaiting(false);
+              retirePoint();
+              clearDrawing();
+            }
             if (msg.state !== "listening") setMicLevel(0);
             break;
           case "microphone":
@@ -155,19 +242,54 @@ export function useSocket() {
             console.log("[mellow] pong:", msg.echo);
             break;
           case "capture":
-            // Hide before capture.
-            if (msg.phase === "begin") {
-              // Keep the turn monitor.
-              void emit("pet-capture", { hidden: true }).then(() => {
-                sock.send(JSON.stringify({ type: "capture_ready" }));
-              }).catch((error) => {
-                console.error("[mellow] could not prepare screen capture", error);
-                sock.send(JSON.stringify({ type: "capture_ready" }));
-              });
-            } else {
-              void emit("pet-capture", { hidden: false });
-            }
+            void invoke<boolean>("capture_prepare", { revision: nextAnnotationRevision(),
+              captureId: msg.capture_id, hidden: msg.phase === "begin" }).then((ok) => {
+              if (msg.phase === "begin" && !disposed && ws.current === sock && sock.readyState === WebSocket.OPEN) {
+                sock.send(JSON.stringify({ type: "capture_ready", capture_id: msg.capture_id, ok }));
+              }
+            }).catch((error) => {
+              console.error("[mellow] could not prepare screen capture", error);
+              if (msg.phase === "begin" && !disposed && ws.current === sock && sock.readyState === WebSocket.OPEN) {
+                sock.send(JSON.stringify({ type: "capture_ready", capture_id: msg.capture_id, ok: false }));
+              }
+            });
             break;
+          case "drawing": {
+            clearDrawing(Boolean(msg.scene || msg.preserve_pen));
+            if (!msg.scene) break;
+            const active = { revision: nextAnnotationRevision(), id: msg.scene.presentation_id, socket: sock, finished: false };
+            drawing.current = active;
+            drawingRevision.current = active.revision;
+            if (!aiEnabledRef.current || !drawingAllowed.current) { clearDrawing(); break; }
+            setDrawingPen(true);
+            void invoke<boolean>("annotation_present", { revision: active.revision, scene: msg.scene }).then((accepted) => {
+              if (!accepted && drawing.current === active) clearDrawing(false, "presentation_failed");
+            }).catch((error) => {
+              console.error("[mellow] could not present drawing", error);
+              if (drawing.current === active) clearDrawing(false, "presentation_failed");
+            });
+            break;
+          }
+          case "drawing_finish": {
+            const active = drawing.current;
+            if (active) active.finished = true;
+            if (drawingRevision.current) void invoke("annotation_finish", { revision: active?.revision ?? drawingRevision.current }).catch(() => clearDrawing());
+            setDrawingPen(false);
+            break;
+          }
+          case "drawing_keepalive": {
+            const active = drawing.current;
+            if (!active || active.finished || active.id !== msg.presentation_id || active.socket !== sock) break;
+            // Preserve completed strokes during further narration; an old
+            // receipt cannot renew a replacement scene or reborrow its bone.
+            void invoke<boolean>("annotation_renew", { revision: active.revision }).then((accepted) => {
+              if (!accepted && drawing.current === active && !active.finished) clearDrawing(false, "presentation_failed");
+            }).catch((error) => {
+              console.error("[mellow] could not extend active drawing", error);
+              if (drawing.current === active && !active.finished) clearDrawing(false, "presentation_failed");
+            });
+            break;
+          }
           case "pomodoro":
             setTimer((current) => ({
               action: msg.action,
@@ -219,6 +341,7 @@ export function useSocket() {
         activePoint.current = null;
         setPoint(null);
         setGuideWaiting(false);
+        clearDrawing();
         if (!disposed) timer = setTimeout(connect, 1000);
       };
     };
@@ -228,17 +351,24 @@ export function useSocket() {
       disposed = true;
       clearTimeout(timer);
       ws.current?.close();
+      clearDrawing();
     };
-  }, []);
+  }, [clearDrawing]);
 
-  /** Clear dialogue. */
-  const clear = useCallback(() => {
+  /** Dismiss finished dialogue without retiring useful on-screen drawings. */
+  const dismissDialogue = useCallback(() => {
     setTranscript("");
     setReply("");
     setError("");
     setReminder("");
     retirePoint();
   }, [retirePoint]);
+
+  /** Explicit reset also retires drawings (new turn, sleep, hide, etc.). */
+  const clear = useCallback(() => {
+    dismissDialogue();
+    clearDrawing();
+  }, [dismissDialogue, clearDrawing]);
 
   /** Dismiss a reminder. */
   const dismissReminder = useCallback(() => setReminder(""), []);
@@ -282,6 +412,9 @@ export function useSocket() {
     timer,
     send,
     clear,
+    dismissDialogue,
     dismissReminder,
+    setDrawingAllowed,
+    drawingPen,
   };
 }

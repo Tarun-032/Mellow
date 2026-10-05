@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "annotations",
+  "description": "Annotation renderers only receive scene events; no sidecar, opener or updater access",
+  "windows": ["annotation-*"],
+  "permissions": ["core:event:allow-listen", "core:event:allow-unlisten"]
+}

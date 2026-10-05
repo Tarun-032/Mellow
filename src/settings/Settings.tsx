@@ -56,6 +56,7 @@ type SettingsData = {
   /** AI enabled; false = pet-only mode. */
   ai_enabled: boolean;
   writing_enabled: boolean;
+  drawing_enabled: boolean;
   /** Mellow's five-colour coat. */
   coat: Coat;
 };
@@ -123,6 +124,7 @@ type SettingsPage =
   | "stt"
   | "tts"
   | "writing"
+  | "guidance"
   | "sessions"
   | "personalization"
   | "meetings"
@@ -130,7 +132,7 @@ type SettingsPage =
   | "advanced";
 
 /** Pages that save as you go, so they get no Save changes bar. */
-const SAVES_ITSELF = new Set<SettingsPage>(["meetings", "updates", "writing", "sessions"]);
+const SAVES_ITSELF = new Set<SettingsPage>(["meetings", "updates", "writing", "guidance", "sessions"]);
 
 const SETTINGS_PAGES: Array<{
   id: SettingsPage;
@@ -168,6 +170,7 @@ const SETTINGS_PAGES: Array<{
     description: "Saved conversations",
   },
   { id: "personalization", label: "Personalization", description: "About you, personality and memory" },
+  { id: "guidance", label: "Screen guidance", description: "Draw while explaining" },
   { id: "meetings", label: "Meetings", description: "Transcripts and meeting notes" },
   {
     id: "updates",
@@ -1303,6 +1306,41 @@ export default function Settings() {
                   Drafting from what is on screen sends that field&rsquo;s context to the provider
                   you chose under Engine. Terminal and editor prompts get a single line.
                 </p>
+              </div>
+            </section>
+          )}
+
+          {activePage === "guidance" && (
+            <section className="settings-page" aria-labelledby="guidance-heading">
+              <div className="page-heading">
+                <h2 id="guidance-heading">Draw while explaining</h2>
+                <p>The bone traces temporary marks as Mellow explains, with short captions beside it.</p>
+              </div>
+              <div className="settings-group">
+                <label className="switch">
+                  <span className="switch__text">
+                    <b>Screen drawings · Experimental</b>
+                    <small>Mellow can draw when you ask about a diagram or chart on screen. Simple questions still use pointing.</small>
+                  </span>
+                  <input type="checkbox" role="switch" disabled={!form.ai_enabled}
+                    checked={form.drawing_enabled ?? false}
+                    onChange={(event) => saveSetting({ drawing_enabled: event.target.checked })} />
+                  <i className="switch__track" aria-hidden="true" />
+                </label>
+                {settingError && <p className="notice notice--error" role="alert">{settingError}</p>}
+                {!form.ai_enabled && <p className="field-note">Choose an engine first to use screen drawings.</p>}
+              </div>
+              <div className="settings-group">
+                <h3>Try asking</h3>
+                <p>&ldquo;Circle the save button.&rdquo;</p>
+                <p>&ldquo;Explain this chart.&rdquo;</p>
+                <p>&ldquo;Draw along the triangle&rsquo;s edges and explain them.&rdquo;</p>
+                <p className="field-note">Keep the app still while Mellow explains. Click, scroll, type or switch apps to clear the marks. They do not block your mouse or keyboard.</p>
+              </div>
+              <div className="settings-group">
+                <h3>Your engine and screen</h3>
+                <p>Your selected engine must support images. Each drawing request sends a screen image and makes one planning call, with at most one closer-look call if needed. Ordinary answers use no drawing calls.</p>
+                <p className="field-note">If Mellow cannot place a drawing reliably, it stops. Model placement accuracy varies; this feature does not click or operate apps.</p>
               </div>
             </section>
           )}

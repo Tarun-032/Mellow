@@ -27,6 +27,7 @@ class Turn:
         self.stages = []
         self.agent_calls = []
         self.pointer = []
+        self.visual = []
         self.marks = {}
         self.outcome = "completed"
         self.closed = False
@@ -53,7 +54,7 @@ class Turn:
                     "duration_ms": round((time.perf_counter() - self.started) * 1000, 3),
                     "marks_ms": dict(self.marks), "stages": list(self.stages),
                     "agent_calls": list(self.agent_calls),
-                    "pointer": list(self.pointer)}
+                    "pointer": list(self.pointer), "visual": list(self.visual)}
 
 
 def mark(name):
@@ -65,6 +66,22 @@ def marker():
     """Bind timing to its owning turn, including receipts on the WS task."""
     turn = _current.get()
     return turn.mark if turn is not None else lambda _: None
+
+
+def visual_recorder():
+    """Bind bounded diagnostic codes to a turn, including native WS receipts."""
+    turn = _current.get()
+    def record(outcome, reason):
+        # Callers supply fixed codes, never provider output or screen text.
+        if (not turn or not isinstance(reason, str) or not isinstance(outcome, str)
+                or len(reason) > 64 or len(outcome) > 32
+                or any(not (c.isascii() and (c.isalnum() or c == "_")) for c in outcome + reason)):
+            return
+        with turn.lock:
+            if not turn.closed and len(turn.visual) < 32:
+                turn.visual.append({"outcome": outcome, "reason": reason,
+                                    "at_ms": round((time.perf_counter() - turn.started) * 1000, 3)})
+    return record
 
 
 def outcome(value):

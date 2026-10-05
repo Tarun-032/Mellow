@@ -6,6 +6,7 @@ import logging
 import re
 from contextlib import aclosing
 from typing import AsyncIterator
+from urllib.parse import urlparse
 
 import httpx
 
@@ -616,6 +617,18 @@ def _google_openai(cfg: dict) -> bool:
     return "generativelanguage.googleapis.com" in (cfg.get("base_url") or "").lower()
 
 
+def _google_json_schema(cfg: dict) -> bool:
+    """Official Gemini 2.5+ compatibility endpoint, not an arbitrary proxy."""
+    base = urlparse(cfg.get("base_url") or "")
+    version = re.match(r"gemini-(\d+)(?:\.(\d+))?(?:-|$)", cfg.get("model", "").lower())
+    try:
+        official = (base.scheme == "https" and base.hostname == "generativelanguage.googleapis.com"
+                    and base.port in (None, 443) and base.path.rstrip("/") == "/v1beta/openai")
+    except ValueError:
+        return False
+    return bool(official and version and (int(version[1]), int(version[2] or 0)) >= (2, 5))
+
+
 # Gemma 4 on Google's OpenAI endpoint. reasoning_effort maps to a thinking *budget*
 _GEMMA_THINK_LEVEL = {
     "": "MINIMAL",
@@ -653,6 +666,27 @@ async def _openai(
     }
     if cfg["provider"] == "ollama":
         payload["keep_alive"] = "30m"
+    schema = cfg.get("_json_schema")
+    # Request-local: older models and arbitrary compatibility proxies receive
+    # the contract as text, with identical host validation and no paid retry.
+    host = urlparse(cfg.get("base_url", "")).hostname
+    model = cfg["model"].lower()
+    modern_openai = (
+        model.startswith(("gpt-4.1", "gpt-5", "gpt-6", "gpt-4o-mini", "o3", "o4"))
+        or model == "gpt-4o"
+        or bool(re.fullmatch(r"gpt-4o-\d{4}-\d{2}-\d{2}", model)) and model >= "gpt-4o-2024-08-06"
+    )
+    if schema and (cfg["provider"] == "ollama" or (
+        host == "api.openai.com" and modern_openai)):
+        payload["response_format"] = {"type": "json_schema", "json_schema": {
+            "name": "mellow_drawing", "strict": True, "schema": schema}}
+    elif schema and _google_json_schema(cfg):
+        # Google's compatibility API supports the schema subset used here:
+        # type/properties/required/additionalProperties, enum, descriptions and
+        # array item limits. Its wrapper does not need OpenAI's strict flag.
+        # Source: https://ai.google.dev/gemini-api/docs/openai#structured-output
+        payload["response_format"] = {"type": "json_schema", "json_schema": {
+            "name": "mellow_drawing", "schema": schema}}
     if cfg["provider"] in _USAGE_PROVIDERS:
         # Without this a stream never reports tokens or whether the cache engaged.
         payload["stream_options"] = {"include_usage": True}
@@ -825,6 +859,10 @@ async def _anthropic(
         "content-type": "application/json",
     }
     base = cfg.get("base_url") or "https://api.anthropic.com/v1"
+    if cfg.get("_json_schema") and urlparse(base).hostname == "api.anthropic.com" and (
+        cfg["model"].startswith(("claude-sonnet-4-5", "claude-sonnet-4-6", "claude-opus-4-5", "claude-opus-4-6", "claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5"))
+    ):
+        payload["output_config"] = {"format": {"type": "json_schema", "schema": cfg["_json_schema"]}}
     if not raw and base.rstrip("/").startswith("https://api.anthropic.com"):
         # Automatic prompt caching: the breakpoint follows the conversation. A
         # custom proxy may reject the field, so only the official host gets it.
@@ -1077,7 +1115,8 @@ async def chat(
 
 async def complete_text(prompt: str, cfg: dict, system: str, image: bytes | None = None,
                         temperature: float = 0.2, max_tokens: int = 4096,
-                        usage: dict | None = None) -> str:
+                        usage: dict | None = None, schema: dict | None = None,
+                        max_chars: int | None = None) -> str:
     """A text-only completion with no persona, anchoring or tool execution.
 
     0.2 suits classifying and note-taking, where the same input should give the
@@ -1088,11 +1127,18 @@ async def complete_text(prompt: str, cfg: dict, system: str, image: bytes | None
                "max_tokens": max_tokens, "temperature": temperature}
     if usage is not None:
         section["_usage"] = usage
+    if schema is not None:
+        section["_json_schema"] = schema
     adapter = _anthropic if section["provider"] == "anthropic" else _openai
     import base64
     image_b64 = base64.b64encode(image).decode("ascii") if image else None
     async with aclosing(adapter(section, [{"role": "user", "content": prompt}], image_b64)) as stream:
-        return "".join([part async for part in stream]).strip()
+        result = ""
+        async for part in stream:
+            result += part
+            if max_chars is not None and len(result) > max_chars:
+                raise ValueError("completion exceeded its output budget")
+        return result.strip()
 
 
 async def complete_vision(prompt: str, cfg: dict, image: bytes) -> str:

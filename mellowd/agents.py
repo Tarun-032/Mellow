@@ -1758,6 +1758,11 @@ class AgentRuntimeManager:
             # The worker stays in the table: it serves this turn and the next,
             # which is what keeps the conversation and its prompt cache alive.
             worker = self.claude.get(request.signature)
+            if worker is None and request.purpose == "drawing":
+                # Prepare lazily on the first explicit drawing request. No
+                # model turn or extra process at ordinary app warm-up.
+                await self._replace_claude(request)
+                worker = self.claude.get(request.signature)
             if worker is None:
                 raise WarmUnavailable("no matching prepared Claude worker")
             self.inflight.add(worker)
@@ -2096,6 +2101,8 @@ async def complete_text(
     temperature: float = 0.2,
     schema: dict | None = None,
     purpose: str = "utility",
+    max_chars: int | None = None,
+    timeout_seconds: float | None = None,
 ) -> str:
     """An isolated notes call, never a normal pet conversation.
 
@@ -2111,7 +2118,10 @@ async def complete_text(
         image=image,
         schema=schema,
         purpose=purpose,
+        timeout_seconds=timeout_seconds,
     )
+    if max_chars is not None:
+        return await _bounded(request, max_chars)
     return "".join([part async for part in _dispatch(request)]).strip()
 
 

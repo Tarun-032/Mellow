@@ -1,0 +1,18 @@
+html, body, #root {
+  width: 100%; height: 100%; margin: 0; overflow: hidden;
+  background: transparent !important; pointer-events: none; user-select: none;
+}
+.annotations { display: block; overflow: hidden; }
+.annotations .annotation-stroke { stroke-dasharray: 1; stroke-dashoffset: 1; opacity: 0; }
+.annotations .annotation-fill, .annotations .annotation-arrowhead { opacity: 0; }
+.annotation-kept .annotation-stroke { stroke-dashoffset: 0; opacity: 1; }
+.annotation-kept .annotation-fill, .annotation-kept .annotation-arrowhead { opacity: 1; }
+.annotation-pen { opacity: 0; will-change: transform; }
+.annotation-bone {
+  width: 24px; height: 24px;
+  background: var(--coat-bone, url("./bone.png")) 0 0 / 100% 100% no-repeat;
+  image-rendering: pixelated;
+}
+.annotation-caption { opacity: 0; font: 14px "Segoe UI", sans-serif; }
+.annotation-caption rect { fill: #fff9e6; stroke: #372f28; stroke-width: 2; }
+.annotation-caption text { fill: #372f28; }

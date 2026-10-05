@@ -98,7 +98,10 @@ export default function Pet() {
     timer: asked,
     send,
     clear,
+    dismissDialogue,
     dismissReminder,
+    setDrawingAllowed,
+    drawingPen,
   } = useSocket();
   const meeting = useMeeting();
   const meetingActive = Boolean(meeting.status?.active);
@@ -296,6 +299,9 @@ export default function Pet() {
   }, [meetingActive, panel, setQuiet, clear]);
   // Disable pointing while hidden.
   const pointing = aiEnabled && point !== null && !quiet && !hidden && pose === "awake";
+  useEffect(() => {
+    setDrawingAllowed(aiEnabled && !quiet && !hidden && pose === "awake" && !meetingActive);
+  }, [aiEnabled, quiet, hidden, pose, meetingActive, setDrawingAllowed]);
   // Wait for bone arrival.
   const [landed, setLanded] = useState(false);
   // Track the pointing turn.
@@ -481,20 +487,20 @@ export default function Pet() {
     if (spokeThisTurn.current) {
       pointed.current = false;
       spokeThisTurn.current = false;
-      clear();
+      dismissDialogue();
       return;
     }
     const reading = setTimeout(
       () => {
         pointed.current = false;
         spokeThisTurn.current = false;
-        clear();
+        dismissDialogue();
       },
       pointing || pointed.current ? POINT_DISMISS : DISMISS_AFTER,
     );
     return () => clearTimeout(reading);
     // Points restart the timer.
-  }, [state, said, alert, pointing, point, clear, guideWaiting]);
+  }, [state, said, alert, pointing, point, dismissDialogue, guideWaiting]);
 
   const shown = meetingActive ? "writing" :
     motion.earTwitch &&
@@ -667,7 +673,7 @@ export default function Pet() {
           </div>
         )}
         {/* Bubble only when awake, no panel, not pointing. */}
-        {!panel && !writingPanel && !quiet && !pointing && pose === "awake" &&
+        {!panel && !writingPanel && !quiet && !pointing && !drawingPen && pose === "awake" &&
           // Hide empty dialogue.
           (state === "thinking" || state === "looking" || said) && (
           <div className="bubble">

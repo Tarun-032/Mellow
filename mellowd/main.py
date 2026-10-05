@@ -8,7 +8,7 @@ import sys
 import threading
 import time
 from contextlib import aclosing, asynccontextmanager, suppress
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import NamedTuple
 
@@ -17,7 +17,7 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 from mellowd import (
-    act, agents, capture, config, errors, guide, llm, locator, meetings, memory, perf, point, remind, sessions, stt, transport, tts, writing,
+    act, agents, capture, config, drawing, errors, guide, llm, locator, meetings, memory, perf, point, remind, sessions, stt, transport, tts, visual_explanation, writing,
 )
 from mellowd.version import PROTOCOL, SERVICE, VERSION
 
@@ -334,6 +334,11 @@ async def put_config(body: dict):
             session.writer.reset()
             await writing.status(session, send, "idle")
             await send(session.ws, type="state", state="idle")
+    if previous.get("drawing_enabled") and not cfg.get("drawing_enabled"):
+        for session in list(_active_sessions.values()):
+            if getattr(session, "drawing_active", False) or getattr(session, "drawing_scene", None):
+                await session.abort()
+                await send(session.ws, type="state", state="idle")
     return {
         "settings": config.redacted(cfg),
         "engine_changed": engine_changed,
@@ -741,6 +746,22 @@ class Session:
     guide_pending: guide.Pending | None = None
     guide_task: asyncio.Task | None = None
     presentation: guide.Presentation | None = None
+    drawing_presentation: guide.Presentation | None = None
+    drawing_task: asyncio.Task | None = None
+    drawing_scene: dict | None = None
+    drawing_occlusions: list = field(default_factory=list)
+    drawing_pen_occlusions: list = field(default_factory=list)
+    drawing_deadline: float = 0
+    drawing_completion_deadline: float = 0
+    drawing_observed_regions: tuple = ()
+    drawing_diagnostic: object = None
+    drawing_animations: tuple = ()
+    drawing_complete: asyncio.Event = field(default_factory=asyncio.Event)
+    drawing_failure_reason: str | None = None
+    drawing_frame: drawing.Frame | None = None
+    drawing_active: bool = False
+    drawing_pen_active: bool = False
+    drawing_scale: float = 1
     awake: bool = False
     warmup: asyncio.Task | None = None
     meter: asyncio.Task | None = None
@@ -753,6 +774,10 @@ class Session:
     reminders: asyncio.Task | None = None
     # Capture visibility signal.
     hidden: asyncio.Event = field(default_factory=asyncio.Event)
+    capture_id: str | None = None
+    capture_safe: bool = False
+    capture_active: bool = False
+    capture_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     # Turn monitor.
     turn_monitor: dict | None = None
     writer: writing.Writer = field(default_factory=writing.Writer)
@@ -950,6 +975,7 @@ class Session:
     async def abort(self, *, preserve_guide: bool = False) -> None:
         """Stop whatever the pet is doing, right now."""
         _retire_point(self)
+        await _clear_drawing(self)
         self.writer.cancel()
         if self.turn and not self.turn.done():
             self.turn.cancel()
@@ -970,7 +996,6 @@ class Session:
 # Per-shell histories.
 _active_sessions: dict[int, Session] = {}
 _engine_revision = 0
-
 
 async def _meeting_started():
     await agents.stop()
@@ -1059,6 +1084,7 @@ class Shot(NamedTuple):
     hwnd: int
     # Physical source-window bounds; optional for old fixtures/headless runs.
     window: tuple[int, int, int, int] | None = None
+    frame: drawing.Frame | None = None
 
 
 def _shot(
@@ -1067,9 +1093,12 @@ def _shot(
     """Capture + audit metadata in one blocking call. Never raises."""
     monitor = capture.known_monitor(monitor) or capture.active_monitor()
     hwnd, app, title = capture.window_on_monitor(monitor) if monitor else (0, "", "")
+    captured_at = time.monotonic()
     grabbed = capture.grab(max_edge, monitor)
+    window = capture.window_rect(hwnd)
     shot = (
-        Shot(*grabbed, monitor, hwnd, capture.window_rect(hwnd))
+        Shot(*grabbed, monitor, hwnd, window,
+             drawing.Frame.capture(monitor, hwnd, window, grabbed[1], grabbed[2], grabbed[3], captured=captured_at))
         if grabbed and monitor else None
     )
     if not app and not title:
@@ -1078,7 +1107,23 @@ def _shot(
 
 
 # Capture-hide timeout.
-HIDE_TIMEOUT = 0.4
+HIDE_TIMEOUT = 1.0
+
+
+async def _prepare_capture(session):
+    # A receipt belongs to this capture, not a cancelled/previous one.
+    import uuid
+    session.capture_id = uuid.uuid4().hex
+    session.capture_safe = False
+    session.capture_active = True
+    session.hidden.clear()
+    await send(session.ws, type="capture", phase="begin", capture_id=session.capture_id)
+    try:
+        await asyncio.wait_for(session.hidden.wait(), HIDE_TIMEOUT)
+    except TimeoutError:
+        log.warning("shell did not confirm capture preparation")
+        return False
+    return session.capture_safe
 
 
 @perf.timed("capture")
@@ -1086,21 +1131,24 @@ async def _unseen_shot(
     session: Session, max_edge: int = capture.MAX_EDGE
 ) -> tuple[Shot | None, str, str]:
     """`_shot`, with Mellow's own windows out of the picture."""
-    session.hidden.clear()
-    await send(session.ws, type="capture", phase="begin")
-    try:
+    result = await _clean_capture(session, lambda: _shot(max_edge, getattr(session, "turn_monitor", None)))
+    return result if result is not None else (None, "", "")
+
+
+async def _clean_capture(session, sample):
+    """Serialize clean local samples; restore the matching receipt even on cancel."""
+    if not hasattr(session, "capture_lock"):
+        session.capture_lock = asyncio.Lock()
+    async with session.capture_lock:
         try:
-            await asyncio.wait_for(session.hidden.wait(), HIDE_TIMEOUT)
-        except asyncio.TimeoutError:
-            # Capture despite a hide timeout.
-            log.warning("shell did not confirm the hide in %.1fs, capturing anyway", HIDE_TIMEOUT)
-        return await asyncio.to_thread(
-            _shot, max_edge, getattr(session, "turn_monitor", None)
-        )
-    finally:
-        # Always restore Mellow.
-        with suppress(Exception, asyncio.CancelledError):
-            await asyncio.shield(send(session.ws, type="capture", phase="end"))
+            if not await _prepare_capture(session):
+                return None
+            return await asyncio.to_thread(sample)
+        finally:
+            capture_id = session.capture_id
+            with suppress(Exception, asyncio.CancelledError):
+                await asyncio.shield(send(session.ws, type="capture", phase="end", capture_id=capture_id))
+            session.capture_active = False
 
 
 # Defensive scan for action replies and screen-request preambles.
@@ -1663,6 +1711,505 @@ def _retire_point(session: Session) -> None:
     session.presentation = None
 
 
+async def _clear_drawing(session, *, preserve_pen=False) -> None:
+    owned_pen = getattr(session, "drawing_pen_active", False)
+    if not preserve_pen: session.drawing_pen_active = False
+    presentation = getattr(session, "drawing_presentation", None)
+    if presentation:
+        presentation.retire()
+    session.drawing_presentation = None
+    if complete := getattr(session, "drawing_complete", None):
+        complete.set()
+    watcher = getattr(session, "drawing_task", None)
+    session.drawing_task = None
+    if watcher and watcher is not asyncio.current_task():
+        watcher.cancel()
+        with suppress(asyncio.CancelledError):
+            await watcher
+    scene = getattr(session, "drawing_scene", None)
+    session.drawing_scene = None
+    session.drawing_occlusions = []
+    session.drawing_pen_occlusions = []
+    session.drawing_deadline = 0
+    session.drawing_completion_deadline = 0
+    session.drawing_animations = ()
+    session.drawing_observed_regions = ()
+    session.drawing_scale = 1
+    if (scene or owned_pen) and getattr(session, "alive", True):
+        await send(session.ws, type="drawing", scene=None, preserve_pen=preserve_pen)
+
+
+async def _draw(session, shot: Shot, marks: list[dict], reveal_from=0, caption="", *, animations=(), observed_regions=()) -> guide.Presentation:
+    """Present validated geometry; called at playback, never at synthesis."""
+    await _clear_drawing(session, preserve_pen=True)
+    frame = shot.frame
+    if frame is None or not frame.hwnd or frame.window is None:
+        raise ValueError("drawing needs a captured source window")
+    # Speech synthesis/planning can outlive the screen it describes. Recheck a
+    # clean local capture before showing old geometry, not just after display.
+    fresh, _, _ = await _unseen_shot(session)
+    if (fresh is None or fresh.hwnd != frame.hwnd or fresh.window != frame.window
+            or fresh.monitor != frame.monitor):
+        raise ValueError("drawing source changed since capture")
+    # Renew only AFTER the original source has matched a clean fresh capture.
+    # Keep its crop transform: the model's coordinates belong to that image.
+    renewed = replace(fresh.frame, transform=frame.transform)
+    scene = renewed.scene(marks, reveal_from)
+    if frame.content_changed(fresh.pixels, targets=_drawing_regions(scene, observed_regions), cursor=capture.cursor_position(), animations=animations):
+        raise ValueError("drawing source changed since capture")
+    frame = renewed
+    scene["caption"] = caption[:60]
+    if capture.window_rect(frame.hwnd) != frame.window or capture.known_monitor(frame.monitor) != frame.monitor:
+        raise ValueError("drawing source moved or disappeared")
+    marker = perf.marker()
+    presentation = guide.Presentation(mark=lambda name: marker(name.replace("pointer_", "drawing_")))
+    scene["presentation_id"] = presentation.id
+    session.drawing_presentation = presentation
+    session.drawing_scene = scene
+    session.drawing_pen_active = True
+    session.drawing_frame = frame
+    session.drawing_deadline = time.monotonic() + drawing.ACTIVE_LIFETIME
+    session.drawing_diagnostic = perf.visual_recorder()
+    session.drawing_animations = tuple(animations)
+    session.drawing_observed_regions = tuple(observed_regions)
+    session.drawing_complete = asyncio.Event()
+    # Older shells do not report their animation clock. Use a bounded estimate
+    # until the ready receipt supplies the actual remaining stroke time.
+    shapes = sum(mark["kind"] != "label" for mark in marks[reveal_from:])
+    session.drawing_completion_deadline = time.monotonic() + min(57.0, 2.85 + shapes * 2.1)
+    session.drawing_failure_reason = None
+    perf.mark("drawing_dispatched")
+    await send(session.ws, type="drawing", scene=scene)
+    return presentation
+
+
+def _drawing_regions(scene, observed_regions=()):
+    """Physical source targets, never masks hiding their underlying content."""
+    # A short measured arrow watches the entire original control, not just
+    # its shaft. The host keeps those bounds outside the model/native scene.
+    regions = list(observed_regions)
+    for mark in scene["marks"]:
+        if mark["kind"] == "label":
+            continue
+        xs, ys = zip(*mark["points"])
+        regions.append((min(xs), min(ys), max(1, max(xs)-min(xs)), max(1, max(ys)-min(ys))))
+    return regions
+
+
+async def _invalidate_drawing(session, reason="native_failure") -> None:
+    """A changed source must also stop speech that still describes its marks."""
+    # Capture ownership before clearing ink: cleanup yields to playback and may
+    # overlap a fresh push-to-talk turn. Never reset that replacement's state.
+    turn = getattr(session, "turn", None)
+    interrupted = bool(turn and not turn.done() and turn is not asyncio.current_task())
+    if record := getattr(session, "drawing_diagnostic", None):
+        record("retired", reason)
+    log.info("drawing retired: %s", reason)
+    await _clear_drawing(session)
+    if getattr(session, "turn", None) is not turn:
+        return
+    if interrupted:
+        turn.cancel()
+    await session.speaker.stop()
+    if (interrupted and getattr(session, "turn", None) is turn
+            and getattr(session, "alive", True)):
+        # Successful answer() sends idle; its cancellation path cannot reach
+        # that line. Also retire interrupted dialogue, including muted replies.
+        await send(session.ws, type="state", state="idle", interrupted=True)
+
+
+async def _watch_drawing(session, frame, scene):
+    # Clean underlying source samples; no screenshot is uploaded or saved.
+    # Input is not a cancellation event. Only persistent content/layout changes
+    # matter, and annotations themselves must not hide changed target pixels.
+    baseline = frame
+    changed_samples = 0
+    reason = "source_changed"
+    try:
+        while session.drawing_scene is scene:
+            await asyncio.sleep(.5)
+            if getattr(session, "capture_active", False):
+                continue
+            if time.monotonic() >= session.drawing_deadline:
+                reason = "expired"
+                break
+            if capture.window_rect(frame.hwnd) != frame.window or capture.known_monitor(frame.monitor) != frame.monitor:
+                reason = "display_changed"
+                break
+            sampled = await _clean_capture(session, lambda: capture.frame(frame.monitor))
+            if sampled is None:
+                reason = "capture_unavailable"
+                break
+            _, pixels, _ = sampled
+            if session.drawing_scene is not scene:
+                return
+            changed = baseline.content_changed(pixels, targets=_drawing_regions(scene, getattr(session, "drawing_observed_regions", ())), cursor=capture.cursor_position(),
+                                                animations=getattr(session, "drawing_animations", ()))
+            changed_samples = changed_samples + 1 if changed else 0
+            if changed_samples >= 2:
+                break
+        if session.drawing_scene is scene:
+            await _invalidate_drawing(session, reason)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception("drawing observation failed")
+        if session.drawing_scene is scene:
+            await _invalidate_drawing(session, "observer_error")
+
+
+async def _begin_drawing_beat(session, shot, marks, sentence, partial, *, reveal_from=0, animations=(), observed_regions=()):
+    """Verify and show ink at playback; return why its readiness gate failed."""
+    try:
+        caption = next((m["text"] for m in marks[reveal_from:] if m["kind"] == "label"), "")
+        if not caption:
+            caption = sentence.split(".", 1)[0][:60]
+        ticket = await _draw(session, shot, marks, reveal_from, caption, animations=animations, observed_regions=observed_regions)
+        if not await ticket.wait():
+            reason = getattr(session, "drawing_failure_reason", None)
+            await _clear_drawing(session)
+            return "renderer_failed" if reason in {None, "presentation_failed", "native_failure"} else "withheld"
+        ticket.mark("drawing_playback_ready")
+        scene = session.drawing_scene
+        session.drawing_task = asyncio.create_task(_watch_drawing(session, session.drawing_frame, scene))
+        await _deliver(session, sentence, False, partial)
+        return "ready"
+    except ValueError as error:
+        reason = "source_changed" if str(error) in {
+            "drawing source changed since capture", "drawing source moved or disappeared"
+        } else "invalid_scene"
+        perf.visual_recorder()("preflight_rejected", reason)
+        perf.mark("drawing_preflight_rejected_" + reason)
+        log.info("drawing preflight withheld: %s", reason)
+        await _clear_drawing(session)
+        return "withheld"
+
+
+async def _drawing_stroke_done(session):
+    """Use the renderer's bounded clock, while still detecting lost receipts."""
+    ticket = session.drawing_presentation
+    if ticket is None or ticket.retired:
+        raise asyncio.CancelledError
+    remaining = max(.5, getattr(session, "drawing_completion_deadline", time.monotonic() + 6) - time.monotonic())
+    try:
+        await asyncio.wait_for(session.drawing_complete.wait(), remaining)
+    except TimeoutError:
+        perf.outcome("drawing_failed")
+        perf.visual_recorder()("completion_timeout", "renderer_unresponsive")
+        await _clear_drawing(session)
+        return False
+    if ticket.retired or session.drawing_presentation is not ticket:
+        raise asyncio.CancelledError
+    return True
+
+
+async def _drawing_beat(session, shot: Shot, marks, sentence, speak, partial, *, reveal_from=0, wait_complete=False, animations=(), fallback_target=None, observed_regions=()):
+    """Visible ink gates speech; the final stroke also gates the next beat."""
+    delivered = ""
+    readiness = ""
+
+    async def before():
+        nonlocal delivered, readiness
+        readiness = await _begin_drawing_beat(session, shot, marks, sentence, partial,
+                                             reveal_from=reveal_from, animations=animations, observed_regions=observed_regions)
+        if readiness == "ready": delivered = sentence
+        return readiness == "ready"
+
+    if speak:
+        await session.speaker.speak_beat(sentence, before)
+        await _played(session)
+    else:
+        await before()
+    if not delivered:
+        if readiness == "renderer_failed" and fallback_target is not None:
+            return await _visual_control_point(session, shot, fallback_target, sentence, speak, partial)
+        perf.outcome("drawing_failed")
+        return await _deliver(session, "I couldn't place the drawing reliably, so I'll stop there.", speak, partial)
+    if wait_complete:
+        if not await _drawing_stroke_done(session):
+            return delivered + " " + await _deliver(session, "The drawing stopped responding, so I'll stop here.", speak, partial)
+        if not speak:
+            # Muted explanations remain visible long enough to read.
+            await asyncio.sleep(min(6.0, max(1.2, len(sentence) / 28)))
+    return delivered
+
+
+async def _visual_reasoning_fresh(session, shot, animations):
+    """Reasoning without new ink still needs current screen evidence."""
+    fresh, _, _ = await _unseen_shot(session)
+    frame = shot.frame
+    scene = session.drawing_scene
+    targets = _drawing_regions(scene, getattr(session, "drawing_observed_regions", ())) if scene is not None else ()
+    return (fresh is not None and fresh.hwnd == frame.hwnd and fresh.window == frame.window
+            and fresh.monitor == frame.monitor
+            and not frame.content_changed(fresh.pixels, targets=targets,
+                                          cursor=capture.cursor_position(), animations=animations))
+
+
+async def _visual_sequence(session, plan, partial, *, animations=()):
+    """Prebuffer narration across beats; all screen changes happen at playback.
+
+    Audio lookahead overlaps synthesis with the preceding explanation, while
+    the readiness and completion gates keep the bone and speech in order.
+    """
+    reply = []
+    failure = ""
+
+    async def present(beat):
+        nonlocal failure
+        if session.drawing_scene is not None and not await _drawing_stroke_done(session):
+            failure = "The drawing stopped responding, so I'll stop here."
+            return False
+        new_ink = beat.marks and (beat.reveal_from != len(beat.marks) or session.drawing_scene is None)
+        if not new_ink:
+            # Retained reasoning and a plain conclusion still refer to the
+            # captured page. Do not let audio lookahead bypass its freshness
+            # check merely because this beat adds no shapes.
+            if not await _visual_reasoning_fresh(session, plan.shot, animations):
+                await _clear_drawing(session)
+                failure = "The screen changed before I could show that, so I'll stop here."
+                return False
+        if beat.marks:
+            if beat.reveal_from == len(beat.marks) and session.drawing_scene is not None:
+                session.drawing_deadline = time.monotonic() + drawing.ACTIVE_LIFETIME
+                await send(session.ws, type="drawing_keepalive",
+                           presentation_id=session.drawing_scene["presentation_id"])
+                await _deliver(session, beat.say, False, partial)
+            else:
+                await send(session.ws, type="state", state="looking")
+                readiness = await _begin_drawing_beat(session, plan.shot, beat.marks, beat.say, partial,
+                                                     reveal_from=beat.reveal_from, animations=animations,
+                                                     observed_regions=getattr(beat, "observed_regions", ()))
+                if readiness != "ready":
+                    failure = "I couldn't place the drawing reliably, so I'll stop there."
+                    return False
+        else:
+            await _clear_drawing(session)
+            await _deliver(session, beat.say, False, partial)
+        reply.append(beat.say)
+        return True
+
+    for beat in plan.beats:
+        # Binding the beat here avoids the last-loop-value callback bug.
+        await session.speaker.speak_beat(beat.say, lambda beat=beat: present(beat))
+    await _played(session)
+    if not failure and session.drawing_scene is not None and not await _drawing_stroke_done(session):
+        failure = "The drawing stopped responding, so I'll stop here."
+    if failure:
+        perf.outcome("drawing_failed")
+        reply.append(await _deliver(session, failure, True, partial))
+        # Do not clear the last ink while a failure sentence is still playing.
+        await _played(session)
+    return " ".join(text.strip() for text in reply)
+
+
+def _visual_images(shot, candidates):
+    """Measured visible media, not guessed diagram boxes or control regions."""
+    wx, wy, ww, wh = shot.window
+    return tuple(row.bounds for row in candidates
+                 if row.source == "uia" and getattr(row, "is_image", False)
+                 and not row.chrome and row.bounds is not None
+                 and wx <= row.bounds[0] < row.bounds[0] + row.bounds[2] <= wx + ww
+                 and wy <= row.bounds[1] < row.bounds[1] + row.bounds[3] <= wy + wh)
+
+
+async def _visual_sample(session, shot, samples):
+    """Keep small local motion evidence; never upload or store these frames."""
+    hwnd, _, _ = capture.window_on_monitor(shot.monitor)
+    if (hwnd != shot.hwnd or capture.window_rect(shot.hwnd) != shot.window
+            or capture.known_monitor(shot.monitor) != shot.monitor):
+        return False
+    sampled = await _clean_capture(session, lambda: capture.frame(shot.monitor))
+    if sampled is None:
+        return False
+    _, pixels, _ = sampled
+    hwnd, _, _ = capture.window_on_monitor(shot.monitor)
+    if hwnd != shot.hwnd or capture.window_rect(shot.hwnd) != shot.window:
+        return False
+    samples.append(await asyncio.to_thread(drawing.observation, pixels))
+    return True
+
+
+async def _visual_motion_samples(session, shot, samples):
+    # Observe while the existing planner runs; six small local samples are the
+    # entire motion budget. A paused GIF may only begin moving during planning.
+    while len(samples) < 6:
+        await asyncio.sleep(.5)
+        if not await _visual_sample(session, shot, samples):
+            return False
+    return True
+
+
+async def _visual_point(session, plan, speak, partial, *, animations=()):
+    """A planner's single validated location uses the ordinary arriving bone."""
+    beat = plan.beats[0]
+    if control := visual_explanation.verified_control(plan):
+        return await _visual_control_point(session, plan.shot, control, beat.say, speak, partial)
+    frame = replace(plan.shot.frame, captured=time.monotonic())
+    scene = frame.scene(beat.marks)
+    fresh, _, _ = await _unseen_shot(session)
+    if (fresh is None or fresh.hwnd != frame.hwnd or fresh.window != frame.window
+            or fresh.monitor != frame.monitor
+            or frame.content_changed(fresh.pixels, targets=_drawing_regions(scene),
+                                     cursor=capture.cursor_position(), animations=animations)):
+        perf.outcome("drawing_failed")
+        return await _deliver(session, "The screen changed before I could show that, so I'll stop here.", speak, partial)
+    target = visual_explanation.point_target(plan)
+    await _aim(session, target)
+    perf.mark("visual_presentation_point")
+    return await _narrate(session, [(target, beat.say)], speak, partial, fresh)
+
+
+async def _visual_control_point(session, shot, target, sentence, speak, partial):
+    """An ink failure can still show one independently verified control.
+
+    Never derive this target from a rejected drawing, or use this path after a
+    source/layout change. Its UIA bounds and the unchanged source are checked
+    again after the failed renderer has been cleared.
+    """
+    if not visual_explanation.interactive(target):
+        perf.outcome("drawing_failed")
+        return await _deliver(session, "I couldn't verify that control reliably, so I'll stop here.", speak, partial)
+    delivered = ""
+    obstacle = "The screen changed before I could show that, so I'll stop here."
+
+    async def before():
+        nonlocal delivered, obstacle
+        # Check at playback, after slow synthesis, just like the drawing path.
+        fresh, _, _ = await _unseen_shot(session)
+        frame = shot.frame
+        if (fresh is None or frame is None or fresh.hwnd != frame.hwnd
+                or fresh.window != frame.window or fresh.monitor != frame.monitor
+                or frame.content_changed(fresh.pixels, targets=[target.bounds], cursor=capture.cursor_position())):
+            return False
+        ticket = await _aim(session, target)
+        if not await ticket.wait():
+            await _hide_point(session)
+            obstacle = _POINTER_UNAVAILABLE
+            return False
+        perf.mark("visual_control_point_fallback")
+        delivered = await _deliver(session, "I'll point to it instead. " + sentence, False, partial)
+        return True
+
+    if speak:
+        await session.speaker.speak_beat("I'll point to it instead. " + sentence, before)
+        await _played(session)
+    else:
+        await before()
+    if delivered:
+        return delivered
+    perf.outcome("drawing_failed")
+    return await _deliver(session, obstacle, speak, partial)
+
+
+async def _visual_answer(session, prompt, cfg, speak, partial):
+    if not cfg.get("drawing_enabled"):
+        return await _deliver(session, "Turn on screen drawings in Settings, Screen guidance, to use this.", speak, partial)
+    if not cfg.get("ai_enabled") or not llm.vision_ok(cfg["llm"]):
+        return await _deliver(session, "Screen drawings need an engine that can see images. Check vision in Settings.", speak, partial)
+    await send(session.ws, type="state", state="looking")
+    session.drawing_active = True
+    try:
+        await _clear_drawing(session)
+        shot, app, _ = await _unseen_shot(session)
+        if shot is None or shot.frame is None or not shot.hwnd or shot.window is None:
+            return await _deliver(session, "I couldn't capture the screen safely, so I can't draw on it.", speak, partial)
+        candidates = await asyncio.to_thread(point.candidates, prompt, shot.pixels, shot.monitor, None, shot.hwnd)
+        browser = app.lower() in {"chrome.exe", "msedge.exe", "firefox.exe", "brave.exe",
+                                  "opera.exe", "vivaldi.exe", "arc.exe"}
+        page = next((row.page_bounds for row in candidates if row.page_bounds is not None), None) if browser else None
+        images = _visual_images(shot, candidates)
+        samples, motion = [], None
+        animations = ()
+        if images:
+            if not await _visual_sample(session, shot, samples):
+                return await _deliver(session, "The screen changed before I could explain it. Ask again once it is still.", speak, partial)
+            await asyncio.sleep(.25)
+            if not await _visual_sample(session, shot, samples):
+                return await _deliver(session, "The screen changed before I could explain it. Ask again once it is still.", speak, partial)
+            animations = shot.frame.animation_regions(samples, images)
+            motion = asyncio.create_task(_visual_motion_samples(session, shot, samples))
+        try:
+            try:
+                plan = await visual_explanation.generate(prompt, shot, cfg, candidates, page_bounds=page,
+                                                        history=session.history, dynamic_regions=animations)
+            finally:
+                if motion is not None:
+                    motion.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await motion
+        except (ValueError, TimeoutError) as error:
+            log.info("visual explanation withheld: %s", str(error) or "planning timed out")
+            perf.visual_recorder()("plan_rejected", visual_explanation.rejection_reason(error))
+            perf.outcome("drawing_failed")
+            return await _deliver(session, "I couldn't make a reliable drawing plan for this screen. Try a simpler drawing request.", speak, partial)
+        if plan.status == "unavailable":
+            perf.outcome("drawing_unavailable")
+            return await _deliver(session, plan.message, speak, partial)
+        if plan.status == "plain":
+            perf.mark("visual_presentation_plain")
+            return await _deliver(session, plan.message, speak, partial)
+        if images:
+            animations = shot.frame.animation_regions(samples, images)
+            plan = visual_explanation.stabilize(plan, animations)
+            if animations:
+                perf.mark("visual_animation_observed")
+        perf.mark("drawing_plan_validated")
+        if plan.status == "point":
+            return await _visual_point(session, plan, speak, partial, animations=animations)
+        perf.mark("visual_presentation_drawing")
+        if speak and len(plan.beats) > 1:
+            return await _visual_sequence(session, plan, partial, animations=animations)
+        reply = []
+        # Fallback is limited to a single-control plan whose target passed the
+        # planner's independent measured-box agreement. A multi-target diagram
+        # or merely plausible box must never become a guessed pointer.
+        fallback = visual_explanation.verified_control(plan) if len(plan.beats) == 1 else None
+        for beat in plan.beats:
+            if (not beat.marks or (beat.reveal_from == len(beat.marks) and session.drawing_scene is not None)):
+                if not await _visual_reasoning_fresh(session, plan.shot, animations):
+                    await _clear_drawing(session)
+                    reply.append(await _deliver(session, "The screen changed before I could show that, so I'll stop here.", speak, partial))
+                    break
+            if speak:
+                # Each drawing beat has its own audio preparation. Keep the
+                # previous speaking pose from lingering through that wait;
+                # Speaker switches back only after this beat is ready to play.
+                await send(session.ws, type="state", state="looking")
+            if beat.marks:
+                if (beat.reveal_from == len(beat.marks)
+                        and getattr(session, "drawing_scene", None) is not None):
+                    # Further reasoning may need no new ink. Preserve the marks
+                    # and observer; do not make the bone trace them a second time.
+                    session.drawing_deadline = time.monotonic() + drawing.ACTIVE_LIFETIME
+                    await send(session.ws, type="drawing_keepalive",
+                               presentation_id=session.drawing_scene["presentation_id"])
+                    reply.append((await _deliver(session, beat.say, speak, partial)).strip())
+                    if speak:
+                        await _played(session)
+                    else:
+                        await asyncio.sleep(_dwell(beat.say))
+                    continue
+                heard = await _drawing_beat(session, plan.shot, beat.marks, beat.say, speak, partial,
+                                             reveal_from=beat.reveal_from, wait_complete=True, animations=animations,
+                                             fallback_target=fallback, observed_regions=getattr(beat, "observed_regions", ()))
+                reply.append(heard.strip())
+                if heard.strip() != beat.say: break
+            else:
+                await _clear_drawing(session)
+                reply.append((await _deliver(session, beat.say, speak, partial)).strip())
+                if speak: await _played(session)
+        return " ".join(text.strip() for text in reply)
+    except BaseException:
+        await asyncio.shield(_clear_drawing(session))
+        raise
+    finally:
+        session.drawing_active = False
+        # Every beat has finished its audio (or muted reading interval) and its
+        # final stroke. Retire ink and return the borrowed bone together now.
+        await asyncio.shield(_clear_drawing(session))
+
+
 async def _hide_point(session: Session) -> None:
     """Take the bone away."""
     _retire_point(session)
@@ -1813,16 +2360,15 @@ async def _prepare_pointing(session: Session, prompt: str):
     """Read-only work overlapped with writing classification; never call a model."""
     try:
         with perf.span("point_preparation"):
-            session.hidden.clear()
-            await send(session.ws, type="capture", phase="begin")
             try:
-                with suppress(asyncio.TimeoutError):
-                    await asyncio.wait_for(session.hidden.wait(), HIDE_TIMEOUT)
+                if not await _prepare_capture(session):
+                    return None
                 monitor = capture.known_monitor(getattr(session, "turn_monitor", None)) or capture.active_monitor()
                 hwnd, app, title = capture.window_on_monitor(monitor) if monitor else (0, "", "")
                 # Capture native pixels once. UIA, OCR and JPEG encoding then
                 # proceed together over the same requested screen state.
                 uia_task = asyncio.create_task(asyncio.to_thread(point.uia_candidates, hwnd))
+                captured_at = time.monotonic()
                 captured = await asyncio.to_thread(capture.frame, monitor)
                 if captured is None or monitor is None:
                     await uia_task
@@ -1852,10 +2398,13 @@ async def _prepare_pointing(session: Session, prompt: str):
                     uia_task.cancel()
                     with suppress(asyncio.CancelledError, Exception):
                         await uia_task
-                shot = Shot(*encoded, pixels, monitor, hwnd, capture.window_rect(hwnd))
+                window = capture.window_rect(hwnd)
+                shot = Shot(*encoded, pixels, monitor, hwnd, window,
+                            drawing.Frame.capture(monitor, hwnd, window, encoded[1], encoded[2], pixels, captured=captured_at))
             finally:
                 with suppress(Exception, asyncio.CancelledError):
-                    await asyncio.shield(send(session.ws, type="capture", phase="end"))
+                    await asyncio.shield(send(session.ws, type="capture", phase="end", capture_id=session.capture_id))
+                session.capture_active = False
             if shot is None:
                 return None
             cands = await asyncio.to_thread(
@@ -1948,6 +2497,7 @@ async def answer(session: Session, prompt: str, prepared=None) -> None:
 
     # Clear the previous point.
     await _hide_point(session)
+    await _clear_drawing(session)
 
     cfg = config.load()
     # Active model.
@@ -1998,22 +2548,31 @@ async def answer(session: Session, prompt: str, prepared=None) -> None:
         and not wants_pointer
         and capture.wants_action(prompt)
     )
+    drawing_route = visual_explanation.request_kind(prompt, automatic=cfg.get("drawing_enabled", False) and sighted,
+                                                   history=session.history[:-1])
+    draw_requested = drawing_route in ("explicit", "automatic")
+    perf.mark("drawing_route_" + drawing_route)
     try:
-        if doing:
+        did = False
+        if draw_requested:
+            reply = await _visual_answer(session, prompt, {**cfg, "memory": remembered}, speak, partial)
+            # Normal history/logging and final speech cleanup still apply.
+            asked = False
+        elif doing:
             reply, did = await _act(session, cfg, speak, partial, prompt)
-            if did:
-                await asyncio.to_thread(
-                    sessions.record, "assistant_said", **_said(cfg, reply, False)
-                )
-                session.history.append({"role": "assistant", "content": reply})
-                del session.history[: max(0, len(session.history) - HISTORY_TURNS * 2)]
-                if speak:
-                    await session.speaker.finish()
-                await send(ws, type="state", state="idle")
-                return
+        if did:
+            await asyncio.to_thread(
+                sessions.record, "assistant_said", **_said(cfg, reply, False)
+            )
+            session.history.append({"role": "assistant", "content": reply})
+            del session.history[: max(0, len(session.history) - HISTORY_TURNS * 2)]
+            if speak:
+                await session.speaker.finish()
+            await send(ws, type="state", state="idle")
+            return
         if remembered:
             cfg = {**cfg, "memory": remembered}
-        if not asked:
+        if not asked and not draw_requested:
             reply, asked, _ = await _pass(
                 session,
                 cfg,
@@ -2233,6 +2792,7 @@ async def answer(session: Session, prompt: str, prepared=None) -> None:
         # Clear the point despite cancellation.
         with suppress(Exception, asyncio.CancelledError):
             await asyncio.shield(_hide_point(session))
+            await asyncio.shield(_clear_drawing(session))
         raise
 
     await asyncio.to_thread(
@@ -2273,10 +2833,11 @@ async def run_turn(session: Session, prompt: str) -> None:
             await _stop_guide(session)
         cfg = config.load()
         if prompt and (cfg.get("ai_enabled") and cfg["llm"]["mode"] in ("cloud", "agent")
-                and llm.vision_ok(cfg["llm"]) and capture.wants_pointing(prompt)):
+                and llm.vision_ok(cfg["llm"]) and capture.wants_pointing(prompt)
+                and not visual_explanation.requested(prompt, automatic=cfg.get("drawing_enabled", False), history=session.history)):
             await _hide_point(session)
             prepared = asyncio.create_task(_prepare_pointing(session, prompt))
-        if cfg.get("writing_enabled") and prompt:
+        if cfg.get("writing_enabled") and prompt and not visual_explanation.requested(prompt, automatic=cfg.get("drawing_enabled", False), history=session.history):
             if prepared is None:
                 await _hide_point(session)
             options = {"discard_preparation": lambda: _discard_preparation(prepared)} if prepared is not None else {}
@@ -2298,6 +2859,7 @@ async def run_turn(session: Session, prompt: str) -> None:
         # Clear failed points.
         with suppress(Exception):
             await _hide_point(session)
+            await _clear_drawing(session)
         await _stop_guide(session)
         await session.speaker.stop()
         await send(session.ws, type="error", message=errors.message(e))
@@ -2397,8 +2959,68 @@ async def handle(session: Session, msg: dict) -> None:
             presentation.acknowledge(msg.get("outcome"))
 
     elif kind == "capture_ready":
-        # Capture is ready.
-        session.hidden.set()
+        if msg.get("capture_id") == session.capture_id and session.capture_id is not None:
+            session.capture_safe = msg.get("ok") is True
+            session.hidden.set()
+
+    elif kind == "drawing_ack":
+        presentation = session.drawing_presentation
+        if presentation is not None and msg.get("presentation_id") == presentation.id:
+            outcome = msg.get("outcome")
+            if outcome == "position":
+                try:
+                    rects = msg.get("occlusions", [])
+                    scale = session.drawing_scale
+                    if not isinstance(rects, list) or len(rects) > 3: raise ValueError("invalid pen masks")
+                    clean = []
+                    for row in rects:
+                        if not isinstance(row, list) or len(row) != 4: raise ValueError("invalid pen mask")
+                        x,y,w,h = map(drawing.number, row)
+                        if not 0 < w <= 256 * scale or not 0 < h <= 64 * scale: raise ValueError("pen mask too large")
+                        clean.append([x,y,w,h])
+                    session.drawing_pen_occlusions = clean
+                except ValueError:
+                    pass
+                return
+            if outcome == "ready":
+                try:
+                    remaining_ms = drawing.number(msg.get("remaining_ms"))
+                    if 0 <= remaining_ms <= 55000:
+                        session.drawing_completion_deadline = time.monotonic() + remaining_ms / 1000 + 2
+                except ValueError:
+                    pass
+                try:
+                    scale = drawing.number(msg.get("scale", 1))
+                    if .5 <= scale <= 8: session.drawing_scale = scale
+                except ValueError:
+                    pass
+                occlusions = msg.get("occlusions", [])
+                if isinstance(occlusions, list) and len(occlusions) <= 8:
+                    try:
+                        checked = [[drawing.number(v) for v in rect] for rect in occlusions if isinstance(rect, list) and len(rect) == 4]
+                        if len(checked) == len(occlusions) and all(w > 0 and h > 0 for _, _, w, h in checked):
+                            session.drawing_occlusions = checked
+                    except ValueError:
+                        pass
+                presentation.acknowledge("arrived")
+                presentation.mark("drawing_ready")
+            elif outcome == "complete":
+                presentation.mark("drawing_complete")
+                if presentation.outcome == "arrived" and not presentation.retired:
+                    session.drawing_complete.set()
+            elif outcome == "failed":
+                reason = msg.get("reason")
+                if reason not in {"expired", "source_changed", "pet_hidden", "display_changed",
+                                   "replaced", "cleared", "native_failure", "presentation_failed"}:
+                    reason = "native_failure"
+                session.drawing_failure_reason = reason
+                if presentation.outcome is None:
+                    if record := getattr(session, "drawing_diagnostic", None):
+                        record("not_ready", reason)
+                    # Let the playback waiter consume failure before retirement.
+                    presentation.acknowledge("failed")
+                else:
+                    await _invalidate_drawing(session, reason)
 
     elif kind == "awake":
         # Wake the mic keeper.

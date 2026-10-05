@@ -124,6 +124,7 @@ struct GuideMotion {
     side_x: f64,
     side_y: f64,
     phase: Phase,
+    ink_until: Option<Instant>,
 }
 
 impl Default for GuideMotion {
@@ -144,11 +145,20 @@ impl Default for GuideMotion {
             side_x: 1.0,
             side_y: 1.0,
             phase: Phase::Following,
+            ink_until: None,
         }
     }
 }
 
 impl GuideMotion {
+    fn renew_pen(&mut self, now: Instant) -> bool {
+        if !self.ready || self.quiet || !self.ink_until.is_some_and(|expires| expires > now) {
+            return false;
+        }
+        self.ink_until = Some(now + Duration::from_secs(60));
+        true
+    }
+
     // Call only after this tick successfully submits placement and visibility.
     fn take_arrival(&mut self, submitted_revision: u64) -> Option<u64> {
         if self.ready
@@ -169,6 +179,69 @@ pub struct GuideState {
     motion: Arc<Mutex<GuideMotion>>,
     runtime: Arc<Mutex<GuideRuntime>>,
     tick_pending: Arc<AtomicBool>,
+    capturing: Arc<AtomicBool>,
+}
+
+impl GuideState {
+    pub fn set_capturing(&self, value: bool) {
+        self.capturing.store(value, std::sync::atomic::Ordering::Relaxed);
+    }
+    pub fn dialogue_revision(&self) -> Option<u64> {
+        let motion = self.motion.lock().ok()?;
+        if motion.ready && !motion.quiet && matches!(motion.phase, Phase::Dwelling { .. }) {
+            Some(motion.revision)
+        } else { None }
+    }
+}
+
+/// The annotation webview paints the same bone and ink on one animation clock.
+/// Native following is suspended, never the user's actual mouse cursor.
+pub fn lend_pen(app: &AppHandle) -> Result<[f64; 2], String> {
+    let state = app.state::<GuideState>();
+    let all_screens = screens(app);
+    let cursor = current_cursor(app)?;
+    let mut motion = state.motion.lock().map_err(|_| "guide state poisoned")?;
+    if !motion.ready || motion.quiet { return Err("guide is unavailable".into()); }
+    initialize_at_cursor(cursor, &mut motion, &all_screens);
+    let scale = screen_for(motion.position, &all_screens).ok_or("guide monitor missing")?.scale;
+    let tip = [motion.position.x + motion.tip_x * scale, motion.position.y + motion.tip_y * scale];
+    // The renderer owns the pen throughout active narration; finish/discard
+    // returns it normally. Match the annotation scene's bounded active lease.
+    motion.ink_until = Some(Instant::now() + Duration::from_secs(60));
+    motion.arrival_pending = None;
+    motion.velocity = Point::default();
+    drop(motion);
+    if let Some(window) = app.get_webview_window("guide") { window.hide().map_err(|e| e.to_string())?; }
+    hide_dialogue(app);
+    Ok(tip)
+}
+
+pub fn pen_at(app: &AppHandle, tip: [f64; 2], scale: f64) {
+    let state = app.state::<GuideState>();
+    if let Ok(mut motion) = state.motion.lock() {
+        if motion.ink_until.is_some() {
+            motion.position = Point { x: tip[0] - motion.tip_x * scale, y: tip[1] - motion.tip_y * scale };
+            motion.phase = Phase::Dwelling { at: motion.position };
+            motion.velocity = Point::default();
+        }
+    };
+}
+
+/// Keep the annotation's existing pen loan alive without resetting its pose.
+pub fn renew_pen(app: &AppHandle, now: Instant) -> Result<bool, String> {
+    let state = app.state::<GuideState>();
+    let mut motion = state.motion.lock().map_err(|_| "guide state poisoned")?;
+    Ok(motion.renew_pen(now))
+}
+
+pub fn return_pen(app: &AppHandle) {
+    let state = app.state::<GuideState>();
+    let revision = {
+        let Ok(mut motion) = state.motion.lock() else { return; };
+        if motion.ink_until.take().is_none() { return; }
+        motion.revision + 1
+    };
+    let _ = guide_clear(app.clone(), state, revision);
 }
 
 #[derive(Debug)]
@@ -728,6 +801,7 @@ pub fn guide_set_reduced_motion(
 
 /// One cursor/guide frame on the main thread (window APIs must not run off-thread).
 fn tick(app: &AppHandle, state: &GuideState) {
+    if state.capturing.load(std::sync::atomic::Ordering::Relaxed) { return; }
     let Some(pet) = app.get_webview_window("pet") else {
         return;
     };
@@ -815,6 +889,14 @@ fn tick(app: &AppHandle, state: &GuideState) {
         return;
     };
     let now = Instant::now();
+    let loan = state.motion.lock().ok().and_then(|m| m.ink_until);
+    if let Some(until) = loan {
+        if now < until {
+            if let Some(window) = app.get_webview_window("guide") { let _ = window.hide(); }
+            return;
+        }
+        return_pen(app);
+    }
     let dt = {
         let mut runtime = state
             .runtime
@@ -939,7 +1021,8 @@ fn tick(app: &AppHandle, state: &GuideState) {
         )
     };
 
-    let should_show = ready && !quiet && pet.is_visible().unwrap_or(false);
+    let should_show = ready && !quiet && !state.capturing.load(std::sync::atomic::Ordering::Relaxed)
+        && pet.is_visible().unwrap_or(false);
     let currently_visible = guide_window.is_visible().unwrap_or(false);
     if !should_show {
         if currently_visible {
@@ -1057,6 +1140,55 @@ pub fn spawn(app: AppHandle, state: GuideState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn renewal_extends_an_owned_pen_without_changing_its_pose() {
+        let now = Instant::now();
+        let mut guide = GuideMotion::default();
+        guide.ready = true;
+        guide.position = Point { x: 125.0, y: 240.0 };
+        guide.ink_until = Some(now + Duration::from_secs(1));
+        assert!(guide.renew_pen(now));
+        assert_eq!(guide.ink_until, Some(now + Duration::from_secs(60)));
+        assert_eq!(guide.position.x, 125.0);
+        assert_eq!(guide.position.y, 240.0);
+        guide.ink_until = None;
+        assert!(!guide.renew_pen(now));
+        guide.ink_until = Some(now);
+        assert!(!guide.renew_pen(now));
+        guide.ink_until = Some(now + Duration::from_secs(60));
+        guide.quiet = true;
+        assert!(!guide.renew_pen(now));
+    }
+
+    #[test]
+    fn arrival_requires_current_visible_dwelling_and_is_consumed_once() {
+        let mut guide = GuideMotion::default();
+        guide.revision = 7;
+        guide.arrival_pending = Some(7);
+        guide.phase = Phase::Dwelling {
+            at: Point::default(),
+        };
+        assert_eq!(guide.take_arrival(7), None); // not ready
+        guide.ready = true;
+        guide.quiet = true;
+        assert_eq!(guide.take_arrival(7), None);
+        guide.quiet = false;
+        guide.revision = 8;
+        assert_eq!(guide.take_arrival(7), None); // superseded
+        guide.arrival_pending = Some(8);
+        guide.phase = Phase::Following;
+        assert_eq!(guide.take_arrival(8), None);
+        guide.phase = Phase::Dwelling {
+            at: Point::default(),
+        };
+        assert_eq!(guide.take_arrival(7), None); // old native placement
+        assert_eq!(guide.take_arrival(8), Some(8));
+        assert_eq!(guide.take_arrival(8), None);
+        guide.revision = 9; // same position, new presentation
+        guide.arrival_pending = Some(9);
+        assert_eq!(guide.take_arrival(9), Some(9));
+    }
 
     fn screen() -> Screen {
         Screen {

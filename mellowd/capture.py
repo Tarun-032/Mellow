@@ -27,7 +27,8 @@ SURFACE = r"""
     \b(?:screen|display|monitor|desktop|screenshot)\b
   | \b(?:this|that|the)\s+(?:tab|window|page|dialog|popup|menu|panel|toolbar|
        email|message|error|warning|code|file|folder|form|button|chart|graph|
-       table|image|photo|picture|video|document|paragraph|line|cell|box)\b
+       table|image|photo|picture|video|document|paragraph|line|cell|box|
+       diagrams?|drawings?|triangles?|theorems?|equations?|formul(?:a|as|ae)|proofs?|plots?|figures?)\b
 """
 
 # Watching, rather than knowing: asked about something present.
@@ -88,6 +89,7 @@ GUIDE = r"""
 # Asking for the finger in so many words.
 ERRAND = r"""
     \b(?:point|show|take|guide|lead|direct)\s+me\b
+  | \bpoint\s+(?:to|at)\b
   | \bwhere(?:'?s\b|\s+(?:is|are|was|were|do|does|did|can|could|should|would|
       will|to|abouts)\b)
   | \bhelp\s+me\s+(?:find|get|open|reach|see)\b
@@ -235,6 +237,17 @@ def active_monitor() -> dict | None:
         return None
 
 
+def cursor_position() -> tuple[int, int] | None:
+    """Local cosmetic-change hint; never sends input or records coordinates."""
+    try:
+        position = ctypes.wintypes.POINT()
+        if ctypes.windll.user32.GetCursorPos(ctypes.byref(position)):
+            return position.x, position.y
+    except (AttributeError, OSError):
+        pass
+    return None
+
+
 def window_on_monitor(monitor: dict) -> tuple[int, str, str]:
     """Topmost real application window on ``monitor``, excluding Mellow."""
     try:
@@ -324,6 +337,15 @@ def window_on_monitor(monitor: dict) -> tuple[int, str, str]:
 
         user32.EnumWindows.argtypes = [callback_t, ctypes.wintypes.LPARAM]
         user32.EnumWindows.restype = ctypes.wintypes.BOOL
+        # Foreground is the user's source when it intersects this monitor.
+        # Nonactivating topmost overlays (including recording/automation tools)
+        # can precede it in EnumWindows but are not the app being explained.
+        user32.GetForegroundWindow.restype = hwnd_t
+        foreground_hwnd = user32.GetForegroundWindow()
+        if foreground_hwnd:
+            visit(foreground_hwnd, 0)
+        if found:
+            return found[0]
         user32.EnumWindows(visit, 0)
         return found[0] if found else (0, "", "")
     except Exception:

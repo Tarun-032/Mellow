@@ -192,6 +192,7 @@ DEFAULTS = {
     # The whole AI half, off at the master switch ([[roadmap]] step 8's "just the pet").
     "ai_enabled": True,
     "writing_enabled": False,
+    "drawing_enabled": False,
     # Long-term memory of the user: saved notes in answers plus background learning.
     "memory_enabled": False,
     # About you (Settings, Personalization): used in every answer, memory on or off.
@@ -330,6 +331,8 @@ def validate(candidate: dict) -> dict:
         raise ValueError("meeting_speakers_enabled must be true or false")
     if not isinstance(cfg.get("writing_enabled"), bool):
         raise ValueError("writing_enabled must be true or false")
+    if not isinstance(cfg.get("drawing_enabled"), bool):
+        raise ValueError("drawing_enabled must be true or false")
     if not isinstance(cfg.get("memory_enabled"), bool):
         raise ValueError("memory_enabled must be true or false")
     cfg["profile"] = validate_profile(cfg.get("profile"))
