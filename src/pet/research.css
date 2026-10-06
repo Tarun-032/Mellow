@@ -1,5 +1,4 @@
-/* Research bones parked top-right: below a maximized window's caption buttons
-   and the browser toolbar, so they never sit on something you need to click. */
+/* Top-right, below caption buttons and browser toolbars. */
 .research-tray {
   position: fixed;
   top: 110px;
@@ -90,7 +89,16 @@
   background: var(--brown);
 }
 
-.research-card {
+.research-chip--failed {
+  background: var(--red);
+}
+
+.research-chip--failed:hover {
+  background: var(--ink);
+}
+
+/* Two classes, to beat pet.css's `.panel { width: 100% }`. */
+.research-tray .research-card {
   position: absolute;
   top: 0;
   right: calc(16 * var(--px));

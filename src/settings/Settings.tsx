@@ -605,11 +605,6 @@ export default function Settings() {
     );
   }
 
-  // Mirrors research.kind in the sidecar.
-  const researchReady = form.llm.mode === "cloud" && (
-    ["openai", "anthropic", "openrouter"].includes(form.llm.provider) ||
-    form.llm.base_url.toLowerCase().includes("generativelanguage.googleapis.com"));
-
   /** Keep mode and provider aligned (LLM local preset only). */
   const chooseMode = (name: Capability, mode: Mode | "pet") => {
     // Pet-only is the master AI switch, not a transport.
@@ -1357,13 +1352,13 @@ export default function Settings() {
             <section className="settings-page" aria-labelledby="research-heading">
               <div className="page-heading">
                 <h2 id="research-heading">Web research</h2>
-                <p>Ask Mellow to research something and it searches the web in the background. A coloured bone parks in the top-right corner and turns green when the report is ready.</p>
+                <p>Mellow searches the web for free and your engine writes the answer. No extra key needed.</p>
               </div>
               <div className="settings-group">
                 <label className="switch">
                   <span className="switch__text">
-                    <b>Research on request</b>
-                    <small>Questions about news, weather, prices and anything you ask Mellow to research or look into.</small>
+                    <b>Search the web</b>
+                    <small>Quick facts like weather, prices and scores are answered out loud. Ask Mellow to research or look into something, or about the news, and a coloured bone parks in the top-right corner until the report is ready.</small>
                   </span>
                   <input type="checkbox" role="switch" disabled={!form.ai_enabled}
                     checked={form.research_enabled ?? true}
@@ -1371,19 +1366,19 @@ export default function Settings() {
                   <i className="switch__track" aria-hidden="true" />
                 </label>
                 {settingError && <p className="notice notice--error" role="alert">{settingError}</p>}
-                {!researchReady && <p className="field-note">Research needs a cloud engine from Gemini, OpenAI, Anthropic or OpenRouter. Choose one under Engine.</p>}
+                {!form.ai_enabled && <p className="field-note">Choose an engine first to search the web.</p>}
               </div>
               <div className="settings-group">
                 <h3>Try asking</h3>
                 <p>&ldquo;Research the best budget mechanical keyboards.&rdquo;</p>
-                <p>&ldquo;What&rsquo;s the weather in Boston right now?&rdquo;</p>
                 <p>&ldquo;What&rsquo;s the latest news on the Mars mission?&rdquo;</p>
-                <p className="field-note">Keep talking while it works. Click the bone to read the report and its sources. Ask a follow-up and Mellow remembers what it found.</p>
+                <p>&ldquo;Who won the game last night?&rdquo;</p>
+                <p className="field-note">Keep talking while a report is on its way. Click the bone to read it and its sources, and ask a follow-up: Mellow remembers what it found.</p>
               </div>
               <div className="settings-group">
                 <h3>What it sends</h3>
-                <p>Only your question goes to the provider you chose under Engine, which runs the web search. Nothing on your screen is sent.</p>
-                <p className="field-note">Providers may charge for each search on top of the usual model cost.</p>
+                <p>Your question goes to free public search engines such as DuckDuckGo. The results go to the engine you chose, which writes the answer. Nothing on your screen is sent.</p>
+                <p className="field-note">Free search can be busy now and then. If it is, Mellow says so and the bone offers Try again.</p>
               </div>
             </section>
           )}

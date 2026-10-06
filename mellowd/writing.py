@@ -359,6 +359,7 @@ def fast_route(text: str, has_last_draft: bool = False) -> dict | None:
         capture.wants_pointing(text)
         or capture.wants_action(text)
         or capture.wants_screen(text)
+        or capture.asks_research(text)
         or CLEAR_QUESTION.search(text)
     ):
         return {

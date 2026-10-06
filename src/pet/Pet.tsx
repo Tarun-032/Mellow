@@ -103,6 +103,7 @@ export default function Pet() {
     dismissReminder,
     research,
     dismissResearch,
+    retryResearch,
     setDrawingAllowed,
     drawingPen,
   } = useSocket();
@@ -578,7 +579,7 @@ export default function Pet() {
           )}
         </div>
       )}
-      {!hidden && <ResearchTray jobs={research} trayRef={motion.trayRef} onDismiss={dismissResearch} />}
+      {!hidden && <ResearchTray jobs={research} trayRef={motion.trayRef} onDismiss={dismissResearch} onRetry={retryResearch} />}
       <div
         className="pet-root"
         data-reaction={meetingActive ? "none" : motion.reaction ?? "none"}

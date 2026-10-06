@@ -361,6 +361,14 @@ def list_sessions() -> list[dict]:
         )
 
 
+def report_pair(question: str, report: str) -> list[dict]:
+    """A finished research report, as the conversation carries it."""
+    return [
+        {"role": "user", "content": f"(Earlier I asked you to research: {question})"},
+        {"role": "assistant", "content": f"My research found this.\n\n{report}"},
+    ]
+
+
 def resume() -> tuple[list[dict], tuple[str, str] | None]:
     """The current session's recent turns as LLM messages, plus its destination."""
     try:
@@ -382,10 +390,18 @@ def resume() -> tuple[list[dict], tuple[str, str] | None]:
         messages: list[dict] = []
         destination: tuple[str, str, str] | None = None
         for event in events:
+            if event.get("type") == "tool_result" and event.get("report"):
+                # Only between whole turns, as live history placed it.
+                if messages and messages[-1]["role"] == "assistant":
+                    messages += report_pair(str(event.get("detail", "")), str(event["report"]))
+                continue
             role = SAID.get(str(event.get("type")))
             text = str(event.get("text", ""))
             if not role or not text:
                 continue  # a failed or barged-in-before-a-word turn has nothing to carry
+            if event.get("web"):
+                # Keep the web marker so the model repeats it.
+                text = f"{event['web']} {text}"
             messages.append({"role": role, "content": text})
             if role == "assistant":
                 # Exactly the triple main.answer compares.

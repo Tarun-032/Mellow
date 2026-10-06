@@ -13,10 +13,13 @@ function colourOf(id: string) {
   return colours.get(id)!;
 }
 
-/** Jobs already flown in, so a re-render or a reconnect replay doesn't fly them again. */
+/** Jobs already flown in, so each flies once. */
 const landed = new Set<string>();
 
-const STATUS_LABEL = { working: "Researching", done: "Research ready", failed: "Research failed" };
+const STATUS_LABEL = { working: "Researching", done: "Research ready", failed: "Couldn't search" };
+
+/** Read or failed bones go this long after their card closes. */
+const LINGER = 20_000;
 
 function host(url: string) {
   try {
@@ -51,7 +54,12 @@ function fly(el: HTMLElement) {
   );
 }
 
-function Report({ job, onHide, onDismiss }: { job: ResearchJob; onHide: () => void; onDismiss: () => void }) {
+function Report({ job, onHide, onDismiss, onRetry }: {
+  job: ResearchJob;
+  onHide: () => void;
+  onDismiss: () => void;
+  onRetry: () => void;
+}) {
   return (
     <div className="panel research-card" data-hit>
       <div className="panel__bar">
@@ -71,7 +79,13 @@ function Report({ job, onHide, onDismiss }: { job: ResearchJob; onHide: () => vo
           </div>
         </>
       )}
-      {job.status === "failed" && <p className="panel__hint panel__hint--error">{job.message}</p>}
+      {job.status === "failed" && (
+        <>
+          <p className="research-card__text">{job.message}</p>
+          <p className="panel__hint">{job.question}</p>
+          <button className="panel__btn panel__btn--wide" onClick={onRetry}>Try again</button>
+        </>
+      )}
       {job.status === "done" && (
         <>
           {job.paragraphs?.map((text, i) => <p className="research-card__text" key={i}>{text}</p>)}
@@ -93,13 +107,26 @@ function Report({ job, onHide, onDismiss }: { job: ResearchJob; onHide: () => vo
   );
 }
 
-function ParkedBone({ job, open, onToggle, onDismiss }: {
+function ParkedBone({ job, open, onToggle, onDismiss, onRetry }: {
   job: ResearchJob;
   open: boolean;
   onToggle: () => void;
   onDismiss: () => void;
+  onRetry: () => void;
 }) {
   const ref = useRef<HTMLButtonElement>(null);
+  // Whether they have read the finished card. A retry starts the reading over.
+  const seen = useRef(false);
+  if (job.status === "working") seen.current = false;
+  else if (open) seen.current = true;
+  const dismiss = useRef(onDismiss);
+  dismiss.current = onDismiss;
+  useEffect(() => {
+    // An unread report stays as the notice; a read one, or a failure, tidies away.
+    if (open || job.status === "working" || (job.status === "done" && !seen.current)) return;
+    const timer = window.setTimeout(() => dismiss.current(), LINGER);
+    return () => window.clearTimeout(timer);
+  }, [job.status, open]);
   const fill = colourOf(job.id);
   const [art, setArt] = useState<string>();
   useEffect(() => {
@@ -115,9 +142,14 @@ function ParkedBone({ job, open, onToggle, onDismiss }: {
 
   return (
     <div className="research-slot">
-      {open && <Report job={job} onHide={onToggle} onDismiss={onDismiss} />}
+      {open && <Report job={job} onHide={onToggle} onDismiss={onDismiss} onRetry={onRetry} />}
       {!open && job.status === "done" && (
         <button type="button" className="research-chip" data-hit onClick={onToggle}>Open</button>
+      )}
+      {!open && job.status === "failed" && (
+        <button type="button" className="research-chip research-chip--failed" data-hit onClick={onToggle}>
+          Couldn&rsquo;t search
+        </button>
       )}
       <button
         type="button"
@@ -137,10 +169,11 @@ function ParkedBone({ job, open, onToggle, onDismiss }: {
 }
 
 /** Research bones parked in the top-right corner, one per job, each opening its report. */
-export function ResearchTray({ jobs, trayRef, onDismiss }: {
+export function ResearchTray({ jobs, trayRef, onDismiss, onRetry }: {
   jobs: ResearchJob[];
   trayRef: React.RefObject<HTMLDivElement | null>;
   onDismiss: (id: string) => void;
+  onRetry: (id: string) => void;
 }) {
   const [openId, setOpenId] = useState<string | null>(null);
   if (!jobs.length) return null;
@@ -156,6 +189,7 @@ export function ResearchTray({ jobs, trayRef, onDismiss }: {
             setOpenId(null);
             onDismiss(job.id);
           }}
+          onRetry={() => onRetry(job.id)}
         />
       ))}
     </div>

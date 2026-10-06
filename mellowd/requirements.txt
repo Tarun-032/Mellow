@@ -56,3 +56,6 @@ comtypes==1.4.16
 pycaw==20251023
 psutil==7.2.2
 winsdk==1.0.0b10
+
+# Web research: free search, no key. No torch.
+ddgs==9.16.0

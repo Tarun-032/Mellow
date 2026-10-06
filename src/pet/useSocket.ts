@@ -394,6 +394,13 @@ export function useSocket() {
   /** Dismiss a reminder. */
   const dismissReminder = useCallback(() => setReminder(""), []);
 
+  /** Run a failed research job again, under the same bone. */
+  const retryResearch = useCallback((id: string) => {
+    if (ws.current?.readyState === WebSocket.OPEN) {
+      ws.current.send(JSON.stringify({ type: "research_retry", id }));
+    }
+  }, []);
+
   /** Forget a research job; the daemon cancels it if it is still searching. */
   const dismissResearch = useCallback((id: string) => {
     setResearch((jobs) => jobs.filter((j) => j.id !== id));
@@ -445,6 +452,7 @@ export function useSocket() {
     dismissReminder,
     research,
     dismissResearch,
+    retryResearch,
     setDrawingAllowed,
     drawingPen,
   };
