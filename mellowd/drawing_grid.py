@@ -75,6 +75,10 @@ def _enclosure(boxes):
 
 def _checked(boxes, proposed, count):
     """Verify the actual boxes; never interpolate an unobserved cell."""
+    if len(boxes) < 2:
+        # No row structure at all (custom-drawn or low-contrast cells), as
+        # opposed to a structure that disagrees with the proposed count.
+        raise ValueError("grid cells are not visible as separate boxes")
     if len(boxes) != count:
         raise ValueError("grid cell count does not match observed geometry")
     boxes = sorted((_rect(box) for box in boxes), key=lambda box: box[0])

@@ -1747,16 +1747,24 @@ async def _draw(session, shot: Shot, marks: list[dict], reveal_from=0, caption="
         raise ValueError("drawing needs a captured source window")
     # Speech synthesis/planning can outlive the screen it describes. Recheck a
     # clean local capture before showing old geometry, not just after display.
-    fresh, _, _ = await _unseen_shot(session)
-    if (fresh is None or fresh.hwnd != frame.hwnd or fresh.window != frame.window
-            or fresh.monitor != frame.monitor):
-        raise ValueError("drawing source changed since capture")
-    # Renew only AFTER the original source has matched a clean fresh capture.
-    # Keep its crop transform: the model's coordinates belong to that image.
-    renewed = replace(fresh.frame, transform=frame.transform)
-    scene = renewed.scene(marks, reveal_from)
-    if frame.content_changed(fresh.pixels, targets=_drawing_regions(scene, observed_regions), cursor=capture.cursor_position(), animations=animations):
-        raise ValueError("drawing source changed since capture")
+    # A tooltip, hover card or caret may be gone a moment later: look twice.
+    for attempt in range(2):
+        fresh, _, _ = await _unseen_shot(session)
+        if (fresh is None or fresh.hwnd != frame.hwnd or fresh.window != frame.window
+                or fresh.monitor != frame.monitor):
+            raise ValueError("drawing source changed since capture")
+        # Renew only AFTER the original source has matched a clean fresh capture.
+        # Keep its crop transform: the model's coordinates belong to that image.
+        renewed = replace(fresh.frame, transform=frame.transform)
+        scene = renewed.scene(marks, reveal_from)
+        changed = frame.content_changed(fresh.pixels, targets=_drawing_regions(scene, observed_regions),
+                                        cursor=capture.cursor_position(), animations=animations)
+        if not changed:
+            break
+        perf.visual_recorder()("preflight_changed", changed)
+        if attempt:
+            raise ValueError("drawing source changed since capture")
+        await asyncio.sleep(.3)
     frame = renewed
     scene["caption"] = caption[:60]
     if capture.window_rect(frame.hwnd) != frame.window or capture.known_monitor(frame.monitor) != frame.monitor:
@@ -1858,8 +1866,13 @@ async def _watch_drawing(session, frame, scene):
             await _invalidate_drawing(session, "observer_error")
 
 
-async def _begin_drawing_beat(session, shot, marks, sentence, partial, *, reveal_from=0, animations=(), observed_regions=()):
-    """Verify and show ink at playback; return why its readiness gate failed."""
+async def _begin_drawing_beat(session, shot, marks, sentence, *, reveal_from=0, animations=(), observed_regions=()):
+    """Verify and show ink; return "ready" or why its readiness gate failed.
+
+    The caller delivers the sentence when its audio starts. The first beat runs
+    this while its speech is still being synthesized, so the bone is already
+    drawing by the time Mellow begins to talk.
+    """
     try:
         caption = next((m["text"] for m in marks[reveal_from:] if m["kind"] == "label"), "")
         if not caption:
@@ -1872,7 +1885,6 @@ async def _begin_drawing_beat(session, shot, marks, sentence, partial, *, reveal
         ticket.mark("drawing_playback_ready")
         scene = session.drawing_scene
         session.drawing_task = asyncio.create_task(_watch_drawing(session, session.drawing_frame, scene))
-        await _deliver(session, sentence, False, partial)
         return "ready"
     except ValueError as error:
         reason = "source_changed" if str(error) in {
@@ -1882,7 +1894,11 @@ async def _begin_drawing_beat(session, shot, marks, sentence, partial, *, reveal
         perf.mark("drawing_preflight_rejected_" + reason)
         log.info("drawing preflight withheld: %s", reason)
         await _clear_drawing(session)
-        return "withheld"
+        return reason if reason == "source_changed" else "withheld"
+
+
+# Never end in silence: an explanation still answers the question without ink.
+_SCREEN_MOVED = "The screen changed before I could mark it, so here it is in words. "
 
 
 async def _drawing_stroke_done(session):
@@ -1903,16 +1919,23 @@ async def _drawing_stroke_done(session):
     return True
 
 
-async def _drawing_beat(session, shot: Shot, marks, sentence, speak, partial, *, reveal_from=0, wait_complete=False, animations=(), fallback_target=None, observed_regions=()):
-    """Visible ink gates speech; the final stroke also gates the next beat."""
+async def _drawing_beat(session, shot: Shot, marks, sentence, speak, partial, *, reveal_from=0, wait_complete=False, animations=(), fallback_target=None, observed_regions=(), early=None, first=False):
+    """Visible ink gates speech; the final stroke also gates the next beat.
+
+    `early` is this beat's _begin_drawing_beat task, started during synthesis.
+    Only a `first` beat (nothing shown yet) falls back to words on a screen change.
+    """
     delivered = ""
     readiness = ""
 
     async def before():
         nonlocal delivered, readiness
-        readiness = await _begin_drawing_beat(session, shot, marks, sentence, partial,
-                                             reveal_from=reveal_from, animations=animations, observed_regions=observed_regions)
-        if readiness == "ready": delivered = sentence
+        readiness = await (early if early is not None else _begin_drawing_beat(
+            session, shot, marks, sentence, reveal_from=reveal_from, animations=animations,
+            observed_regions=observed_regions))
+        if readiness == "ready":
+            await _deliver(session, sentence, False, partial)
+            delivered = sentence
         return readiness == "ready"
 
     if speak:
@@ -1924,6 +1947,8 @@ async def _drawing_beat(session, shot: Shot, marks, sentence, speak, partial, *,
         if readiness == "renderer_failed" and fallback_target is not None:
             return await _visual_control_point(session, shot, fallback_target, sentence, speak, partial)
         perf.outcome("drawing_failed")
+        if readiness == "source_changed" and first:
+            return await _deliver(session, _SCREEN_MOVED + sentence, speak, partial)
         return await _deliver(session, "I couldn't place the drawing reliably, so I'll stop there.", speak, partial)
     if wait_complete:
         if not await _drawing_stroke_done(session):
@@ -1946,46 +1971,52 @@ async def _visual_reasoning_fresh(session, shot, animations):
                                           cursor=capture.cursor_position(), animations=animations))
 
 
-async def _visual_sequence(session, plan, partial, *, animations=()):
+async def _visual_sequence(session, plan, partial, *, animations=(), early=None):
     """Prebuffer narration across beats; all screen changes happen at playback.
 
     Audio lookahead overlaps synthesis with the preceding explanation, while
     the readiness and completion gates keep the bone and speech in order.
+    `early` is the first beat's _begin_drawing_beat task, started during synthesis.
     """
     reply = []
     failure = ""
 
     async def present(beat):
-        nonlocal failure
-        if session.drawing_scene is not None and not await _drawing_stroke_done(session):
-            failure = "The drawing stopped responding, so I'll stop here."
-            return False
-        new_ink = beat.marks and (beat.reveal_from != len(beat.marks) or session.drawing_scene is None)
-        if not new_ink:
-            # Retained reasoning and a plain conclusion still refer to the
-            # captured page. Do not let audio lookahead bypass its freshness
-            # check merely because this beat adds no shapes.
-            if not await _visual_reasoning_fresh(session, plan.shot, animations):
-                await _clear_drawing(session)
-                failure = "The screen changed before I could show that, so I'll stop here."
+        nonlocal failure, early
+        readiness = "ready"
+        if early is not None:
+            readiness, early = await early, None
+        else:
+            if session.drawing_scene is not None and not await _drawing_stroke_done(session):
+                failure = "The drawing stopped responding, so I'll stop here."
                 return False
-        if beat.marks:
-            if beat.reveal_from == len(beat.marks) and session.drawing_scene is not None:
+            new_ink = beat.marks and (beat.reveal_from != len(beat.marks) or session.drawing_scene is None)
+            if not new_ink:
+                # Retained reasoning and a plain conclusion still refer to the
+                # captured page. Do not let audio lookahead bypass its freshness
+                # check merely because this beat adds no shapes.
+                if not await _visual_reasoning_fresh(session, plan.shot, animations):
+                    await _clear_drawing(session)
+                    failure = "The screen changed before I could show that, so I'll stop here."
+                    return False
+            if not beat.marks:
+                await _clear_drawing(session)
+            elif beat.reveal_from == len(beat.marks) and session.drawing_scene is not None:
                 session.drawing_deadline = time.monotonic() + drawing.ACTIVE_LIFETIME
                 await send(session.ws, type="drawing_keepalive",
                            presentation_id=session.drawing_scene["presentation_id"])
-                await _deliver(session, beat.say, False, partial)
             else:
                 await send(session.ws, type="state", state="looking")
-                readiness = await _begin_drawing_beat(session, plan.shot, beat.marks, beat.say, partial,
+                readiness = await _begin_drawing_beat(session, plan.shot, beat.marks, beat.say,
                                                      reveal_from=beat.reveal_from, animations=animations,
                                                      observed_regions=getattr(beat, "observed_regions", ()))
-                if readiness != "ready":
-                    failure = "I couldn't place the drawing reliably, so I'll stop there."
-                    return False
-        else:
-            await _clear_drawing(session)
-            await _deliver(session, beat.say, False, partial)
+        if readiness != "ready":
+            # Nothing shown yet: the explanation still answers the question in words.
+            failure = (_SCREEN_MOVED + " ".join(b.say for b in plan.beats)
+                       if readiness == "source_changed" and not reply else
+                       "I couldn't place the drawing reliably, so I'll stop there.")
+            return False
+        await _deliver(session, beat.say, False, partial)
         reply.append(beat.say)
         return True
 
@@ -2041,35 +2072,28 @@ async def _visual_motion_samples(session, shot, samples):
 
 
 async def _visual_point(session, plan, speak, partial, *, animations=()):
-    """A planner's single validated location uses the ordinary arriving bone."""
-    beat = plan.beats[0]
-    if control := visual_explanation.verified_control(plan):
-        return await _visual_control_point(session, plan.shot, control, beat.say, speak, partial)
-    frame = replace(plan.shot.frame, captured=time.monotonic())
-    scene = frame.scene(beat.marks)
+    """No ink survived validation: the ordinary arriving bone points at each beat's location."""
+    beats = [(beat.pointer, beat.say) for beat in plan.beats]
+    frame = plan.shot.frame
     fresh, _, _ = await _unseen_shot(session)
     if (fresh is None or fresh.hwnd != frame.hwnd or fresh.window != frame.window
             or fresh.monitor != frame.monitor
-            or frame.content_changed(fresh.pixels, targets=_drawing_regions(scene),
+            or frame.content_changed(fresh.pixels, targets=[t.bounds for t, _ in beats if t is not None],
                                      cursor=capture.cursor_position(), animations=animations)):
         perf.outcome("drawing_failed")
         return await _deliver(session, "The screen changed before I could show that, so I'll stop here.", speak, partial)
-    target = visual_explanation.point_target(plan)
-    await _aim(session, target)
-    perf.mark("visual_presentation_point")
-    return await _narrate(session, [(target, beat.say)], speak, partial, fresh)
+    # _narrate expects the first bone already in flight, as answer() does.
+    await _aim(session, next(target for target, _ in beats if target is not None))
+    perf.mark("visual_presentation_point_fallback")
+    return await _narrate(session, beats, speak, partial, fresh)
 
 
 async def _visual_control_point(session, shot, target, sentence, speak, partial):
-    """An ink failure can still show one independently verified control.
+    """An ink failure can still point the bone at the beat's location.
 
-    Never derive this target from a rejected drawing, or use this path after a
-    source/layout change. Its UIA bounds and the unchanged source are checked
-    again after the failed renderer has been cleared.
+    Never use this path after a source/layout change: the unchanged source is
+    checked again at playback, after the failed renderer has been cleared.
     """
-    if not visual_explanation.interactive(target):
-        perf.outcome("drawing_failed")
-        return await _deliver(session, "I couldn't verify that control reliably, so I'll stop here.", speak, partial)
     delivered = ""
     obstacle = "The screen changed before I could show that, so I'll stop here."
 
@@ -2109,6 +2133,7 @@ async def _visual_answer(session, prompt, cfg, speak, partial):
         return await _deliver(session, "Screen drawings need an engine that can see images. Check vision in Settings.", speak, partial)
     await send(session.ws, type="state", state="looking")
     session.drawing_active = True
+    early = None
     try:
         await _clear_drawing(session)
         shot, app, _ = await _unseen_shot(session)
@@ -2158,13 +2183,16 @@ async def _visual_answer(session, prompt, cfg, speak, partial):
         if plan.status == "point":
             return await _visual_point(session, plan, speak, partial, animations=animations)
         perf.mark("visual_presentation_drawing")
+        first = plan.beats[0]
+        if speak and first.marks:
+            # Recheck, dispatch and fly the bone while the first sentence is
+            # still being synthesized; its audio still waits for paint readiness.
+            early = asyncio.create_task(_begin_drawing_beat(
+                session, plan.shot, first.marks, first.say, reveal_from=first.reveal_from,
+                animations=animations, observed_regions=first.observed_regions))
         if speak and len(plan.beats) > 1:
-            return await _visual_sequence(session, plan, partial, animations=animations)
+            return await _visual_sequence(session, plan, partial, animations=animations, early=early)
         reply = []
-        # Fallback is limited to a single-control plan whose target passed the
-        # planner's independent measured-box agreement. A multi-target diagram
-        # or merely plausible box must never become a guessed pointer.
-        fallback = visual_explanation.verified_control(plan) if len(plan.beats) == 1 else None
         for beat in plan.beats:
             if (not beat.marks or (beat.reveal_from == len(beat.marks) and session.drawing_scene is not None)):
                 if not await _visual_reasoning_fresh(session, plan.shot, animations):
@@ -2192,7 +2220,8 @@ async def _visual_answer(session, prompt, cfg, speak, partial):
                     continue
                 heard = await _drawing_beat(session, plan.shot, beat.marks, beat.say, speak, partial,
                                              reveal_from=beat.reveal_from, wait_complete=True, animations=animations,
-                                             fallback_target=fallback, observed_regions=getattr(beat, "observed_regions", ()))
+                                             fallback_target=beat.pointer, observed_regions=getattr(beat, "observed_regions", ()),
+                                             early=early if beat is first else None, first=not reply)
                 reply.append(heard.strip())
                 if heard.strip() != beat.say: break
             else:
@@ -2205,6 +2234,8 @@ async def _visual_answer(session, prompt, cfg, speak, partial):
         raise
     finally:
         session.drawing_active = False
+        if early is not None and not early.done():
+            early.cancel()
         # Every beat has finished its audio (or muted reading interval) and its
         # final stroke. Retire ink and return the borrowed bone together now.
         await asyncio.shield(_clear_drawing(session))
@@ -2581,6 +2612,13 @@ async def answer(session: Session, prompt: str, prepared=None) -> None:
                 look="ask" if sighted else "",
                 partial=partial,
             )
+        if asked and cfg.get("drawing_enabled") and drawing_route != "suppressed":
+            # The answering model decided it must see the screen. With drawings
+            # on, every screen answer goes through the visual planner: draw, else
+            # point, else words. Phrase routing misses this; the model does not.
+            perf.mark("drawing_route_look")
+            reply = await _visual_answer(session, prompt, cfg, speak, partial)
+            asked = False
         if asked:
             # Show screen processing.
             await send(ws, type="state", state="looking")

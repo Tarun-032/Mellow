@@ -318,6 +318,7 @@ class Frame:
         edges retires the plan; marked targets get a tighter structural check.
         Callers debounce pixel changes and check source HWND/bounds separately.
         This gate has no authority to click or to infer an action succeeded.
+        A change returns its fixed reason code (truthy) for diagnostics.
         """
         baseline = self.content_fingerprint
         if baseline is None:
@@ -327,9 +328,9 @@ class Frame:
             current = np.asarray(Image.fromarray(pixels).convert("L").resize(
                 (baseline.shape[1], baseline.shape[0])), dtype=np.int16)
         except (AttributeError, TypeError, ValueError):
-            return True
+            return "unreadable"
         if baseline.shape != current.shape:
-            return True
+            return "unreadable"
         rows, columns = current.shape
         mon = self.monitor
 
@@ -338,7 +339,7 @@ class Frame:
 
         source = region(self.window or (mon["left"], mon["top"], mon["width"], mon["height"]))
         if source is None:
-            return True
+            return "source"
         mask = np.zeros(current.shape, dtype=bool)
         mask[source] = True
         count = int(mask.sum())
@@ -354,16 +355,16 @@ class Frame:
         for rect in list(animations)[:16]:
             animated = region(rect)
             if animated is None or baseline[animated].size > count * .20:
-                return True
+                return "animation"
             if not _animation_stable(baseline, current, animated):
-                return True
+                return "animation"
             # The boundary/palette check above observes the full canvas. Do
             # not reapply the static edge rule to moving shapes touching its
             # edge (the Wikipedia rearrangement animation does exactly that).
             motion[animated] = True
             containers.append(animated)
         if motion.sum() > count * .25:
-            return True
+            return "animation"
         raw &= ~motion
         moved_edges &= ~motion
 
@@ -380,13 +381,13 @@ class Frame:
                 raw_mask[hover] = False
 
         if (raw & raw_mask).sum() > max(32, count * .05):
-            return True
+            return "repaint"
         # Small new text (browser status/tooltip) is incidental away from a
         # grounded target. A source layout change produces many displaced edges.
         if (moved_edges & mask).sum() > max(900, count * .008):
-            return True
+            return "edges"
         if _layout_replaced(moved_edges & mask):
-            return True
+            return "layout"
 
         # No mark bounding box is hidden. A fill-only hover on a button keeps
         # its edge/text layout; a moved control or changed value does not.
@@ -403,7 +404,7 @@ class Frame:
                 encloses = (tx.start <= ax.start and tx.stop >= ax.stop
                             and ty.start <= ay.start and ty.stop >= ay.stop)
                 if overlap and not encloses:
-                    return True
+                    return "target"
             target_raw = raw[target] & target_mask
             area = int(target_mask.sum())
             if not area or target_raw.sum() < 4:
@@ -413,14 +414,14 @@ class Frame:
             edge_change = (old ^ new) & observable
             edge_count = int((old & target_mask).sum())
             if edge_change.sum() >= max(6, min(32, edge_count * .12)):
-                return True
+                return "target"
             if (reversed_edges[target] & observable).sum() >= max(4, min(16, edge_count * .03)):
-                return True
+                return "target"
             # A nearly flat target can change state without acquiring an edge.
             # Small area changes are tolerated globally, but not a substantial
             # replacement of a specifically grounded object.
             if edge_count < 4 and target_raw.sum() > max(16, area * .5):
-                return True
+                return "target"
         return False
 
     def unchanged(self, pixels, scene, occlusions=(), scale=1):
