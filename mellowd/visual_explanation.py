@@ -2,12 +2,15 @@
 from dataclasses import dataclass, replace
 import asyncio
 import json
+import logging
 import math
 import re
 import time
 
 from PIL import Image
 from mellowd import agents, capture, drawing, drawing_geometry, drawing_grid, llm, locator, perf, point
+
+log = logging.getLogger("mellowd.visual")
 
 MAX_BEATS = 8
 MAX_TEXT = 600
@@ -1051,6 +1054,68 @@ def _plan_json(raw):
     return value
 
 
+class PlanStream:
+    """Read a plan while it streams: the root `status` once written, and every
+    COMPLETE beat object so far.
+
+    feed() takes the text so far and scans only what is new, string- and
+    escape-aware and independent of key order. It never parses a partial value
+    and never raises; a stream that restarts (shrinks) is marked broken.
+    """
+
+    def __init__(self):
+        self.pos = self.depth = 0
+        self.in_string = self.escape = self.in_beats = self.broken = False
+        self.string_start = 0
+        self.key = self.awaiting = self.status = self.beat_start = None
+        self.beats: list[str] = []
+
+    def feed(self, text):
+        if self.broken or len(text) < self.pos:
+            self.broken = True
+            return
+        for i in range(self.pos, len(text)):
+            ch = text[i]
+            if self.in_string:
+                if self.escape:
+                    self.escape = False
+                elif ch == "\\":
+                    self.escape = True
+                elif ch == '"':
+                    self.in_string = False
+                    if self.depth == 1:
+                        value = text[self.string_start + 1:i]
+                        if self.awaiting is None:
+                            self.key = value
+                        else:
+                            if self.awaiting == "status":
+                                self.status = value
+                            self.awaiting = None
+                continue
+            if ch == '"':
+                self.in_string, self.string_start = True, i
+            elif ch == ":" and self.depth == 1:
+                self.awaiting = self.key
+            elif ch == "," and self.depth == 1:
+                self.awaiting = None
+            elif ch in "{[":
+                if self.depth == 1 and ch == "[" and self.awaiting == "beats":
+                    self.in_beats = True
+                elif self.in_beats and self.depth == 2 and ch == "{":
+                    self.beat_start = i
+                if self.depth == 1:
+                    self.awaiting = None
+                self.depth += 1
+            elif ch in "}]":
+                self.depth -= 1
+                if self.in_beats and self.depth == 2 and ch == "}" and self.beat_start is not None:
+                    self.beats.append(text[self.beat_start:i + 1])
+                    self.beat_start = None
+                elif self.in_beats and self.depth == 1 and ch == "]":
+                    self.in_beats = False
+        self.pos = len(text)
+
+
 MAX_NEW_MARKS = 8  # host tolerance per beat; the prompt still asks for at most four
 _CONSTRUCTIONS = ('square_on_edge', 'triangle_squares', 'grid_cells')
 
@@ -1229,7 +1294,10 @@ def parse(raw, shot, targets, *, page_bounds=None, prompt="", dynamic_regions=()
         say = text(beat["say"], MAX_TEXT)
         narration += len(say) + bool(beats)
         if narration > MAX_NARRATION:
-            raise ValueError("drawing narration budget exhausted")
+            # Stop at the budget rather than reject the plan: with a streamed
+            # plan the earlier beats may already be on screen and speaking.
+            dropped.append("narration_budget")
+            break
         marks = beat["marks"] if isinstance(beat["marks"], list) else []
         operation = beat["operation"] if beat["operation"] in ("replace", "retain", "clear") else "retain"
         if operation == "clear" and marks:
@@ -1372,25 +1440,50 @@ def stabilize(plan, dynamic_regions):
     return replace(plan, beats=beats)
 
 
-def crop(shot, region):
+# Claude reads images at up to 1568 px and OpenAI/Gemini downscale large
+# screenshots too; a bigger upload only arrives later. Measured on saved
+# screens with Gemini flash-lite: same marked regions, first token sooner.
+PLAN_EDGE = 1568
+
+
+def planner_system(cfg, precise=False):
+    """The planner's system string. Agent mode composes it exactly as warm-up
+    does, or the prepared worker's signature never matches the request."""
+    template = "{persona}\n\n" + SYSTEM + (PRECISION_SYSTEM if precise else "")
+    if cfg["llm"]["mode"] == "agent":
+        return agents._with_persona(template, cfg)
+    return template.replace("{persona}", llm.persona(cfg))
+
+
+# The ordinary drawing worker is prepared at hotkey press, like the locator's.
+agents.register_profile("drawing", "{persona}\n\n" + SYSTEM, SCHEMA)
+
+
+def crop(shot, region, edge=capture.MAX_EDGE):
     t=shot.frame.transform
     a=t.point(region[:2]); b=t.point(region[2:])
     mon=shot.monitor
     l=max(0,math.floor(a[0]-mon["left"])); top=max(0,math.floor(a[1]-mon["top"]))
     r=min(mon["width"],math.ceil(b[0]-mon["left"])); bottom=min(mon["height"],math.ceil(b[1]-mon["top"]))
     if min(r-l,bottom-top)<48: raise ValueError("closer-look crop too small")
-    data,width,height=capture.encode(Image.fromarray(shot.pixels[top:bottom,l:r]), capture.MAX_EDGE)
+    data,width,height=capture.encode(Image.fromarray(shot.pixels[top:bottom,l:r]), edge)
     frame=replace(shot.frame, transform=drawing.Transform(mon["left"],mon["top"],l,top,r-l,bottom-top,
                   width,height,width/(r-l),height/(bottom-top)))
     return shot._replace(data=data,width=width,height=height,frame=frame)
 
 
-async def generate(prompt, shot, cfg, candidates, *, page_bounds=None, history=None, dynamic_regions=None):
-    """One planning call, at most one requested crop; never a repair loop."""
+async def generate(prompt, shot, cfg, candidates, *, page_bounds=None, history=None, dynamic_regions=None,
+                   on_plan=None):
+    """One planning call, at most one requested crop; never a repair loop.
+
+    `on_plan`, when given, receives each validated `ready` prefix of the plan
+    while it is still streaming, so its first beats can be shown and spoken
+    before the model has finished writing the rest.
+    """
     with perf.span("drawing_plan"):
         try:
             plan = await _generate(prompt, shot, cfg, candidates, page_bounds=page_bounds,
-                                   history=history, dynamic_regions=dynamic_regions)
+                                   history=history, dynamic_regions=dynamic_regions, on_plan=on_plan)
         except (ValueError, TimeoutError) as error:
             perf.mark("drawing_plan_rejected." + rejection_reason(error))
             raise
@@ -1398,7 +1491,44 @@ async def generate(prompt, shot, cfg, candidates, *, page_bounds=None, history=N
         return plan
 
 
-async def _generate(prompt, shot, cfg, candidates, *, page_bounds=None, history=None, dynamic_regions=None):
+def _streamed_plans(on_plan, shot, targets, page, prompt, dynamic_regions):
+    """An on_text hook handing on_plan each validated prefix of a streaming plan.
+
+    Every time another beat object completes, the closed beats are parsed by
+    the same per-mark `parse` the full plan uses (deterministic, so the full
+    plan's first beats match). Only a `ready` prefix is handed on; a refine,
+    plain or unavailable reply waits for the end as before. Failures here end
+    streaming quietly; the full reply is still parsed afterwards.
+    """
+    if on_plan is None:
+        return None
+    reader = PlanStream()
+
+    def on_text(text):
+        handed = len(reader.beats)
+        try:
+            reader.feed(text)
+            # Until status is read (a model may write it last) a beat could
+            # still belong to a refine/plain reply, so nothing is handed on.
+            if reader.broken or len(reader.beats) == handed or reader.status not in ("ready", "point"):
+                return
+            prefix = parse('{"status":"ready","message":"","region":[],"beats":[' + ",".join(reader.beats) + "]}",
+                           shot, targets, page_bounds=page, prompt=prompt, dynamic_regions=dynamic_regions)
+        except ValueError:
+            reader.broken = True
+            return
+        except Exception:
+            log.exception("streamed plan reader failed; waiting for the full plan")
+            reader.broken = True
+            return
+        if prefix.status == "ready":
+            on_plan(prefix)
+
+    return on_text
+
+
+async def _generate(prompt, shot, cfg, candidates, *, page_bounds=None, history=None, dynamic_regions=None,
+                    on_plan=None):
     context = conversation_context(history, prompt)
     prompt = step_prompt(prompt)
     # Upload only the foreground source window. Keep the full local fingerprint
@@ -1417,10 +1547,11 @@ async def _generate(prompt, shot, cfg, candidates, *, page_bounds=None, history=
     a=image_point(shot.frame,[max(wx,shot.monitor["left"]),max(wy,shot.monitor["top"])])
     b=image_point(shot.frame,[min(wx+ww,shot.monitor["left"]+shot.monitor["width"]),
                               min(wy+wh,shot.monitor["top"]+shot.monitor["height"])])
-    shot=await asyncio.to_thread(crop,shot,[*a,*b])
+    edge = PLAN_EDGE
+    shot=await asyncio.to_thread(crop,shot,[*a,*b],edge)
     precise = precision_requested(prompt)
     contract = PRECISION_SCHEMA if precise else SCHEMA
-    system = llm.persona(cfg) + "\n\n" + SYSTEM + (PRECISION_SYSTEM if precise else '')
+    system = planner_system(cfg, precise)
     for attempt in range(2):
         targets=evidence(shot,candidates,browser_ui=browser_ui,navigation=navigation_only(prompt),prompt=prompt)
         if attempt == 0:
@@ -1448,14 +1579,16 @@ async def _generate(prompt, shot, cfg, candidates, *, page_bounds=None, history=
                              duplicate_labels=duplicate_labels(targets),
                              navigation_evidence=navigation_evidence(targets,prompt) if navigation_only(prompt) else {},
                              contract=contract),ensure_ascii=False)
+        on_text = _streamed_plans(on_plan, shot, targets, page, prompt, dynamic_regions)
         with perf.purpose("drawing_refinement" if attempt else "drawing"):
             async with asyncio.timeout(TIMEOUT):
                 if cfg["llm"]["mode"] == "agent":
                     raw=await agents.complete_text(user,cfg,system,shot.data,schema=contract,
-                                                  purpose="drawing",max_chars=MAX_OUTPUT,timeout_seconds=TIMEOUT)
+                                                  purpose="drawing",max_chars=MAX_OUTPUT,timeout_seconds=TIMEOUT,
+                                                  on_text=on_text)
                 else:
                     raw=await llm.complete_text(user,cfg,system,shot.data,max_tokens=4096,
-                                               schema=contract,max_chars=MAX_OUTPUT)
+                                               schema=contract,max_chars=MAX_OUTPUT,on_text=on_text)
         # Geometry problems are resolved mark by mark inside parse: snapped,
         # repaired, dropped, or turned into pointing. Only malformed output raises.
         plan=parse(raw,shot,targets,page_bounds=page,prompt=prompt,dynamic_regions=dynamic_regions)
@@ -1463,6 +1596,6 @@ async def _generate(prompt, shot, cfg, candidates, *, page_bounds=None, history=
             perf.mark('visual_marks_dropped')
         if plan.status != "refine": return stabilize(plan,dynamic_regions)
         if attempt: raise ValueError("closer-look budget exhausted")
-        shot=await asyncio.to_thread(crop,shot,plan.region)
+        shot=await asyncio.to_thread(crop,shot,plan.region,edge)
         perf.mark("drawing_crop_requested")
     raise ValueError("drawing budget exhausted")

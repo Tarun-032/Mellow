@@ -780,6 +780,12 @@ class Session:
     capture_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     # Turn monitor.
     turn_monitor: dict | None = None
+    # The screen read while speech is transcribed (see _prepare_screen).
+    screen_ready: asyncio.Task | None = None
+    # This visual turn's clean motion samples and the mask of content that
+    # moves on its own (drawing.Frame.motion_mask).
+    visual_samples: tuple | list = ()
+    visual_motion: object = None
     writer: writing.Writer = field(default_factory=writing.Writer)
 
     def __post_init__(self) -> None:
@@ -976,6 +982,9 @@ class Session:
         """Stop whatever the pet is doing, right now."""
         _retire_point(self)
         await _clear_drawing(self)
+        screen, self.screen_ready = getattr(self, "screen_ready", None), None
+        if screen is not None:
+            screen.cancel()
         self.writer.cancel()
         if self.turn and not self.turn.done():
             self.turn.cancel()
@@ -1088,17 +1097,26 @@ class Shot(NamedTuple):
 
 
 def _shot(
-    max_edge: int = capture.MAX_EDGE, monitor: dict | None = None
+    max_edge: int | None = capture.MAX_EDGE, monitor: dict | None = None
 ) -> tuple[Shot | None, str, str]:
-    """Capture + audit metadata in one blocking call. Never raises."""
+    """Capture + audit metadata in one blocking call. Never raises.
+
+    ``max_edge=None`` skips the JPEG: drawing crops and encodes its own upload,
+    and local freshness checks read only the native pixels.
+    """
     monitor = capture.known_monitor(monitor) or capture.active_monitor()
     hwnd, app, title = capture.window_on_monitor(monitor) if monitor else (0, "", "")
-    captured_at = time.monotonic()
-    grabbed = capture.grab(max_edge, monitor)
+    captured_at, cursor = time.monotonic(), capture.cursor_position()
+    if max_edge is None:
+        captured = capture.frame(monitor) if monitor else None
+        grabbed = (b"", monitor["width"], monitor["height"], captured[1]) if captured else None
+    else:
+        grabbed = capture.grab(max_edge, monitor)
     window = capture.window_rect(hwnd)
     shot = (
         Shot(*grabbed, monitor, hwnd, window,
-             drawing.Frame.capture(monitor, hwnd, window, grabbed[1], grabbed[2], grabbed[3], captured=captured_at))
+             drawing.Frame.capture(monitor, hwnd, window, grabbed[1], grabbed[2], grabbed[3],
+                                   captured=captured_at, cursor=cursor))
         if grabbed and monitor else None
     )
     if not app and not title:
@@ -1128,7 +1146,7 @@ async def _prepare_capture(session):
 
 @perf.timed("capture")
 async def _unseen_shot(
-    session: Session, max_edge: int = capture.MAX_EDGE
+    session: Session, max_edge: int | None = capture.MAX_EDGE
 ) -> tuple[Shot | None, str, str]:
     """`_shot`, with Mellow's own windows out of the picture."""
     result = await _clean_capture(session, lambda: _shot(max_edge, getattr(session, "turn_monitor", None)))
@@ -1748,8 +1766,11 @@ async def _draw(session, shot: Shot, marks: list[dict], reveal_from=0, caption="
     # Speech synthesis/planning can outlive the screen it describes. Recheck a
     # clean local capture before showing old geometry, not just after display.
     # A tooltip, hover card or caret may be gone a moment later: look twice.
+    # Both looks also extend the record of what moves on its own (a playing
+    # video), so a quick plan with few samples still tells motion from change.
+    moving, looks = _visual_motion(session), []
     for attempt in range(2):
-        fresh, _, _ = await _unseen_shot(session)
+        fresh, _, _ = await _unseen_shot(session, None)
         if (fresh is None or fresh.hwnd != frame.hwnd or fresh.window != frame.window
                 or fresh.monitor != frame.monitor):
             raise ValueError("drawing source changed since capture")
@@ -1757,14 +1778,20 @@ async def _draw(session, shot: Shot, marks: list[dict], reveal_from=0, caption="
         # Keep its crop transform: the model's coordinates belong to that image.
         renewed = replace(fresh.frame, transform=frame.transform)
         scene = renewed.scene(marks, reveal_from)
-        changed = frame.content_changed(fresh.pixels, targets=_drawing_regions(scene, observed_regions),
-                                        cursor=capture.cursor_position(), animations=animations)
+        looks.append(fresh.frame.content_fingerprint)
+        if attempt:
+            seen = frame.motion_mask([*getattr(session, "visual_samples", ()), *looks])
+            moving = seen if moving is None else moving if seen is None else moving | seen
+        changed = await asyncio.to_thread(
+            frame.content_changed, fresh.pixels, targets=_drawing_regions(scene, observed_regions),
+            cursor=capture.cursor_position(), animations=animations, moving=moving)
         if not changed:
             break
         perf.visual_recorder()("preflight_changed", changed)
         if attempt:
             raise ValueError("drawing source changed since capture")
         await asyncio.sleep(.3)
+    session.visual_motion = moving
     frame = renewed
     scene["caption"] = caption[:60]
     if capture.window_rect(frame.hwnd) != frame.window or capture.known_monitor(frame.monitor) != frame.monitor:
@@ -1789,6 +1816,11 @@ async def _draw(session, shot: Shot, marks: list[dict], reveal_from=0, caption="
     perf.mark("drawing_dispatched")
     await send(session.ws, type="drawing", scene=scene)
     return presentation
+
+
+def _visual_motion(session):
+    """This turn's mask of content moving on its own (drawing.Frame.motion_mask)."""
+    return getattr(session, "visual_motion", None)
 
 
 def _drawing_regions(scene, observed_regions=()):
@@ -1833,6 +1865,26 @@ async def _watch_drawing(session, frame, scene):
     baseline = frame
     changed_samples = 0
     reason = "source_changed"
+    looks, trail = [], []
+
+    def compare(pixels):
+        # Motion can also start while guiding (a hover preview under the
+        # cursor): the last few looks extend the turn's record of it.
+        # A target is never excused this way: its pixels are always compared.
+        looks.append(drawing.observation(pixels))
+        del looks[:-3]
+        # Where the pointer has been lately: a menu or card it opened may stay.
+        cursor = capture.cursor_position()
+        trail.append(cursor)
+        del trail[:-8]
+        targets = _drawing_regions(scene, getattr(session, "drawing_observed_regions", ()))
+        moving, seen = _visual_motion(session), baseline.motion_mask(looks, exclude=targets)
+        if seen is not None:
+            moving = seen if moving is None else moving | seen
+        return baseline.content_changed(
+            pixels, targets=targets, cursor=cursor, pointers=trail,
+            animations=getattr(session, "drawing_animations", ()), moving=moving)
+
     try:
         while session.drawing_scene is scene:
             await asyncio.sleep(.5)
@@ -1851,10 +1903,10 @@ async def _watch_drawing(session, frame, scene):
             _, pixels, _ = sampled
             if session.drawing_scene is not scene:
                 return
-            changed = baseline.content_changed(pixels, targets=_drawing_regions(scene, getattr(session, "drawing_observed_regions", ())), cursor=capture.cursor_position(),
-                                                animations=getattr(session, "drawing_animations", ()))
+            changed = await asyncio.to_thread(compare, pixels)
             changed_samples = changed_samples + 1 if changed else 0
             if changed_samples >= 2:
+                perf.visual_recorder()("watch_changed", changed)
                 break
         if session.drawing_scene is scene:
             await _invalidate_drawing(session, reason)
@@ -1961,28 +2013,35 @@ async def _drawing_beat(session, shot: Shot, marks, sentence, speak, partial, *,
 
 async def _visual_reasoning_fresh(session, shot, animations):
     """Reasoning without new ink still needs current screen evidence."""
-    fresh, _, _ = await _unseen_shot(session)
+    fresh, _, _ = await _unseen_shot(session, None)
     frame = shot.frame
     scene = session.drawing_scene
     targets = _drawing_regions(scene, getattr(session, "drawing_observed_regions", ())) if scene is not None else ()
-    return (fresh is not None and fresh.hwnd == frame.hwnd and fresh.window == frame.window
-            and fresh.monitor == frame.monitor
-            and not frame.content_changed(fresh.pixels, targets=targets,
-                                          cursor=capture.cursor_position(), animations=animations))
+    if (fresh is None or fresh.hwnd != frame.hwnd or fresh.window != frame.window
+            or fresh.monitor != frame.monitor):
+        return False
+    changed = await asyncio.to_thread(frame.content_changed, fresh.pixels, targets=targets,
+                                      cursor=capture.cursor_position(), animations=animations,
+                                      moving=_visual_motion(session))
+    return not changed
 
 
-async def _visual_sequence(session, plan, partial, *, animations=(), early=None):
+async def _visual_sequence(session, plan, partial, *, animations=(), early=None, incoming=None):
     """Prebuffer narration across beats; all screen changes happen at playback.
 
     Audio lookahead overlaps synthesis with the preceding explanation, while
     the readiness and completion gates keep the bone and speech in order.
-    `early` is the first beat's _begin_drawing_beat task, started during synthesis.
+    `early` is the first beat's _begin_drawing_beat task, started during
+    synthesis. `incoming`, when given, is a queue of beats the planner is still
+    writing (None ends it); otherwise plan.beats is the whole plan.
     """
-    reply = []
+    shot = plan.shot
+    reply, queued = [], []
     failure = ""
+    in_words = False
 
     async def present(beat):
-        nonlocal failure, early
+        nonlocal failure, early, in_words
         readiness = "ready"
         if early is not None:
             readiness, early = await early, None
@@ -1995,7 +2054,7 @@ async def _visual_sequence(session, plan, partial, *, animations=(), early=None)
                 # Retained reasoning and a plain conclusion still refer to the
                 # captured page. Do not let audio lookahead bypass its freshness
                 # check merely because this beat adds no shapes.
-                if not await _visual_reasoning_fresh(session, plan.shot, animations):
+                if not await _visual_reasoning_fresh(session, shot, animations):
                     await _clear_drawing(session)
                     failure = "The screen changed before I could show that, so I'll stop here."
                     return False
@@ -2007,23 +2066,45 @@ async def _visual_sequence(session, plan, partial, *, animations=(), early=None)
                            presentation_id=session.drawing_scene["presentation_id"])
             else:
                 await send(session.ws, type="state", state="looking")
-                readiness = await _begin_drawing_beat(session, plan.shot, beat.marks, beat.say,
+                readiness = await _begin_drawing_beat(session, shot, beat.marks, beat.say,
                                                      reveal_from=beat.reveal_from, animations=animations,
                                                      observed_regions=getattr(beat, "observed_regions", ()))
+        if readiness == "renderer_failed" and beat.pointer is not None:
+            # The ink did not appear; the bone can still show the place.
+            ticket = await _aim(session, beat.pointer)
+            if await ticket.wait():
+                perf.mark("visual_control_point_fallback")
+                await _deliver(session, beat.say, False, partial)
+                reply.append(beat.say)
+                return True
+            await _hide_point(session)
         if readiness != "ready":
-            # Nothing shown yet: the explanation still answers the question in words.
-            failure = (_SCREEN_MOVED + " ".join(b.say for b in plan.beats)
-                       if readiness == "source_changed" and not reply else
-                       "I couldn't place the drawing reliably, so I'll stop there.")
+            if readiness == "source_changed" and not reply:
+                # Nothing shown yet: the explanation still answers the question
+                # in words, once every beat is known.
+                in_words = True
+            else:
+                failure = "I couldn't place the drawing reliably, so I'll stop there."
             return False
         await _deliver(session, beat.say, False, partial)
         reply.append(beat.say)
         return True
 
-    for beat in plan.beats:
+    async def beats():
+        if incoming is None:
+            for beat in plan.beats:
+                yield beat
+            return
+        while (beat := await incoming.get()) is not None:
+            yield beat
+
+    async for beat in beats():
+        queued.append(beat)
         # Binding the beat here avoids the last-loop-value callback bug.
         await session.speaker.speak_beat(beat.say, lambda beat=beat: present(beat))
     await _played(session)
+    if in_words:
+        failure = _SCREEN_MOVED + " ".join(b.say for b in queued)
     if not failure and session.drawing_scene is not None and not await _drawing_stroke_done(session):
         failure = "The drawing stopped responding, so I'll stop here."
     if failure:
@@ -2075,11 +2156,12 @@ async def _visual_point(session, plan, speak, partial, *, animations=()):
     """No ink survived validation: the ordinary arriving bone points at each beat's location."""
     beats = [(beat.pointer, beat.say) for beat in plan.beats]
     frame = plan.shot.frame
-    fresh, _, _ = await _unseen_shot(session)
+    fresh, _, _ = await _unseen_shot(session, None)
     if (fresh is None or fresh.hwnd != frame.hwnd or fresh.window != frame.window
             or fresh.monitor != frame.monitor
-            or frame.content_changed(fresh.pixels, targets=[t.bounds for t, _ in beats if t is not None],
-                                     cursor=capture.cursor_position(), animations=animations)):
+            or await asyncio.to_thread(
+                frame.content_changed, fresh.pixels, targets=[t.bounds for t, _ in beats if t is not None],
+                cursor=capture.cursor_position(), animations=animations, moving=_visual_motion(session))):
         perf.outcome("drawing_failed")
         return await _deliver(session, "The screen changed before I could show that, so I'll stop here.", speak, partial)
     # _narrate expects the first bone already in flight, as answer() does.
@@ -2100,11 +2182,12 @@ async def _visual_control_point(session, shot, target, sentence, speak, partial)
     async def before():
         nonlocal delivered, obstacle
         # Check at playback, after slow synthesis, just like the drawing path.
-        fresh, _, _ = await _unseen_shot(session)
+        fresh, _, _ = await _unseen_shot(session, None)
         frame = shot.frame
         if (fresh is None or frame is None or fresh.hwnd != frame.hwnd
                 or fresh.window != frame.window or fresh.monitor != frame.monitor
-                or frame.content_changed(fresh.pixels, targets=[target.bounds], cursor=capture.cursor_position())):
+                or await asyncio.to_thread(frame.content_changed, fresh.pixels, targets=[target.bounds],
+                                           cursor=capture.cursor_position(), moving=_visual_motion(session))):
             return False
         ticket = await _aim(session, target)
         if not await ticket.wait():
@@ -2133,41 +2216,90 @@ async def _visual_answer(session, prompt, cfg, speak, partial):
         return await _deliver(session, "Screen drawings need an engine that can see images. Check vision in Settings.", speak, partial)
     await send(session.ws, type="state", state="looking")
     session.drawing_active = True
-    early = None
+    early = playback = None
     try:
         await _clear_drawing(session)
-        shot, app, _ = await _unseen_shot(session)
-        if shot is None or shot.frame is None or not shot.hwnd or shot.window is None:
-            return await _deliver(session, "I couldn't capture the screen safely, so I can't draw on it.", speak, partial)
-        candidates = await asyncio.to_thread(point.candidates, prompt, shot.pixels, shot.monitor, None, shot.hwnd)
+        read = await _take_screen_read(session)
+        if read is not None:
+            # Read while the question was transcribed; only the scoring needs the words.
+            shot, app, samples = read.shot, read.app, list(read.samples)
+            candidates = await asyncio.to_thread(point.candidates, prompt, shot.pixels, shot.monitor, None,
+                                                 shot.hwnd, read.accessible, read.ocr_rows)
+        else:
+            shot, app, _ = await _unseen_shot(session, None)
+            if shot is None or shot.frame is None or not shot.hwnd or shot.window is None:
+                return await _deliver(session, "I couldn't capture the screen safely, so I can't draw on it.", speak, partial)
+            await send(session.ws, type="drawing_prepare", monitor=shot.monitor)
+            candidates = await asyncio.to_thread(point.candidates, prompt, shot.pixels, shot.monitor, None, shot.hwnd)
+            samples = []
         browser = app.lower() in {"chrome.exe", "msedge.exe", "firefox.exe", "brave.exe",
                                   "opera.exe", "vivaldi.exe", "arc.exe"}
         page = next((row.page_bounds for row in candidates if row.page_bounds is not None), None) if browser else None
         images = _visual_images(shot, candidates)
-        samples, motion = [], None
-        animations = ()
-        if images:
-            if not await _visual_sample(session, shot, samples):
-                return await _deliver(session, "The screen changed before I could explain it. Ask again once it is still.", speak, partial)
-            await asyncio.sleep(.25)
-            if not await _visual_sample(session, shot, samples):
-                return await _deliver(session, "The screen changed before I could explain it. Ask again once it is still.", speak, partial)
-            animations = shot.frame.animation_regions(samples, images)
-            motion = asyncio.create_task(_visual_motion_samples(session, shot, samples))
+        # Motion evidence never delays the model: what was sampled during
+        # transcription is used now, and sampling continues while it plans.
+        animations = shot.frame.animation_regions(samples, images) if images else ()
+        session.visual_samples, session.visual_motion = samples, None
+        motion = asyncio.create_task(_visual_motion_samples(session, shot, samples))
+        incoming, handed = asyncio.Queue(), []
+
+        def on_plan(prefix):
+            """Show and speak each beat as soon as the planner has written it."""
+            nonlocal playback, early
+            if not speak:
+                return
+            prefix = visual_explanation.stabilize(prefix, animations)
+            if playback is None:
+                # Motion seen so far guards the first ink; sampling stops so no
+                # capture overlaps its presentation.
+                session.visual_motion = shot.frame.motion_mask(samples)
+                if session.visual_motion is not None:
+                    perf.mark("visual_motion_masked")
+                motion.cancel()
+                perf.mark("drawing_stream_started")
+                first = prefix.beats[0]
+                if first.marks:
+                    early = asyncio.create_task(_begin_drawing_beat(
+                        session, prefix.shot, first.marks, first.say, reveal_from=first.reveal_from,
+                        animations=animations, observed_regions=first.observed_regions))
+                playback = asyncio.create_task(_visual_sequence(
+                    session, prefix, partial, animations=animations, early=early, incoming=incoming))
+            for beat in prefix.beats[len(handed):]:
+                incoming.put_nowait(beat)
+                handed.append(beat)
+
         try:
             try:
                 plan = await visual_explanation.generate(prompt, shot, cfg, candidates, page_bounds=page,
-                                                        history=session.history, dynamic_regions=animations)
+                                                        history=session.history, dynamic_regions=animations,
+                                                        on_plan=on_plan)
             finally:
-                if motion is not None:
-                    motion.cancel()
-                    with suppress(asyncio.CancelledError):
-                        await motion
+                motion.cancel()
+                with suppress(asyncio.CancelledError):
+                    await motion
         except (ValueError, TimeoutError) as error:
+            if playback is not None:
+                # What is already shown and spoken stands; nothing more follows.
+                incoming.put_nowait(None)
+                return await playback
             log.info("visual explanation withheld: %s", str(error) or "planning timed out")
             perf.visual_recorder()("plan_rejected", visual_explanation.rejection_reason(error))
             perf.outcome("drawing_failed")
             return await _deliver(session, "I couldn't make a reliable drawing plan for this screen. Try a simpler drawing request.", speak, partial)
+        if playback is not None:
+            # The stream ended: hand over any beats it had not yet closed. A
+            # provider that restarted its output may have finished a different
+            # plan; then playback ends with the beats already queued.
+            final = visual_explanation.stabilize(plan, animations).beats if plan.status == "ready" else ()
+            if [(b.say, b.marks) for b in final[:len(handed)]] == [(b.say, b.marks) for b in handed]:
+                for beat in final[len(handed):]:
+                    incoming.put_nowait(beat)
+            else:
+                perf.mark("drawing_stream_diverged")
+            incoming.put_nowait(None)
+            perf.mark("drawing_plan_validated")
+            perf.mark("visual_presentation_drawing")
+            return await playback
         if plan.status == "unavailable":
             perf.outcome("drawing_unavailable")
             return await _deliver(session, plan.message, speak, partial)
@@ -2179,6 +2311,11 @@ async def _visual_answer(session, prompt, cfg, speak, partial):
             plan = visual_explanation.stabilize(plan, animations)
             if animations:
                 perf.mark("visual_animation_observed")
+        # What kept moving while the question was asked and planned (a video,
+        # a streaming terminal) is excused from every later freshness check.
+        session.visual_motion = shot.frame.motion_mask(samples)
+        if session.visual_motion is not None:
+            perf.mark("visual_motion_masked")
         perf.mark("drawing_plan_validated")
         if plan.status == "point":
             return await _visual_point(session, plan, speak, partial, animations=animations)
@@ -2234,8 +2371,10 @@ async def _visual_answer(session, prompt, cfg, speak, partial):
         raise
     finally:
         session.drawing_active = False
-        if early is not None and not early.done():
-            early.cancel()
+        session.visual_samples, session.visual_motion = (), None
+        for task in (early, playback):
+            if task is not None and not task.done():
+                task.cancel()
         # Every beat has finished its audio (or muted reading interval) and its
         # final stroke. Retire ink and return the borrowed bone together now.
         await asyncio.shield(_clear_drawing(session))
@@ -2453,6 +2592,96 @@ async def _discard_preparation(task) -> None:
         task.cancel()
         with suppress(asyncio.CancelledError, Exception):
             await task
+
+
+class ScreenRead(NamedTuple):
+    shot: Shot
+    app: str
+    accessible: tuple
+    ocr_rows: list
+    samples: list
+
+
+# How long a screen read during speech-to-text stays usable for its question.
+SCREEN_READ_TTL = 10.0
+
+
+def _start_screen_read(session: Session) -> None:
+    """Read the screen while the question is still being transcribed.
+
+    Only when the turn could become a screen drawing. Nothing leaves the
+    machine unless it does; the question chooses from this evidence later.
+    """
+    if getattr(session, "screen_ready", None) is not None:
+        return
+    cfg = config.load()
+    if (cfg.get("drawing_enabled") and cfg.get("ai_enabled", True)
+            and llm.vision_ok(cfg["llm"]) and not meetings.manager.active):
+        session.screen_ready = asyncio.create_task(_prepare_screen(session))
+
+
+async def _prepare_screen(session: Session) -> ScreenRead | None:
+    """The same evidence a drawing turn reads after transcription, read earlier.
+
+    One clean native frame, its accessibility tree and OCR rows, and one motion
+    sample. It decides nothing about where to point: that needs the question.
+    """
+    try:
+        with perf.span("screen_read"):
+            monitor = capture.known_monitor(getattr(session, "turn_monitor", None)) or capture.active_monitor()
+            if monitor is None:
+                return None
+            hwnd, _, _ = capture.window_on_monitor(monitor)
+            # The accessibility walk needs only the window, not the pixels.
+            uia = asyncio.create_task(asyncio.to_thread(point.uia_candidates, hwnd))
+            # The drawing overlay for this monitor starts loading now too.
+            await send(session.ws, type="drawing_prepare", monitor=monitor)
+            try:
+                shot, app, _ = await _unseen_shot(session, None)
+                if shot is None or shot.hwnd != hwnd or shot.window is None:
+                    return None
+                ocr = asyncio.create_task(asyncio.to_thread(point.collect_ocr, point.start_ocr(shot.pixels)))
+                samples: list = []
+                # A second look shows what is moving on its own (video, a
+                # streaming terminal) before anyone asks about it.
+                await asyncio.sleep(.3)
+                await _visual_sample(session, shot, samples)
+                accessible, ocr_rows = await asyncio.gather(uia, ocr)
+            finally:
+                if not uia.done():
+                    uia.cancel()
+            await asyncio.to_thread(point.remember_evidence, shot.hwnd, shot.monitor, shot.pixels,
+                                    accessible, ocr_rows)
+            return ScreenRead(shot, app, accessible, ocr_rows, samples)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception("screen read during transcription failed; reading after it")
+        return None
+
+
+async def _drop_screen_read(session: Session) -> None:
+    task, session.screen_ready = getattr(session, "screen_ready", None), None
+    await _discard_preparation(task)
+
+
+async def _take_screen_read(session: Session) -> ScreenRead | None:
+    """The screen read during transcription, if it still describes this screen."""
+    task, session.screen_ready = getattr(session, "screen_ready", None), None
+    if task is None:
+        return None
+    await asyncio.wait({task})
+    if task.cancelled() or task.exception() is not None or task.result() is None:
+        return None
+    read = task.result()
+    shot = read.shot
+    if (time.monotonic() - shot.frame.captured > SCREEN_READ_TTL
+            or capture.window_rect(shot.hwnd) != shot.window
+            or capture.window_on_monitor(shot.monitor)[0] != shot.hwnd):
+        perf.mark("screen_read_stale")
+        return None
+    perf.mark("screen_read_used")
+    return read
 
 
 def _same_control(local, aimed) -> bool:
@@ -2904,6 +3133,7 @@ async def run_turn(session: Session, prompt: str) -> None:
         await send(session.ws, type="state", state="idle")
     finally:
         await _discard_preparation(prepared)
+        await _drop_screen_read(session)
         memory.learner.turn_ended()
 
 
@@ -2915,6 +3145,8 @@ def _transcribe_voice(audio, cancelled):
 
 
 async def _voice_turn(session: Session, audio) -> None:
+    # Screen evidence does not depend on the words; read it while they are transcribed.
+    _start_screen_read(session)
     try:
         text = await asyncio.to_thread(_transcribe_voice, audio, session.writer.cancelled)
         if meetings.manager.active or session.writer.cancelled.is_set():
@@ -2936,6 +3168,8 @@ async def _voice_turn(session: Session, audio) -> None:
         perf.outcome("failed")
         await send(session.ws, type="error", message=errors.message(exc))
         await send(session.ws, type="state", state="idle")
+    finally:
+        await _drop_screen_read(session)
 
 
 async def _writing_start(session: Session, finding=None) -> None:
@@ -3100,6 +3334,10 @@ async def handle(session: Session, msg: dict) -> None:
             # Idempotent when already ready. On a wake hotkey this overlaps mic,
             # field discovery, cancellation and the user's speech.
             asyncio.create_task(agents.warm(cfg))
+        elif cfg.get("ai_enabled"):
+            # Same overlap for API providers: the TLS handshake happens while
+            # the user is still talking, not before the first token.
+            asyncio.create_task(llm.warm_connection(cfg))
         # Snapshot the focused field at the same moment as microphone wake-up.
         # Keep this task detached until abort() has cancelled the prior writer.
         writing_finding = (

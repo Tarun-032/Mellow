@@ -154,6 +154,74 @@ def _layout_replaced(edges):
     return False
 
 
+def _components(cells):
+    """8-connected components of a boolean tile grid, as a label array (0 = none)."""
+    labels = np.zeros(cells.shape, dtype=np.int32)
+    rows, columns = cells.shape
+    count = 0
+    for start in zip(*np.nonzero(cells)):
+        if labels[start]:
+            continue
+        count += 1
+        labels[start] = count
+        pending = [start]
+        while pending:
+            y, x = pending.pop()
+            for ny in range(max(0, y - 1), min(rows, y + 2)):
+                for nx in range(max(0, x - 1), min(columns, x + 2)):
+                    if cells[ny, nx] and not labels[ny, nx]:
+                        labels[ny, nx] = count
+                        pending.append((ny, nx))
+    return labels
+
+
+def _incidental_areas(changed, moving, near, targets, limit):
+    """Changed areas that are not the page changing, as a pixel mask.
+
+    - Motion settling: an area holding most of the motion it touches (a hover
+      preview stops and its thumbnail returns, a terminal stops streaming).
+      The motion mask covers only what moved, rarely a video's whole frame,
+      so the swap spills past it. Up to `limit` observation pixels.
+    - Pointer interaction: an area starting where the pointer is or was (a
+      hover card, link preview, hover menu, expanding card). Up to half that.
+
+    An area touching a target never qualifies, and a scroll, navigation or a
+    dialog away from the pointer and from moving content is still compared.
+    """
+    rows, columns = changed.shape
+    pad = ((0, (-rows) % 4), (0, (-columns) % 4))
+
+    def tiles(pixels, least):
+        padded = np.pad(pixels, pad)
+        return padded.reshape(padded.shape[0] // 4, 4, padded.shape[1] // 4, 4).sum(axis=(1, 3)) >= least
+
+    def cells(regions):
+        out = np.zeros_like(changed_tiles)
+        for area in regions:
+            if area is not None:
+                ty, tx = area
+                out[ty.start // 4:-(-ty.stop // 4), tx.start // 4:-(-tx.stop // 4)] = True
+        return out
+
+    changed_tiles, moving_tiles = tiles(changed, 2), tiles(moving, 1)
+    blocked, pointer = cells(targets), cells(near)
+    areas, motions = _components(changed_tiles), _components(moving_tiles)
+    motion_size = np.bincount(motions.ravel())
+    excused = np.zeros_like(changed_tiles)
+    for label in range(1, int(areas.max()) + 1):
+        area = areas == label
+        if blocked[area].any():
+            continue
+        ys, xs = np.nonzero(area)
+        size = (ys.max() - ys.min() + 1) * (xs.max() - xs.min() + 1) * 16
+        touched = np.unique(motions[area & moving_tiles])
+        settling = (touched.size and size <= limit
+                    and int((area & moving_tiles).sum()) * 2 >= motion_size[touched].sum())
+        if settling or (pointer[area].any() and size <= limit / 2):
+            excused |= area
+    return np.repeat(np.repeat(excused, 4, axis=0), 4, axis=1)[:rows, :columns]
+
+
 def _region(rect, monitor, shape):
     """A measured physical rectangle clipped to a small local observation."""
     try:
@@ -211,14 +279,16 @@ class Frame:
     captured: float = field(default_factory=time.monotonic)
     id: str = field(default_factory=lambda: uuid.uuid4().hex)
     content_fingerprint: object = field(default=None, repr=False)
+    # Where the pointer was at capture: hover effects start around it.
+    cursor: tuple | None = None
 
     @classmethod
-    def capture(cls, monitor, hwnd, window, width, height, pixels, *, captured=None):
+    def capture(cls, monitor, hwnd, window, width, height, pixels, *, captured=None, cursor=None):
         return cls(dict(monitor), hwnd, window, Transform(
             monitor["left"], monitor["top"], 0, 0, monitor["width"], monitor["height"],
             width, height, width / monitor["width"], height / monitor["height"]
         ), thumbnail(pixels), captured if captured is not None else time.monotonic(),
-                   content_fingerprint=observation(pixels))
+                   content_fingerprint=observation(pixels), cursor=cursor)
 
     def scene(self, marks, reveal_from=0):
         if not isinstance(marks, list) or not 1 <= len(marks) <= MAX_MARKS:
@@ -305,11 +375,76 @@ class Frame:
             return ()
         # A local animation cannot excuse scroll/navigation of the page around
         # it, even when the candidate images happen to retain similar colors.
-        if any(self.content_changed(p, animations=approved) for p in samples[-8:]):
+        moving = self.motion_mask(samples)
+        if any(self.content_changed(p, animations=approved, moving=moving) for p in samples[-8:]):
             return ()
         return tuple(approved)
 
-    def content_changed(self, pixels, *, targets=(), cursor=None, animations=()):
+    def motion_mask(self, samples, exclude=()):
+        """Pixels that keep changing on their own: a playing video, a streaming
+        terminal, a spinner. Returns an observation-sized boolean mask or None.
+
+        A 4x4 observation tile is moving when change reaches it (within two
+        tiles: text scrolls leave some cells unchanged in a given pair) in at
+        least TWO consecutive sample pairs. A scroll, navigation or dialog
+        changes once and then holds still, so it never enters the mask and
+        still cancels guidance through the unmasked content. If moving tiles
+        cover more than half of the source window, the page itself is
+        changing: no mask. `exclude` rects (marked targets) never count as
+        moving, so their own pixels are always compared.
+        """
+        baseline = self.content_fingerprint
+        if baseline is None:
+            return None
+        frames = [baseline]
+        for sample in samples:
+            try:
+                sample = np.asarray(sample)
+                if sample.shape != baseline.shape:
+                    sample = np.asarray(Image.fromarray(sample).convert("L").resize(
+                        (baseline.shape[1], baseline.shape[0])), dtype=np.int16)
+            except (AttributeError, TypeError, ValueError):
+                continue
+            frames.append(sample.astype(np.int16))
+        if len(frames) < 3:
+            return None
+        rows, columns = baseline.shape
+        pad = ((0, (-rows) % 4), (0, (-columns) % 4))
+
+        def tiles(before, after):
+            changed = np.pad(np.abs(after - before) > 18, pad)
+            # Two changed pixels per tile: a lone flicker is not motion.
+            return changed.reshape(changed.shape[0] // 4, 4, changed.shape[1] // 4, 4).sum(axis=(1, 3)) >= 2
+
+        def grow(cells, by):
+            padded, out = np.pad(cells, by), np.zeros_like(cells)
+            for dy in range(2 * by + 1):
+                for dx in range(2 * by + 1):
+                    out |= padded[dy:dy + cells.shape[0], dx:dx + cells.shape[1]]
+            return out
+
+        changed = [grow(tiles(a, b), 2) for a, b in zip(frames, frames[1:])]
+        moving = np.zeros_like(changed[0])
+        for first, second in zip(changed, changed[1:]):
+            moving |= first & second
+        if not moving.any():
+            return None
+        mask = np.repeat(np.repeat(moving, 4, axis=0), 4, axis=1)[:rows, :columns]
+        source = _region(self.window or (self.monitor["left"], self.monitor["top"],
+                                        self.monitor["width"], self.monitor["height"]),
+                         self.monitor, baseline.shape)
+        if source is None:
+            return None
+        inside = np.zeros_like(mask)
+        inside[source] = mask[source]
+        if inside[source].mean() > .5:
+            return None
+        for rect in exclude:
+            if (area := _region(rect, self.monitor, inside.shape)) is not None:
+                inside[area] = False
+        return inside if inside.any() else None
+
+    def content_changed(self, pixels, *, targets=(), cursor=None, animations=(), moving=None, pointers=()):
         """Compare CLEAN underlying source pixels, never an overlay screenshot.
 
         Input activity alone is not a change. Small hover fills, a blinking
@@ -319,6 +454,8 @@ class Frame:
         Callers debounce pixel changes and check source HWND/bounds separately.
         This gate has no authority to click or to infer an action succeeded.
         A change returns its fixed reason code (truthy) for diagnostics.
+        `pointers` are other recent pointer positions besides `cursor` (now)
+        and this frame's own capture position.
         """
         baseline = self.content_fingerprint
         if baseline is None:
@@ -367,6 +504,28 @@ class Frame:
             return "animation"
         raw &= ~motion
         moved_edges &= ~motion
+        # Content already moving on its own (motion_mask: a playing video, a
+        # streaming terminal) cannot show that the page changed, nor can that
+        # surface stopping, or a hover card/preview/menu opening or closing
+        # where the pointer is or was. Everything else, and every target, is
+        # still compared.
+        if moving is not None and moving.shape != current.shape:
+            moving = None
+        anchors = [p for p in (cursor, self.cursor, *pointers) if p is not None]
+        if moving is not None or anchors:
+            near = []
+            for point in anchors:
+                try:
+                    x, y = map(number, point)
+                    near.append(region((x - 96, y - 96, 192, 192)))
+                except (TypeError, ValueError):
+                    continue
+            still = moving if moving is not None else np.zeros(current.shape, dtype=bool)
+            excused = still | _incidental_areas((raw | moved_edges) & mask, still, near,
+                                                [region(rect) for rect in targets], count * .5)
+            raw &= ~excused
+            moved_edges &= ~excused
+            motion = motion | excused
 
         # Cursor-local cosmetic repaint is bounded; structural evidence and
         # every target remain visible to their separate checks below.
@@ -405,6 +564,10 @@ class Frame:
                             and ty.start <= ay.start and ty.stop >= ay.stop)
                 if overlap and not encloses:
                     return "target"
+            # Only background motion is excused: a target that itself sits in
+            # moving content cannot be re-verified from pixels.
+            if moving is not None and (moving[target] & target_mask).sum() > target_mask.sum() * .5:
+                return "target"
             target_raw = raw[target] & target_mask
             area = int(target_mask.sum())
             if not area or target_raw.sum() < 4:

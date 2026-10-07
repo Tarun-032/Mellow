@@ -283,6 +283,42 @@ fn discard(app: &tauri::AppHandle, inner: &mut Inner, keep_pen: bool, reason: &'
     if !keep_pen { crate::cursor::return_pen(app); }
 }
 
+/// The monitor's hidden click-through overlay, built once and reused.
+fn overlay_window(handle: &tauri::AppHandle, name: String) -> Result<tauri::WebviewWindow, String> {
+    if let Some(existing) = handle.get_webview_window(&name) {
+        return Ok(existing);
+    }
+    WebviewWindowBuilder::new(handle, name, WebviewUrl::App("index.html".into()))
+        .title("Mellow annotations")
+        .inner_size(1.0, 1.0)
+        .resizable(false)
+        .decorations(false)
+        .transparent(true)
+        .always_on_top(true)
+        .skip_taskbar(true)
+        .shadow(false)
+        .focusable(false)
+        .visible(false)
+        .build()
+        .map_err(|e| e.to_string())
+}
+
+/// Build a monitor's overlay while a screen question is still being answered,
+/// so the first drawing does not wait for WebView2 to start and load the page.
+#[tauri::command]
+pub async fn annotation_prepare(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    left: i32,
+    top: i32,
+) -> Result<(), String> {
+    pet(&window)?;
+    let label = format!("annotation-{left}-{top}");
+    tauri::async_runtime::spawn_blocking(move || overlay_window(&app, label).map(|_| ()))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 #[tauri::command]
 pub async fn annotation_present(
     app: tauri::AppHandle,
@@ -315,26 +351,9 @@ pub async fn annotation_present(
     // Building a WebView2 window in a synchronous event handler can deadlock.
     let handle = app.clone();
     let name = label.clone();
-    let native = tauri::async_runtime::spawn_blocking(move || {
-        if let Some(existing) = handle.get_webview_window(&name) {
-            return Ok(existing);
-        }
-        WebviewWindowBuilder::new(&handle, name, WebviewUrl::App("index.html".into()))
-            .title("Mellow annotations")
-            .inner_size(1.0, 1.0)
-            .resizable(false)
-            .decorations(false)
-            .transparent(true)
-            .always_on_top(true)
-            .skip_taskbar(true)
-            .shadow(false)
-            .focusable(false)
-            .visible(false)
-            .build()
-            .map_err(|e| e.to_string())
-    })
-    .await
-    .map_err(|e| e.to_string())??;
+    let native = tauri::async_runtime::spawn_blocking(move || overlay_window(&handle, name))
+        .await
+        .map_err(|e| e.to_string())??;
     on_main(app, move |app| {
         let mut inner = owned.0.lock().map_err(|_| "drawing state poisoned")?;
         if revision != inner.revision {
@@ -447,6 +466,19 @@ pub async fn annotation_painted(
     remaining_ms: Option<f64>,
 ) -> Result<bool, String> {
     let owned = state.inner().clone();
+    // A clean capture hides drawings for a moment. Wait it out (off the main
+    // thread) instead of declining: the renderer sends each receipt once, so a
+    // decline here used to strand the scene until its arrival timeout.
+    let watched = owned.clone();
+    let _ = tauri::async_runtime::spawn_blocking(move || {
+        for _ in 0..60 {
+            if !watched.0.lock().map(|inner| inner.capturing).unwrap_or(false) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(16));
+        }
+    })
+    .await;
     on_main(app, move |app| {
         let mut inner = owned.0.lock().map_err(|_| "drawing state poisoned")?;
         if inner.capturing {
