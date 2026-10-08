@@ -169,9 +169,7 @@ def _merge_section(name: str, current: dict, submitted: dict) -> dict:
     merged = {**current, **submitted}
     merged.pop("has_api_key", None)
     if name == "llm":
-        # One set of active transport fields serves both API and agent modes.
-        # Preserve each non-secret destination separately so changing modes
-        # cannot combine `mode=cloud` with provider `codex` or `claude`.
+        # Keep each mode's destination separately so switching modes never mixes them.
         current_mode = current.get("mode")
         if current_mode == "cloud":
             merged.update(
@@ -755,7 +753,6 @@ class Session:
     drawing_completion_deadline: float = 0
     drawing_observed_regions: tuple = ()
     drawing_diagnostic: object = None
-    drawing_animations: tuple = ()
     drawing_complete: asyncio.Event = field(default_factory=asyncio.Event)
     drawing_failure_reason: str | None = None
     drawing_frame: drawing.Frame | None = None
@@ -782,10 +779,13 @@ class Session:
     turn_monitor: dict | None = None
     # The screen read while speech is transcribed (see _prepare_screen).
     screen_ready: asyncio.Task | None = None
-    # This visual turn's clean motion samples and the mask of content that
-    # moves on its own (drawing.Frame.motion_mask).
+    # Regions marked earlier in this answer: what words-only beats refer to.
+    visual_regions: tuple | list = ()
+    # This turn's motion samples and live areas (cancel evidence only).
     visual_samples: tuple | list = ()
-    visual_motion: object = None
+    visual_live: tuple = ()
+    # What the current drawing was made from: (shot, marks, observed, caption).
+    drawing_source: tuple | None = None
     writer: writing.Writer = field(default_factory=writing.Writer)
 
     def __post_init__(self) -> None:
@@ -868,9 +868,7 @@ class Session:
             )
             return True
 
-        # Normal sleep wake-up: reopen only the last working microphone. If
-        # PortAudio kept stale state, refresh once and retry the current primary
-        # before falling back to the exhaustive compatibility path.
+        # Wake: reopen the last working mic; refresh once, then try every device.
         try:
             route = self.recorder.open_preferred(quiet=True)
         except Exception as exc:
@@ -1099,14 +1097,11 @@ class Shot(NamedTuple):
 def _shot(
     max_edge: int | None = capture.MAX_EDGE, monitor: dict | None = None
 ) -> tuple[Shot | None, str, str]:
-    """Capture + audit metadata in one blocking call. Never raises.
-
-    ``max_edge=None`` skips the JPEG: drawing crops and encodes its own upload,
-    and local freshness checks read only the native pixels.
-    """
+    """Capture + audit metadata in one blocking call; never raises.
+    ``max_edge=None`` skips the JPEG (drawing encodes its own upload)."""
     monitor = capture.known_monitor(monitor) or capture.active_monitor()
     hwnd, app, title = capture.window_on_monitor(monitor) if monitor else (0, "", "")
-    captured_at, cursor = time.monotonic(), capture.cursor_position()
+    captured_at = time.monotonic()
     if max_edge is None:
         captured = capture.frame(monitor) if monitor else None
         grabbed = (b"", monitor["width"], monitor["height"], captured[1]) if captured else None
@@ -1115,8 +1110,7 @@ def _shot(
     window = capture.window_rect(hwnd)
     shot = (
         Shot(*grabbed, monitor, hwnd, window,
-             drawing.Frame.capture(monitor, hwnd, window, grabbed[1], grabbed[2], grabbed[3],
-                                   captured=captured_at, cursor=cursor))
+             drawing.Frame.capture(monitor, hwnd, window, grabbed[1], grabbed[2], grabbed[3], captured=captured_at))
         if grabbed and monitor else None
     )
     if not app and not title:
@@ -1179,11 +1173,8 @@ _LOOK_PREAMBLES = (
 
 
 def _hold_look_opening(text: str) -> bool:
-    """Hold a possible screen request, but release ordinary prose immediately.
-
-    The model contract puts [look] first. Keep the old short scan for common
-    preambles as well, since some models say 'Let me look' before the marker.
-    """
+    """Hold a possible screen request ([look], or a 'let me look' preamble);
+    release ordinary prose immediately."""
     head = text.lstrip().lower()
     if len(head) >= LOOK_SCAN:
         return False
@@ -1382,18 +1373,12 @@ async def _pass(
 async def _deliver(
     session: Session, text: str, speak: bool, partial: dict | None = None
 ) -> str:
-    """Deliver an already-grounded answer without another model call.
-
-    Beats accumulate in the bubble, so it ends holding the whole explanation as
-    one paragraph.
-    """
+    """Deliver a grounded answer without another model call; beats accumulate."""
     reply = text.strip()
     if not reply:
         reply = "I couldn't lock onto a safe target on this screen."
     if partial is not None:
-        # Beats of one narration accumulate, and neither useSocket nor `partial`
-        # inserts anything between them. Without this a cancelled multi-beat
-        # turn was recorded as "...your media.Then drag...".
+        # Nothing else separates accumulated beats ("media.Then drag").
         if partial["text"]:
             reply = " " + reply
         partial["text"] += reply
@@ -1408,32 +1393,21 @@ async def _deliver(
     return reply
 
 
-# Said when the screen moved out from under a later bone. This one stays: it
-# reports a real failure, which is not a voice decision. The old _CLOSING is
-# gone - a stock sign-off is exactly what llm.CORE forbids, and a handover that
-# belongs is written by the model as a narration beat.
+# Said when the screen moved out from under a later bone (a real failure).
 _CUT_SHORT = "That's moved, so I'll stop there rather than point at the wrong thing."
 
 _POINTER_UNAVAILABLE = "I couldn't get the pointer into place, so I'll stop pointing there."
 
 
 def _dwell(sentence: str) -> float:
-    """How long a step holds when there is no voice to pace against.
-
-    ponytail: flat reading speed, no per-word timing. Raise it if muted users
-    report the bone outrunning them.
-    """
+    """How long a step holds with no voice to pace against.
+    ponytail: flat reading speed; raise it if muted users get outrun."""
     return min(6.0, 1.0 + len(sentence.split()) / 3)
 
 
 async def _played(session: Session) -> None:
-    """Wait for the queued speech to be heard, and let a barge-in through.
-
-    `Speaker.finish` suppresses CancelledError while it waits on the playback
-    task, so a cancel arriving mid-step is swallowed and the loop would go on to
-    show the next bone after the user had already interrupted. The suppression
-    leaves the request recorded on this task, so ask.
-    """
+    """Wait for queued speech, re-raising a barge-in that `Speaker.finish`
+    swallowed (the cancel request stays recorded on this task)."""
     await session.speaker.finish()
     task = asyncio.current_task()
     if task is not None and task.cancelling():
@@ -1444,11 +1418,7 @@ async def _played(session: Session) -> None:
 
 
 async def _still_there(session: Session, shot, target: point.Target):
-    """Re-verify a later step on a fresh frame. Local pixels only, no model call.
-
-    Steps are chosen together on one frame, but a later bone is shown seconds
-    after it - long enough for the app to repaint or the user to start clicking.
-    """
+    """Re-verify a later step on a fresh frame (local pixels, no model call)."""
     fresh, _, _ = await _unseen_shot(session, capture.POINT_EDGE)
     if fresh is None:
         perf.mark("step_unverified")
@@ -1466,11 +1436,8 @@ async def _narrate(
     session: Session, beats: list[tuple[point.Target | None, str]], speak: bool,
     partial: dict, shot,
 ) -> str:
-    """Speak one narration, moving the bone as each beat that has one comes up.
-
-    Speech shares one synthesis/playback pipeline across every beat. Each beat
-    verifies its target and emits its text at playback, never during lookahead.
-    """
+    """Speak one narration, moving the bone as each beat comes up; targets
+    are verified at playback, never during lookahead."""
     said = []
     cut = False
     shown = 0      # bones actually put on screen: what latency.md counts
@@ -1481,10 +1448,7 @@ async def _narrate(
     async def present(target, sentence):
         nonlocal shown, up, spoke_bone, shot, cut, presentation, obstacle
         if target is None:
-            # Narration. Take the bone away first, or unrelated prose is read
-            # beside a control it is no longer about. Before the first bone
-            # there is nothing to hide, and the bone answer() dispatched is
-            # already flying to the control this beat is leading up to.
+            # Narration: hide the bone first, unless it is still flying to this beat's control.
             if up and spoke_bone and not (
                 (pending := getattr(session, "guide_pending", None)) and pending.observer
             ):
@@ -1512,9 +1476,7 @@ async def _narrate(
         return True
 
     if speak:
-        # Queue the full narration so LOOKAHEAD can synthesize later clauses
-        # while this one is playing. The callback gates both pointer and text;
-        # a changed target or cancellation cannot release prefetched speech.
+        # Queue all of it for lookahead; the callback gates pointer and text.
         for target, sentence in beats:
             async def before(target=target, sentence=sentence):
                 return await present(target, sentence)
@@ -1750,25 +1712,25 @@ async def _clear_drawing(session, *, preserve_pen=False) -> None:
     session.drawing_pen_occlusions = []
     session.drawing_deadline = 0
     session.drawing_completion_deadline = 0
-    session.drawing_animations = ()
     session.drawing_observed_regions = ()
     session.drawing_scale = 1
     if (scene or owned_pen) and getattr(session, "alive", True):
         await send(session.ws, type="drawing", scene=None, preserve_pen=preserve_pen)
 
 
-async def _draw(session, shot: Shot, marks: list[dict], reveal_from=0, caption="", *, animations=(), observed_regions=()) -> guide.Presentation:
+async def _draw(session, shot: Shot, marks: list[dict], reveal_from=0, caption="", *, observed_regions=()) -> guide.Presentation:
     """Present validated geometry; called at playback, never at synthesis."""
+    previous = getattr(session, "drawing_scene", None)
+    shown = _drawing_regions(previous) if previous else ()
     await _clear_drawing(session, preserve_pen=True)
     frame = shot.frame
     if frame is None or not frame.hwnd or frame.window is None:
         raise ValueError("drawing needs a captured source window")
-    # Speech synthesis/planning can outlive the screen it describes. Recheck a
-    # clean local capture before showing old geometry, not just after display.
-    # A tooltip, hover card or caret may be gone a moment later: look twice.
-    # Both looks also extend the record of what moves on its own (a playing
-    # video), so a quick plan with few samples still tells motion from change.
-    moving, looks = _visual_motion(session), []
+    # Areas already seen moving this turn: marks inside become their highlight.
+    if known := getattr(session, "visual_live", ()):
+        marks, reveal_from, _ = visual_explanation.widen(shot, marks, known, reveal_from, shown)
+        observed_regions = visual_explanation.outside(observed_regions, known)
+    # Recheck a clean capture before drawing; look twice for passing tooltips.
     for attempt in range(2):
         fresh, _, _ = await _unseen_shot(session, None)
         if (fresh is None or fresh.hwnd != frame.hwnd or fresh.window != frame.window
@@ -1778,20 +1740,30 @@ async def _draw(session, shot: Shot, marks: list[dict], reveal_from=0, caption="
         # Keep its crop transform: the model's coordinates belong to that image.
         renewed = replace(fresh.frame, transform=frame.transform)
         scene = renewed.scene(marks, reveal_from)
-        looks.append(fresh.frame.content_fingerprint)
-        if attempt:
-            seen = frame.motion_mask([*getattr(session, "visual_samples", ()), *looks])
-            moving = seen if moving is None else moving if seen is None else moving | seen
         changed = await asyncio.to_thread(
-            frame.content_changed, fresh.pixels, targets=_drawing_regions(scene, observed_regions),
-            cursor=capture.cursor_position(), animations=animations, moving=moving)
+            frame.content_changed, fresh.pixels, targets=_drawing_regions(scene, observed_regions))
+        if changed == "moved" and _unattended(frame):
+            # No input since the capture: it moved by itself. Widen to the live area.
+            looks = [*getattr(session, "visual_samples", ()), drawing.observation(fresh.pixels)]
+            live = await asyncio.to_thread(frame.live_regions, looks, unattended=True)
+            wider, carried, _ = visual_explanation.widen(shot, marks, live, reveal_from, shown)
+            if wider != list(marks):
+                marks, reveal_from = wider, carried
+                observed_regions = visual_explanation.outside(observed_regions, live)
+                session.visual_live = (*getattr(session, "visual_live", ()), *live)
+                perf.mark("drawing_live_widened")
+                scene = renewed.scene(marks, reveal_from)
+                changed = await asyncio.to_thread(
+                    frame.content_changed, fresh.pixels, targets=_drawing_regions(scene, observed_regions))
         if not changed:
             break
         perf.visual_recorder()("preflight_changed", changed)
         if attempt:
+            await asyncio.to_thread(_keep_cancel_evidence, session, frame, fresh.pixels,
+                                    _drawing_regions(scene, observed_regions), f"preflight-{changed}")
             raise ValueError("drawing source changed since capture")
         await asyncio.sleep(.3)
-    session.visual_motion = moving
+    session.visual_regions = _drawing_regions(scene, observed_regions)
     frame = renewed
     scene["caption"] = caption[:60]
     if capture.window_rect(frame.hwnd) != frame.window or capture.known_monitor(frame.monitor) != frame.monitor:
@@ -1805,8 +1777,8 @@ async def _draw(session, shot: Shot, marks: list[dict], reveal_from=0, caption="
     session.drawing_frame = frame
     session.drawing_deadline = time.monotonic() + drawing.ACTIVE_LIFETIME
     session.drawing_diagnostic = perf.visual_recorder()
-    session.drawing_animations = tuple(animations)
     session.drawing_observed_regions = tuple(observed_regions)
+    session.drawing_source = (shot, list(marks), tuple(observed_regions), caption)
     session.drawing_complete = asyncio.Event()
     # Older shells do not report their animation clock. Use a bounded estimate
     # until the ready receipt supplies the actual remaining stroke time.
@@ -1818,9 +1790,39 @@ async def _draw(session, shot: Shot, marks: list[dict], reveal_from=0, caption="
     return presentation
 
 
-def _visual_motion(session):
-    """This turn's mask of content moving on its own (drawing.Frame.motion_mask)."""
-    return getattr(session, "visual_motion", None)
+def _keep_cancel_evidence(session, frame, pixels, targets, reason):
+    """Save a cancelled drawing's observations locally (last five)."""
+    import numpy as np
+    try:
+        folder = config.CONFIG_DIR / "diagnostics" / "drawing-cancels"
+        folder.mkdir(parents=True, exist_ok=True)
+        baseline = frame.content_fingerprint
+        samples = [s for s in getattr(session, "visual_samples", ()) if np.shape(s) == np.shape(baseline)]
+        np.savez_compressed(
+            folder / f"{datetime.now():%Y%m%d-%H%M%S}-{reason}.npz",
+            baseline=baseline, current=drawing.observation(pixels),
+            samples=np.stack(samples) if samples else np.zeros((0, *np.shape(baseline))),
+            targets=np.array(list(targets), dtype=float).reshape(-1, 4),
+            live=np.array(list(getattr(session, "visual_live", ())), dtype=float).reshape(-1, 4),
+            window=np.array(frame.window or (0, 0, 0, 0)),
+            monitor=np.array([frame.monitor[k] for k in ("left", "top", "width", "height")]))
+        for old in sorted(folder.glob("*.npz"))[:-5]:
+            old.unlink()
+    except Exception:
+        log.exception("could not keep drawing cancel evidence")
+
+
+def _unattended(frame):
+    """No input since this frame was captured."""
+    return capture.idle_seconds() + .05 >= time.monotonic() - frame.captured
+
+
+async def _targets_in_place(session, frame, targets):
+    """One clean look: the same source window, every target where it was."""
+    fresh, _, _ = await _unseen_shot(session, None)
+    return (fresh is not None and frame is not None and fresh.hwnd == frame.hwnd
+            and fresh.window == frame.window and fresh.monitor == frame.monitor
+            and not await asyncio.to_thread(frame.content_changed, fresh.pixels, targets=targets))
 
 
 def _drawing_regions(scene, observed_regions=()):
@@ -1859,31 +1861,16 @@ async def _invalidate_drawing(session, reason="native_failure") -> None:
 
 
 async def _watch_drawing(session, frame, scene):
-    # Clean underlying source samples; no screenshot is uploaded or saved.
-    # Input is not a cancellation event. Only persistent content/layout changes
-    # matter, and annotations themselves must not hide changed target pixels.
+    # Clean local samples only; persistent changes to the marked things retire it.
     baseline = frame
     changed_samples = 0
     reason = "source_changed"
-    looks, trail = [], []
+    looks, steady_at = [], frame.captured
 
     def compare(pixels):
-        # Motion can also start while guiding (a hover preview under the
-        # cursor): the last few looks extend the turn's record of it.
-        # A target is never excused this way: its pixels are always compared.
-        looks.append(drawing.observation(pixels))
-        del looks[:-3]
-        # Where the pointer has been lately: a menu or card it opened may stay.
-        cursor = capture.cursor_position()
-        trail.append(cursor)
-        del trail[:-8]
-        targets = _drawing_regions(scene, getattr(session, "drawing_observed_regions", ()))
-        moving, seen = _visual_motion(session), baseline.motion_mask(looks, exclude=targets)
-        if seen is not None:
-            moving = seen if moving is None else moving | seen
+        # Only the marked things matter; everything around them may change.
         return baseline.content_changed(
-            pixels, targets=targets, cursor=cursor, pointers=trail,
-            animations=getattr(session, "drawing_animations", ()), moving=moving)
+            pixels, targets=_drawing_regions(scene, getattr(session, "drawing_observed_regions", ())))
 
     try:
         while session.drawing_scene is scene:
@@ -1896,6 +1883,7 @@ async def _watch_drawing(session, frame, scene):
             if capture.window_rect(frame.hwnd) != frame.window or capture.known_monitor(frame.monitor) != frame.monitor:
                 reason = "display_changed"
                 break
+            seen_at = time.monotonic()
             sampled = await _clean_capture(session, lambda: capture.frame(frame.monitor))
             if sampled is None:
                 reason = "capture_unavailable"
@@ -1904,9 +1892,19 @@ async def _watch_drawing(session, frame, scene):
             if session.drawing_scene is not scene:
                 return
             changed = await asyncio.to_thread(compare, pixels)
+            looks = [*looks[-5:], drawing.observation(pixels)]
+            if not changed:
+                steady_at = seen_at
             changed_samples = changed_samples + 1 if changed else 0
             if changed_samples >= 2:
                 perf.visual_recorder()("watch_changed", changed)
+                # Moved with no input (.3 s for render lag): output pushed it.
+                if (changed == "moved" and capture.idle_seconds() >= time.monotonic() - steady_at + .3
+                        and await _follow_output(session, baseline, looks)):
+                    return
+                await asyncio.to_thread(
+                    _keep_cancel_evidence, session, baseline, pixels,
+                    _drawing_regions(scene, getattr(session, "drawing_observed_regions", ())), f"watch-{changed}")
                 break
         if session.drawing_scene is scene:
             await _invalidate_drawing(session, reason)
@@ -1918,18 +1916,31 @@ async def _watch_drawing(session, frame, scene):
             await _invalidate_drawing(session, "observer_error")
 
 
-async def _begin_drawing_beat(session, shot, marks, sentence, *, reveal_from=0, animations=(), observed_regions=()):
-    """Verify and show ink; return "ready" or why its readiness gate failed.
+async def _follow_output(session, frame, looks):
+    """Redraw as a highlight of the live area; False if no mark is in one."""
+    if getattr(session, "drawing_source", None) is None:
+        return False
+    shot, marks, observed, caption = session.drawing_source
+    live = await asyncio.to_thread(frame.live_regions, looks, unattended=True)
+    wider, _, _ = visual_explanation.widen(shot, marks, live)
+    if wider == list(marks):
+        return False
+    perf.mark("drawing_live_followed")
+    session.visual_live = (*getattr(session, "visual_live", ()), *live)
+    if await _begin_drawing_beat(session, shot, wider, caption, reveal_from=len(wider),
+                                 observed_regions=visual_explanation.outside(observed, live)) != "ready":
+        await _invalidate_drawing(session, "source_changed")
+    return True
 
-    The caller delivers the sentence when its audio starts. The first beat runs
-    this while its speech is still being synthesized, so the bone is already
-    drawing by the time Mellow begins to talk.
-    """
+
+async def _begin_drawing_beat(session, shot, marks, sentence, *, reveal_from=0, observed_regions=()):
+    """Verify and show ink; return "ready" or why it failed. The first beat
+    runs this during synthesis, so drawing starts before speech."""
     try:
         caption = next((m["text"] for m in marks[reveal_from:] if m["kind"] == "label"), "")
         if not caption:
             caption = sentence.split(".", 1)[0][:60]
-        ticket = await _draw(session, shot, marks, reveal_from, caption, animations=animations, observed_regions=observed_regions)
+        ticket = await _draw(session, shot, marks, reveal_from, caption, observed_regions=observed_regions)
         if not await ticket.wait():
             reason = getattr(session, "drawing_failure_reason", None)
             await _clear_drawing(session)
@@ -1971,19 +1982,16 @@ async def _drawing_stroke_done(session):
     return True
 
 
-async def _drawing_beat(session, shot: Shot, marks, sentence, speak, partial, *, reveal_from=0, wait_complete=False, animations=(), fallback_target=None, observed_regions=(), early=None, first=False):
-    """Visible ink gates speech; the final stroke also gates the next beat.
-
-    `early` is this beat's _begin_drawing_beat task, started during synthesis.
-    Only a `first` beat (nothing shown yet) falls back to words on a screen change.
-    """
+async def _drawing_beat(session, shot: Shot, marks, sentence, speak, partial, *, reveal_from=0, wait_complete=False, fallback_target=None, observed_regions=(), early=None, first=False):
+    """Visible ink gates speech; the final stroke gates the next beat.
+    Only a `first` beat falls back to words on a screen change."""
     delivered = ""
     readiness = ""
 
     async def before():
         nonlocal delivered, readiness
         readiness = await (early if early is not None else _begin_drawing_beat(
-            session, shot, marks, sentence, reveal_from=reveal_from, animations=animations,
+            session, shot, marks, sentence, reveal_from=reveal_from,
             observed_regions=observed_regions))
         if readiness == "ready":
             await _deliver(session, sentence, False, partial)
@@ -2011,30 +2019,17 @@ async def _drawing_beat(session, shot: Shot, marks, sentence, speak, partial, *,
     return delivered
 
 
-async def _visual_reasoning_fresh(session, shot, animations):
-    """Reasoning without new ink still needs current screen evidence."""
-    fresh, _, _ = await _unseen_shot(session, None)
-    frame = shot.frame
+async def _visual_reasoning_fresh(session, shot):
+    """Reasoning without new ink still refers to what this answer marked."""
     scene = session.drawing_scene
-    targets = _drawing_regions(scene, getattr(session, "drawing_observed_regions", ())) if scene is not None else ()
-    if (fresh is None or fresh.hwnd != frame.hwnd or fresh.window != frame.window
-            or fresh.monitor != frame.monitor):
-        return False
-    changed = await asyncio.to_thread(frame.content_changed, fresh.pixels, targets=targets,
-                                      cursor=capture.cursor_position(), animations=animations,
-                                      moving=_visual_motion(session))
-    return not changed
+    targets = (_drawing_regions(scene, getattr(session, "drawing_observed_regions", ()))
+               if scene is not None else getattr(session, "visual_regions", ()))
+    return await _targets_in_place(session, shot.frame, targets)
 
 
-async def _visual_sequence(session, plan, partial, *, animations=(), early=None, incoming=None):
-    """Prebuffer narration across beats; all screen changes happen at playback.
-
-    Audio lookahead overlaps synthesis with the preceding explanation, while
-    the readiness and completion gates keep the bone and speech in order.
-    `early` is the first beat's _begin_drawing_beat task, started during
-    synthesis. `incoming`, when given, is a queue of beats the planner is still
-    writing (None ends it); otherwise plan.beats is the whole plan.
-    """
+async def _visual_sequence(session, plan, partial, *, early=None, incoming=None):
+    """Prebuffer narration across beats; screen changes happen at playback.
+    `incoming`: queue of beats still being planned (None ends it)."""
     shot = plan.shot
     reply, queued = [], []
     failure = ""
@@ -2051,10 +2046,8 @@ async def _visual_sequence(session, plan, partial, *, animations=(), early=None,
                 return False
             new_ink = beat.marks and (beat.reveal_from != len(beat.marks) or session.drawing_scene is None)
             if not new_ink:
-                # Retained reasoning and a plain conclusion still refer to the
-                # captured page. Do not let audio lookahead bypass its freshness
-                # check merely because this beat adds no shapes.
-                if not await _visual_reasoning_fresh(session, shot, animations):
+                # Words-only beats still refer to the page: check it is fresh.
+                if not await _visual_reasoning_fresh(session, shot):
                     await _clear_drawing(session)
                     failure = "The screen changed before I could show that, so I'll stop here."
                     return False
@@ -2067,9 +2060,10 @@ async def _visual_sequence(session, plan, partial, *, animations=(), early=None,
             else:
                 await send(session.ws, type="state", state="looking")
                 readiness = await _begin_drawing_beat(session, shot, beat.marks, beat.say,
-                                                     reveal_from=beat.reveal_from, animations=animations,
+                                                     reveal_from=beat.reveal_from,
                                                      observed_regions=getattr(beat, "observed_regions", ()))
-        if readiness == "renderer_failed" and beat.pointer is not None:
+        if (readiness == "renderer_failed" and beat.pointer is not None
+                and await _targets_in_place(session, shot.frame, [beat.pointer.bounds])):
             # The ink did not appear; the bone can still show the place.
             ticket = await _aim(session, beat.pointer)
             if await ticket.wait():
@@ -2152,7 +2146,7 @@ async def _visual_motion_samples(session, shot, samples):
     return True
 
 
-async def _visual_point(session, plan, speak, partial, *, animations=()):
+async def _visual_point(session, plan, speak, partial):
     """No ink survived validation: the ordinary arriving bone points at each beat's location."""
     beats = [(beat.pointer, beat.say) for beat in plan.beats]
     frame = plan.shot.frame
@@ -2160,8 +2154,7 @@ async def _visual_point(session, plan, speak, partial, *, animations=()):
     if (fresh is None or fresh.hwnd != frame.hwnd or fresh.window != frame.window
             or fresh.monitor != frame.monitor
             or await asyncio.to_thread(
-                frame.content_changed, fresh.pixels, targets=[t.bounds for t, _ in beats if t is not None],
-                cursor=capture.cursor_position(), animations=animations, moving=_visual_motion(session))):
+                frame.content_changed, fresh.pixels, targets=[t.bounds for t, _ in beats if t is not None])):
         perf.outcome("drawing_failed")
         return await _deliver(session, "The screen changed before I could show that, so I'll stop here.", speak, partial)
     # _narrate expects the first bone already in flight, as answer() does.
@@ -2171,23 +2164,14 @@ async def _visual_point(session, plan, speak, partial, *, animations=()):
 
 
 async def _visual_control_point(session, shot, target, sentence, speak, partial):
-    """An ink failure can still point the bone at the beat's location.
-
-    Never use this path after a source/layout change: the unchanged source is
-    checked again at playback, after the failed renderer has been cleared.
-    """
+    """After an ink failure, point the bone at the beat instead (source rechecked)."""
     delivered = ""
     obstacle = "The screen changed before I could show that, so I'll stop here."
 
     async def before():
         nonlocal delivered, obstacle
         # Check at playback, after slow synthesis, just like the drawing path.
-        fresh, _, _ = await _unseen_shot(session, None)
-        frame = shot.frame
-        if (fresh is None or frame is None or fresh.hwnd != frame.hwnd
-                or fresh.window != frame.window or fresh.monitor != frame.monitor
-                or await asyncio.to_thread(frame.content_changed, fresh.pixels, targets=[target.bounds],
-                                           cursor=capture.cursor_position(), moving=_visual_motion(session))):
+        if not await _targets_in_place(session, shot.frame, [target.bounds]):
             return False
         ticket = await _aim(session, target)
         if not await ticket.wait():
@@ -2239,31 +2223,38 @@ async def _visual_answer(session, prompt, cfg, speak, partial):
         # Motion evidence never delays the model: what was sampled during
         # transcription is used now, and sampling continues while it plans.
         animations = shot.frame.animation_regions(samples, images) if images else ()
-        session.visual_samples, session.visual_motion = samples, None
+        session.visual_regions, session.visual_samples, session.visual_live = (), samples, ()
         motion = asyncio.create_task(_visual_motion_samples(session, shot, samples))
-        incoming, handed = asyncio.Queue(), []
+        incoming, handed, steady = asyncio.Queue(), [], None
+
+        def unstable():
+            """Animated images and live areas, fixed at the first beat."""
+            nonlocal steady
+            if steady is None:
+                live = shot.frame.live_regions(samples, unattended=_unattended(shot.frame))
+                if live:
+                    perf.mark("visual_live_area")
+                steady = (*animations, *live)
+                session.visual_live = steady
+            return steady
 
         def on_plan(prefix):
             """Show and speak each beat as soon as the planner has written it."""
             nonlocal playback, early
             if not speak:
                 return
-            prefix = visual_explanation.stabilize(prefix, animations)
+            prefix = visual_explanation.stabilize(prefix, unstable())
             if playback is None:
-                # Motion seen so far guards the first ink; sampling stops so no
-                # capture overlaps its presentation.
-                session.visual_motion = shot.frame.motion_mask(samples)
-                if session.visual_motion is not None:
-                    perf.mark("visual_motion_masked")
+                # Sampling stops so no capture overlaps the first presentation.
                 motion.cancel()
                 perf.mark("drawing_stream_started")
                 first = prefix.beats[0]
                 if first.marks:
                     early = asyncio.create_task(_begin_drawing_beat(
                         session, prefix.shot, first.marks, first.say, reveal_from=first.reveal_from,
-                        animations=animations, observed_regions=first.observed_regions))
+                        observed_regions=first.observed_regions))
                 playback = asyncio.create_task(_visual_sequence(
-                    session, prefix, partial, animations=animations, early=early, incoming=incoming))
+                    session, prefix, partial, early=early, incoming=incoming))
             for beat in prefix.beats[len(handed):]:
                 incoming.put_nowait(beat)
                 handed.append(beat)
@@ -2287,10 +2278,8 @@ async def _visual_answer(session, prompt, cfg, speak, partial):
             perf.outcome("drawing_failed")
             return await _deliver(session, "I couldn't make a reliable drawing plan for this screen. Try a simpler drawing request.", speak, partial)
         if playback is not None:
-            # The stream ended: hand over any beats it had not yet closed. A
-            # provider that restarted its output may have finished a different
-            # plan; then playback ends with the beats already queued.
-            final = visual_explanation.stabilize(plan, animations).beats if plan.status == "ready" else ()
+            # Hand over the remaining beats, unless a restarted stream changed the plan.
+            final = visual_explanation.stabilize(plan, unstable()).beats if plan.status == "ready" else ()
             if [(b.say, b.marks) for b in final[:len(handed)]] == [(b.say, b.marks) for b in handed]:
                 for beat in final[len(handed):]:
                     incoming.put_nowait(beat)
@@ -2308,17 +2297,12 @@ async def _visual_answer(session, prompt, cfg, speak, partial):
             return await _deliver(session, plan.message, speak, partial)
         if images:
             animations = shot.frame.animation_regions(samples, images)
-            plan = visual_explanation.stabilize(plan, animations)
             if animations:
                 perf.mark("visual_animation_observed")
-        # What kept moving while the question was asked and planned (a video,
-        # a streaming terminal) is excused from every later freshness check.
-        session.visual_motion = shot.frame.motion_mask(samples)
-        if session.visual_motion is not None:
-            perf.mark("visual_motion_masked")
+        plan = visual_explanation.stabilize(plan, unstable())
         perf.mark("drawing_plan_validated")
         if plan.status == "point":
-            return await _visual_point(session, plan, speak, partial, animations=animations)
+            return await _visual_point(session, plan, speak, partial)
         perf.mark("visual_presentation_drawing")
         first = plan.beats[0]
         if speak and first.marks:
@@ -2326,20 +2310,18 @@ async def _visual_answer(session, prompt, cfg, speak, partial):
             # still being synthesized; its audio still waits for paint readiness.
             early = asyncio.create_task(_begin_drawing_beat(
                 session, plan.shot, first.marks, first.say, reveal_from=first.reveal_from,
-                animations=animations, observed_regions=first.observed_regions))
+                observed_regions=first.observed_regions))
         if speak and len(plan.beats) > 1:
-            return await _visual_sequence(session, plan, partial, animations=animations, early=early)
+            return await _visual_sequence(session, plan, partial, early=early)
         reply = []
         for beat in plan.beats:
             if (not beat.marks or (beat.reveal_from == len(beat.marks) and session.drawing_scene is not None)):
-                if not await _visual_reasoning_fresh(session, plan.shot, animations):
+                if not await _visual_reasoning_fresh(session, plan.shot):
                     await _clear_drawing(session)
                     reply.append(await _deliver(session, "The screen changed before I could show that, so I'll stop here.", speak, partial))
                     break
             if speak:
-                # Each drawing beat has its own audio preparation. Keep the
-                # previous speaking pose from lingering through that wait;
-                # Speaker switches back only after this beat is ready to play.
+                # Don't hold the speaking pose while this beat's audio prepares.
                 await send(session.ws, type="state", state="looking")
             if beat.marks:
                 if (beat.reveal_from == len(beat.marks)
@@ -2356,7 +2338,7 @@ async def _visual_answer(session, prompt, cfg, speak, partial):
                         await asyncio.sleep(_dwell(beat.say))
                     continue
                 heard = await _drawing_beat(session, plan.shot, beat.marks, beat.say, speak, partial,
-                                             reveal_from=beat.reveal_from, wait_complete=True, animations=animations,
+                                             reveal_from=beat.reveal_from, wait_complete=True,
                                              fallback_target=beat.pointer, observed_regions=getattr(beat, "observed_regions", ()),
                                              early=early if beat is first else None, first=not reply)
                 reply.append(heard.strip())
@@ -2371,7 +2353,7 @@ async def _visual_answer(session, prompt, cfg, speak, partial):
         raise
     finally:
         session.drawing_active = False
-        session.visual_samples, session.visual_motion = (), None
+        session.visual_regions, session.visual_samples, session.visual_live = (), (), ()
         for task in (early, playback):
             if task is not None and not task.done():
                 task.cancel()
@@ -2607,11 +2589,7 @@ SCREEN_READ_TTL = 10.0
 
 
 def _start_screen_read(session: Session) -> None:
-    """Read the screen while the question is still being transcribed.
-
-    Only when the turn could become a screen drawing. Nothing leaves the
-    machine unless it does; the question chooses from this evidence later.
-    """
+    """Read the screen during transcription, when the turn may draw (stays local)."""
     if getattr(session, "screen_ready", None) is not None:
         return
     cfg = config.load()
@@ -2621,11 +2599,7 @@ def _start_screen_read(session: Session) -> None:
 
 
 async def _prepare_screen(session: Session) -> ScreenRead | None:
-    """The same evidence a drawing turn reads after transcription, read earlier.
-
-    One clean native frame, its accessibility tree and OCR rows, and one motion
-    sample. It decides nothing about where to point: that needs the question.
-    """
+    """A drawing turn's evidence, read early: frame, UIA, OCR, one motion sample."""
     try:
         with perf.span("screen_read"):
             monitor = capture.known_monitor(getattr(session, "turn_monitor", None)) or capture.active_monitor()
@@ -2689,9 +2663,7 @@ def _same_control(local, aimed) -> bool:
     monitor = aimed.monitor or local.monitor
     if local.bounds is None or not monitor:
         return False
-    # nx/ny are normalized within the owning monitor; bounds are desktop pixels
-    # as (left, top, width, height). Half a control of slack, so a near-miss on
-    # a small button still counts as the same control.
+    # nx/ny are monitor-normalized, bounds are desktop pixels; half a control of slack.
     slack = max(local.bounds[2], local.bounds[3]) / 2
     return locator._inside(
         local.bounds,
@@ -2702,13 +2674,8 @@ def _same_control(local, aimed) -> bool:
 
 
 async def _aim_early(session, shot, target, local_fallback):
-    """Verify and show the model's choice while it is still writing its sentence.
-
-    The same checks as after a finished reply: prefer an identical measured
-    rectangle, capture a fresh frame, and show nothing if the control moved.
-    Returns (aimed, fresh) once the bone is up, or None to leave the target to
-    the normal path, which can track or re-resolve a moved control.
-    """
+    """Verify and show the model's choice while it is still writing.
+    Returns (aimed, fresh) once the bone is up, or None for the normal path."""
     aimed = target
     if local_fallback is not None and _same_control(local_fallback, target):
         aimed = local_fallback
@@ -2842,9 +2809,7 @@ async def answer(session: Session, prompt: str, prepared=None) -> None:
                 partial=partial,
             )
         if asked and cfg.get("drawing_enabled") and drawing_route != "suppressed":
-            # The answering model decided it must see the screen. With drawings
-            # on, every screen answer goes through the visual planner: draw, else
-            # point, else words. Phrase routing misses this; the model does not.
+            # The model asked to look: draw, else point, else words.
             perf.mark("drawing_route_look")
             reply = await _visual_answer(session, prompt, cfg, speak, partial)
             asked = False
@@ -2878,9 +2843,7 @@ async def answer(session: Session, prompt: str, prepared=None) -> None:
                             shot.monitor, None, shot.hwnd,
                         )
 
-                    # Keep a high-confidence measured result as a safety net,
-                    # but let the agent write the normal answer and validate the
-                    # same visual request as API mode. This removes canned speech.
+                    # A confident measured match is only a safety net; the agent still answers.
                     local_fallback = (
                         point.confident_match(cands)
                         if cfg["llm"]["mode"] == "agent"
@@ -2922,12 +2885,7 @@ async def answer(session: Session, prompt: str, prepared=None) -> None:
                         if grounded.target is None:
                             grounded_answer = locator.pointer_reply(aimed)
                     elif local_fallback is not None and aimed is not None:
-                        # A unique, high-confidence UIA rectangle is more precise
-                        # than a model-copied E index — but only when it is the
-                        # same control. Swapping in a lexical match that landed
-                        # elsewhere is the phrase-gate veto again, wearing the
-                        # word "precision": it points at one control while the
-                        # spoken answer describes another.
+                        # A confident UIA rectangle is more precise, if it is the same control.
                         if _same_control(local_fallback, aimed):
                             aimed = local_fallback
                             perf.mark("pointer_local_precision")
@@ -2958,9 +2916,7 @@ async def answer(session: Session, prompt: str, prepared=None) -> None:
                             )
                             if tracked is not None:
                                 aimed, shot = tracked, fresh
-                                # The frame moved under step 1. Later steps were
-                                # chosen on the old one, so they are no longer
-                                # measurements of anything on screen.
+                                # The frame moved under step 1; later steps are stale.
                                 grounded = locator.GroundedResult(aimed, grounded_answer)
                                 log.info("tracked the localized control on the fresh frame")
                             else:
@@ -3289,6 +3245,10 @@ async def handle(session: Session, msg: dict) -> None:
                 if presentation.outcome is None:
                     if record := getattr(session, "drawing_diagnostic", None):
                         record("not_ready", reason)
+                        if reason == "source_changed":
+                            # Which app the shell found in front (name only).
+                            app = capture.foreground()[0] or "unknown"
+                            record("foreground", "".join(c if c.isascii() and c.isalnum() else "_" for c in app)[:40])
                     # Let the playback waiter consume failure before retirement.
                     presentation.acknowledge("failed")
                 else:

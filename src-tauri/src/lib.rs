@@ -752,6 +752,8 @@ pub fn run() {
                 .skip_taskbar(true)
                 .shadow(false)
                 .focusable(false)
+                // Otherwise show() activates and steals focus from the source app.
+                .focused(false)
                 .visible(false)
                 .build()?;
                 guide.set_ignore_cursor_events(true)?;
@@ -772,6 +774,7 @@ pub fn run() {
                 .skip_taskbar(true)
                 .shadow(false)
                 .focusable(false)
+                .focused(false)
                 .visible(false)
                 .build()?;
                 guide_bubble.set_ignore_cursor_events(true)?;

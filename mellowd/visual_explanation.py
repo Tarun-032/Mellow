@@ -436,6 +436,11 @@ Host-observed dynamic_regions are animated images. Their outer containers are
 stable, but inner vertices can move while you answer. Highlight the supplied whole
 container and explain the moving arrangement; do not trace its transient edges or
 claim that its current internal coordinates will remain fixed.
+Output that new lines keep pushing up (terminal or log output, build output, chat
+or activity feeds) moves while you speak. To explain what is happening in such a
+pane, what its output says or what a program is doing, highlight the whole output
+pane once in the first beat and explain it in words; later beats retain it and add
+no marks. Mark single lines only when the question is about those lines.
 Root has status,message,region,beats. ready: message empty, region empty, beats
 nonempty with at least one mark. point: message/region empty, exactly ONE replace
 beat with one rectangle/highlight/ellipse bounding the single target; optionally
@@ -1401,42 +1406,69 @@ def dynamic_boxes(shot, regions):
     return result
 
 
-def stabilize(plan, dynamic_regions):
-    """An observed animation gets a stable container selection, never moving-edge ink.
+def _mostly_inside(points, region):
+    """At least half the mark's box is inside the region (a point: within 2 px)."""
+    x, y, w, h = region
+    xs, ys = [a for a, _ in points], [b for _, b in points]
+    left, top, right, bottom = min(xs), min(ys), max(xs), max(ys)
+    area = (right - left) * (bottom - top)
+    if area <= 0:
+        return all(x - 2 <= a <= x + w + 2 and y - 2 <= b <= y + h + 2 for a, b in points)
+    overlap = max(0, min(right, x + w) - max(left, x)) * max(0, min(bottom, y + h) - max(top, y))
+    return overlap >= area * .5
 
-    This also works when local animation evidence arrives during the model call.
-    Static geometry outside those host-observed containers stays unchanged.
-    """
-    regions = dynamic_boxes(plan.shot, dynamic_regions)
-    if not regions or not plan.beats:
+
+def _widened(shot, mark, regions):
+    """A mark inside a moving region becomes its highlight; returns (mark, key or None)."""
+    physical = [shot.frame.transform.point(p) for p in mark["points"]]
+    index = next((i for i, region in enumerate(regions) if _mostly_inside(physical, region)), None)
+    if index is None:
+        return mark, None
+    x, y, w, h = regions[index]
+    if mark["kind"] == "label":
+        return dict(mark, points=[image_point(shot.frame, [x, y])]), ("label", index, mark["text"])
+    # One colour, so the same area stays put across sentences.
+    return dict(kind="highlight", color="mint", points=[
+        image_point(shot.frame, [x, y]), image_point(shot.frame, [x + w, y + h])]), ("region", index)
+
+
+def widen(shot, marks, dynamic_regions, reveal_from=0, shown=()):
+    """Marks inside moving regions become one highlight each; one already
+    `shown` is carried, not redrawn. Returns (marks, reveal_from, regions)."""
+    regions = dynamic_boxes(shot, dynamic_regions)
+    carried, new, seen = [], [], []
+    for index, mark in enumerate(marks):
+        adjusted, key = _widened(shot, mark, regions)
+        if key is not None:
+            if key in seen:
+                continue
+            seen.append(key)
+        again = key is not None and key[0] == "region" and any(_iou(regions[key[1]], box) >= .8 for box in shown)
+        (carried if index < reveal_from or again else new).append(adjusted)
+    return carried + new, len(carried), [regions[key[1]] for key in seen if key[0] == "region"]
+
+
+def outside(regions, dynamic_regions):
+    """Watched boxes not inside a moving area; that area is watched whole."""
+    return tuple(r for r in regions if not any(
+        _mostly_inside([(r[0], r[1]), (r[0] + r[2], r[1] + r[3])], area) for area in dynamic_regions))
+
+
+def stabilize(plan, dynamic_regions):
+    """Marks on content that moves by itself become one whole-area highlight."""
+    if not dynamic_boxes(plan.shot, dynamic_regions) or not plan.beats:
         return plan
-    beats = []
+    beats, shown, previous = [], [], []
     for beat in plan.beats:
-        marks, seen, old_count = [], set(), 0
-        for index, mark in enumerate(beat.marks):
-            physical = [plan.shot.frame.transform.point(p) for p in mark["points"]]
-            region_index = next((i for i,(x,y,w,h) in enumerate(regions)
-                if all(x-2 <= a <= x+w+2 and y-2 <= b <= y+h+2 for a,b in physical)), None)
-            adjusted = mark
-            if region_index is not None:
-                x,y,w,h = regions[region_index]
-                if mark["kind"] == "label":
-                    adjusted = dict(mark, points=[image_point(plan.shot.frame,[x,y])])
-                    key = ("label", region_index, mark["text"])
-                else:
-                    adjusted = dict(kind="highlight", color=mark["color"], points=[
-                        image_point(plan.shot.frame,[x,y]),image_point(plan.shot.frame,[x+w,y+h])])
-                    key = ("region", region_index)
-                if key in seen:
-                    continue
-                seen.add(key)
-            marks.append(adjusted)
-            if index < beat.reveal_from:
-                old_count += 1
+        marks, reveal_from, regions = widen(plan.shot, beat.marks, dynamic_regions, beat.reveal_from, shown)
+        if reveal_from == len(marks) and any(mark not in marks for mark in previous):
+            # Nothing new to draw, but an earlier mark must go: redraw.
+            marks, reveal_from, regions = widen(plan.shot, beat.marks, dynamic_regions, beat.reveal_from)
+        shown, previous = regions, marks
         # The adapted scene is still subject to every ordinary geometry/budget guard.
         if marks:
             replace(plan.shot.frame,captured=time.monotonic()).scene(marks)
-        beats.append(replace(beat, marks=marks, reveal_from=old_count))
+        beats.append(replace(beat, marks=marks, reveal_from=reveal_from))
     return replace(plan, beats=beats)
 
 

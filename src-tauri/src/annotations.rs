@@ -190,7 +190,11 @@ fn source_valid(scene: &Scene) -> bool {
     };
     // Read only a source HWND and its physical rectangle. No input is sent.
     unsafe {
-        if GetForegroundWindow() != scene.hwnd
+        // Mellow's own windows are not a switch away from the source.
+        let foreground = GetForegroundWindow();
+        let mut foreground_pid = 0;
+        GetWindowThreadProcessId(foreground, &mut foreground_pid);
+        if (foreground != scene.hwnd && foreground_pid != std::process::id())
             || IsWindowVisible(scene.hwnd) == 0
             || IsIconic(scene.hwnd) != 0
             || GetWindowRect(scene.hwnd, &mut rect) == 0
@@ -298,6 +302,7 @@ fn overlay_window(handle: &tauri::AppHandle, name: String) -> Result<tauri::Webv
         .skip_taskbar(true)
         .shadow(false)
         .focusable(false)
+        .focused(false)
         .visible(false)
         .build()
         .map_err(|e| e.to_string())
