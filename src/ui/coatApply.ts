@@ -164,13 +164,20 @@ export function roleAt(cell: number, x: number, y: number): Role | null {
 export function useCoat(): void {
   useEffect(() => {
     let alive = true;
+    let retry = 0;
     const paint = (coat: unknown) => {
       if (alive && isCoat(coat)) applyCoat(coat, document.documentElement).catch(() => {});
     };
-    fetch(`${API}/config`)
-      .then((r) => r.json())
-      .then((body) => paint(body?.settings?.coat))
-      .catch(() => {});
+    // The sidecar may still be starting (seconds, in the installed app): keep asking.
+    const load = () => {
+      fetch(`${API}/config`)
+        .then((r) => r.json())
+        .then((body) => paint(body?.settings?.coat))
+        .catch(() => {
+          if (alive) retry = window.setTimeout(load, 1000);
+        });
+    };
+    load();
     // guide-bubble is not in src-tauri/capabilities, so listen can reject there.
     // It still gets the saved coat from the fetch above.
     const stop = listen<Coat>("coat", (event) => paint(event.payload)).catch(
@@ -178,6 +185,7 @@ export function useCoat(): void {
     );
     return () => {
       alive = false;
+      window.clearTimeout(retry);
       stop.then((off) => off()).catch(() => {});
     };
   }, []);
