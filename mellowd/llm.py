@@ -289,6 +289,23 @@ REMINDER_SEEN = _REMINDER_TONE + (
     " screen doesn't show what they're asking about, just answer the question"
     " directly and say the screen doesn't show it."
 )
+# The model decides when a question needs the web (main._pass catches these).
+SEARCH = "[SEARCH:"
+RESEARCH = "[RESEARCH:"
+REMINDER_WEB = (
+    " You can use the web for things you don't know or that may have changed."
+    " Use [RESEARCH: a search query with their details | a short name for the"
+    " topic, a few words] whenever they ask you to research, look into, find out"
+    " about, or find information or details on something, even if you think you"
+    " already know, and whenever a good answer would take more than a sentence or"
+    " two: comparisons, recommendations, lists of options, or the latest on a"
+    " topic. A report is written for them in the background. Use [SEARCH: a short"
+    " search query] only for one quick current fact you can say in a sentence or"
+    " two, like the weather, a score, a date, a price, or a yes or no. Begin your"
+    " reply with exactly one of these and write nothing after it. Use neither for"
+    " things you know well, small talk, or their screen. Never write these for any"
+    " other reason."
+)
 
 
 # The marker, demonstrated.
@@ -296,6 +313,17 @@ ANCHOR_LOOK = (
     ("what does this error on my screen say?", LOOK),
     # NOTE: keep this list and ANCHOR_SEEN in step
     ("can you see my screen?", LOOK),
+)
+
+# The web markers, demonstrated, with one question that needs neither.
+ANCHOR_WEB = (
+    ("what's the weather in boston right now?", "[SEARCH: weather in Boston]"),
+    ("can you research some phones under 300 dollars?",
+     "[RESEARCH: best phones under 300 dollars | phones under 300 dollars]"),
+    ("can you find some information about the new codex features?",
+     "[RESEARCH: new OpenAI Codex features | what's new in Codex]"),
+    ("who won the game last night?", "[SEARCH: who won the game last night]"),
+    ("what's the capital of france?", "Paris."),
 )
 
 # The other half: what a screen answer looks like once the picture has arrived.
@@ -504,8 +532,10 @@ _ACT_RULE = (
     " [DO:n|what to do] when the row asks for it, and then talk to them about"
     " it however suits the moment - you are doing them a favour, not filing a"
     " report. If none of them is what they meant - if they are asking about"
-    " something on their screen rather than asking you to open something -"
-    " start with [DO:none] instead and the question is handled the usual way."
+    " something on their screen rather than asking you to open something, or"
+    " they want an answer or information rather than something opened or"
+    " played - start with [DO:none] instead and the question is handled the"
+    " usual way."
     " When they say play that, it, this, that song, or that video, resolve the"
     " actual title from what they named earlier in this request or conversation"
     " and put that title after the |. Never pass a pronoun such as that or it"
@@ -553,6 +583,11 @@ ANCHOR_ACT = (
 
 
 def _reminder_for(cfg: dict) -> str:
+    """The screen rule this request carries, and the web rule when research is on."""
+    return _screen_rule(cfg) + (REMINDER_WEB if cfg.get("web") else "")
+
+
+def _screen_rule(cfg: dict) -> str:
     """Which screen rule this request carries."""
     # Appended rather than formatted in: these are OCR'd labels off a stranger's screen
     items = cfg.get("items") or ""
@@ -587,6 +622,8 @@ def _anchored(cfg: dict, messages: list[dict]) -> list[dict]:
         exchanges += ANCHOR_SEEN
     elif cfg.get("vision_ok", True):
         exchanges += ANCHOR_LOOK
+    if cfg.get("web"):
+        exchanges += ANCHOR_WEB
     out = []
     for question, answer in exchanges:
         out.append({"role": "user", "content": question})

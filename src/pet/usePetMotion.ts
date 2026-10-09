@@ -122,6 +122,14 @@ function hitsPet(cursor: Cursor, x: number, y: number, padding: number) {
   return false;
 }
 
+/** Cursor over any clickable piece of a scattered group, like parked research bones? */
+function inAny(ref: React.RefObject<HTMLElement | null>, cursor: Cursor) {
+  return Array.from(ref.current?.querySelectorAll<HTMLElement>("[data-hit]") ?? []).some((el) => {
+    const box = el.getBoundingClientRect();
+    return cursor.x >= box.left && cursor.x <= box.right && cursor.y >= box.top && cursor.y <= box.bottom;
+  });
+}
+
 /** Cursor inside an element's client box? */
 function inBox(ref: React.RefObject<HTMLElement | null>, cursor: Cursor) {
   const el = ref.current;
@@ -161,6 +169,7 @@ export function usePetMotion(
   const bubbleRef = useRef<HTMLDivElement>(null);
   // Open panel always claims the cursor.
   const panelRef = useRef<HTMLDivElement>(null);
+  const trayRef = useRef<HTMLDivElement>(null);
   const [reaction, setReaction] = useState<Reaction>(null);
   const [quiet, setQuietState] = useState<Side | null>(null);
   const [petBurst, setPetBurst] = useState(0);
@@ -364,7 +373,8 @@ export function usePetMotion(
         m.dragging ||
           inside ||
           overScrollingBubble(bubbleRef, payload) ||
-          inBox(panelRef, payload),
+          inBox(panelRef, payload) ||
+          inAny(trayRef, payload),
       );
 
       // No hover-wake while tucked away.
@@ -632,6 +642,7 @@ export function usePetMotion(
     eyesRef,
     bubbleRef,
     panelRef,
+    trayRef,
     releaseOverlay,
     reaction,
     quiet,

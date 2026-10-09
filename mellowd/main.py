@@ -3,10 +3,12 @@
 import asyncio
 import json
 import logging
+import random
 import re
 import sys
 import threading
 import time
+import uuid
 from contextlib import aclosing, asynccontextmanager, suppress
 from dataclasses import dataclass, field, replace
 from datetime import datetime
@@ -17,7 +19,7 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 from mellowd import (
-    act, agents, capture, config, drawing, errors, guide, llm, locator, meetings, memory, perf, point, remind, sessions, stt, transport, tts, visual_explanation, writing,
+    act, agents, capture, config, drawing, errors, guide, llm, locator, meetings, memory, perf, point, remind, research, sessions, stt, transport, tts, visual_explanation, writing,
 )
 from mellowd.version import PROTOCOL, SERVICE, VERSION
 
@@ -1004,6 +1006,125 @@ class Session:
 _active_sessions: dict[int, Session] = {}
 _engine_revision = 0
 
+# Research jobs outlive turns; their last state is replayed on reconnect.
+MAX_RESEARCH = 3
+_research_tasks: dict[str, asyncio.Task] = {}
+_research_state: dict[str, dict] = {}
+
+
+async def _publish_research(job: str, **fields) -> None:
+    _research_state[job] = {"type": "research", "id": job, **fields}
+    for session in list(_active_sessions.values()):
+        with suppress(WebSocketDisconnect, RuntimeError):
+            await send(session.ws, **_research_state[job])
+
+
+async def _research_job(job: str, question: str, cfg: dict) -> None:
+    revision = _engine_revision
+    await _publish_research(job, status="working", question=question)
+    try:
+        found = await research.run(question, cfg)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        message = str(e) if isinstance(e, research.ResearchError) else errors.message(e)
+        log.warning("research failed: %s", message)
+        perf.outcome("failed")
+        if job in _research_state:
+            await _publish_research(job, status="failed", question=question, message=message)
+            await _say_research_failed(message)
+        return
+    finally:
+        _research_tasks.pop(job, None)
+    if job not in _research_state:  # dismissed while the answer was on its way
+        return
+    await _publish_research(job, status="done", question=question, title=found.title,
+                            paragraphs=found.paragraphs, sources=found.sources)
+    # Into history, for follow-up questions.
+    for session in list(_active_sessions.values()):
+        if session.turn is not None and not session.turn.done():
+            # A live turn's user/assistant pair stays together.
+            await asyncio.wait({session.turn})
+        if revision != _engine_revision:
+            return
+        session.history += sessions.report_pair(question, found.plain)
+        del session.history[: max(0, len(session.history) - HISTORY_TURNS * 2)]
+    # After the wait, so resume sees it between whole turns.
+    await asyncio.to_thread(sessions.record, "tool_result", what="research", detail=question,
+                            title=found.title, report=found.plain)
+
+
+async def _say_research_failed(message: str) -> None:
+    """Say why, unless Mellow is busy; the red bone shows it anyway."""
+    if _turn_running() or meetings.manager.active:
+        return
+    text = f"I couldn't finish that research. {message}"
+    speak = config.load()["tts"]["speak"]
+    for session in list(_active_sessions.values()):
+        with suppress(WebSocketDisconnect, RuntimeError):
+            # Clear the old reply first.
+            await send(session.ws, type="transcript", text="")
+            await send(session.ws, type="reply_chunk", text=text)
+            if speak:
+                session.speaker.begin()
+                sentences = tts.SentenceBuffer()
+                for sentence in [*sentences.feed(text), *sentences.flush()]:
+                    await session.speaker.speak(sentence)
+                await session.speaker.finish()
+            await send(session.ws, type="state", state="idle")
+
+
+def _launch_research(job: str, question: str, cfg: dict) -> None:
+    _research_tasks[job] = asyncio.create_task(
+        perf.run(_research_job(job, question, cfg), perf.Turn("research"))
+    )
+
+
+# Mellow says the line; the model only names the topic.
+_ON_IT = (
+    "Looking into {topic} now.",
+    "Sure, I'll put together a report on {topic}.",
+    "On it. I'll dig into {topic} and leave the report in the corner.",
+    "Give me a moment to research {topic}.",
+    "I'm on it. Your report on {topic} will be in the corner.",
+)
+_ON_IT_PLAIN = "On it. I'll leave the report in the corner."
+_last_on_it = -1
+# Search jargon not worth saying aloud.
+_QUERY_TAIL = re.compile(
+    r"\s+\b(?:detailed|details|reviews?|specs?|specifications|comparison|compared|prices?|pricing|"
+    r"release|rumou?rs?|features|guide|overview|explained|info|information|20\d\d)\b.*$",
+    re.IGNORECASE,
+)
+
+
+def _speakable(query: str) -> str:
+    """A topic to say out loud, from a search query, when the model named none."""
+    topic = re.sub(r"^(?:the\s+)?(?:best|top|latest)\s+", "", query.strip(), flags=re.IGNORECASE)
+    trimmed = _QUERY_TAIL.sub("", topic)
+    topic = trimmed if len(trimmed.split()) >= 2 else topic
+    head = re.split(r"\s+and\s+", topic, maxsplit=1, flags=re.IGNORECASE)[0]
+    return " ".join((head if len(head.split()) >= 2 else topic).split()[:6])
+
+
+def _on_it(topic: str, query: str = "") -> str:
+    """A different line each time, about their topic."""
+    global _last_on_it
+    topic = topic or _speakable(query)
+    if not topic:
+        return _ON_IT_PLAIN
+    _last_on_it = random.choice([i for i in range(len(_ON_IT)) if i != _last_on_it])
+    return _ON_IT[_last_on_it].format(topic=topic.rstrip(" ."))
+
+
+async def _start_research(session: "Session", cfg: dict, speak: bool, partial: dict, prompt: str,
+                          topic: str = "") -> str:
+    if len(_research_tasks) >= MAX_RESEARCH:
+        return await _deliver(session, "I'm already researching three things. Give me a moment.", speak, partial)
+    _launch_research(uuid.uuid4().hex[:12], prompt, cfg)
+    return await _deliver(session, _on_it(topic, prompt), speak, partial)
+
+
 async def _meeting_started():
     await agents.stop()
     point.stop_ocr()
@@ -1065,8 +1186,8 @@ async def _reset_for_engine_change() -> None:
     log.info("engine changed; current conversation closed")
 
 
-def _said(cfg: dict, reply: str, aborted: bool) -> dict:
-    """The fields an assistant_said event carries."""
+def _said(cfg: dict, reply: str, aborted: bool, web: str = "") -> dict:
+    """The fields an assistant_said event carries; `web` is the reply's web marker."""
     return {
         "text": reply,
         "model": cfg["llm"]["model"],
@@ -1074,6 +1195,7 @@ def _said(cfg: dict, reply: str, aborted: bool) -> dict:
         # Answering endpoint.
         "base_url": cfg["llm"]["base_url"],
         "aborted": aborted,
+        **({"web": web} if web else {}),
     }
 
 
@@ -1176,14 +1298,20 @@ def _hold_look_opening(text: str) -> bool:
     """Hold a possible screen request ([look], or a 'let me look' preamble);
     release ordinary prose immediately."""
     head = text.lstrip().lower()
+    if head.startswith("[") and "]" not in head:
+        # A marker still arriving.
+        return len(head) < POINT_HOLD
     if len(head) >= LOOK_SCAN:
         return False
-    if not head or (head.startswith("[") and "]" not in head):
+    if not head:
         return True
     return any(prefix.startswith(head) or head.startswith(prefix) for prefix in _LOOK_PREAMBLES)
 
 # Screen marker.
 _LOOK_TOKEN = re.compile(re.escape(llm.LOOK) + r"(?![0-9A-Za-z])", re.IGNORECASE)
+
+# Web markers: [SEARCH: q] or [RESEARCH: q | topic].
+_WEB_TOKEN = re.compile(r"\[\s*(SEARCH|RESEARCH)\s*:\s*([^\]\n]{1,200}?)\s*\]", re.IGNORECASE)
 
 # Point marker.
 _POINT_TOKEN = re.compile(
@@ -1249,12 +1377,16 @@ async def _pass(
     on_point=None,
     token=None,
     presentation: guide.Presentation | None = None,
+    web: dict | None = None,
 ) -> tuple[str, bool, Pick | Deed | None]:
-    """One streaming pass of the model, into the bubble and the voice."""
+    """One streaming pass of the model, into the bubble and the voice.
+
+    With `web`, an opening web marker ends the pass and fills it in.
+    """
     ws = session.ws
     sentences = tts.SentenceBuffer()
     held = ""
-    settled = not look
+    settled = not look and web is None
     reply = ""
     # Hold a possible point marker.
     tail = ""
@@ -1285,7 +1417,7 @@ async def _pass(
         if not text and not final:
             return
         # Combine the held tail first: [look] can arrive across several chunks.
-        text, tail, found = _split_point(_LOOK_TOKEN.sub("", tail + text), token)
+        text, tail, found = _split_point(_WEB_TOKEN.sub("", _LOOK_TOKEN.sub("", tail + text)), token)
         if found and point is None:
             point = found
             if on_point is not None:
@@ -1303,8 +1435,14 @@ async def _pass(
             for sentence in sentences.feed(text):
                 await queue(sentence)
 
-    def resolve(text: str) -> tuple[str, bool]:
-        """(what to emit, whether the model asked for eyes) for a held opening."""
+    def resolve(text: str) -> tuple[str, bool | str]:
+        """(what to emit, True if it asked for eyes or "web" for the web) for a held opening."""
+        if web is not None and (match := _WEB_TOKEN.search(text)):
+            web["kind"] = "research" if match.group(1).lower() == "research" else "search"
+            query, _, topic = match.group(2).partition("|")
+            web["query"], web["topic"] = query.strip(), topic.strip()
+            # Drop filler, as with [look].
+            return "", "web"
         if not _LOOK_TOKEN.search(text):
             return text, False
         if look == "ask":
@@ -1326,15 +1464,15 @@ async def _pass(
                     held += chunk
                     text, asked = resolve(held)
                     if asked:
-                        return "", True, None
+                        return "", asked is True, None
                     if token is _DO_TOKEN and _declined(held):
                         # Respect an action veto.
                         return "", False, NONE
                     if not (token or _POINT_TOKEN).search(held):
-                        if token is _DO_TOKEN or look not in ("ask", "strip"):
+                        if token is _DO_TOKEN or look not in ("ask", "strip", ""):
                             waiting = len(held.lstrip()) < LOOK_SCAN
                         else:
-                            waiting = look == "ask" and _hold_look_opening(held)
+                            waiting = (look == "ask" or web is not None) and _hold_look_opening(held)
                         if waiting:
                             continue
                     settled = True
@@ -1352,7 +1490,7 @@ async def _pass(
         # Flush a short answer.
         text, asked = resolve(held)
         if asked:
-            return "", True, None
+            return "", asked is True, None
         chunk, held = text, ""
         await emit(chunk)
 
@@ -2779,6 +2917,8 @@ async def answer(session: Session, prompt: str, prepared=None) -> None:
                                                    history=session.history[:-1])
     draw_requested = drawing_route in ("explicit", "automatic")
     perf.mark("drawing_route_" + drawing_route)
+    # Kept in history so later turns repeat the marker, not just the words.
+    web_tag = ""
     try:
         did = False
         if draw_requested:
@@ -2800,14 +2940,30 @@ async def answer(session: Session, prompt: str, prepared=None) -> None:
         if remembered:
             cfg = {**cfg, "memory": remembered}
         if not asked and not draw_requested:
+            # The model decides: [SEARCH:] for a quick fact, [RESEARCH:] for a report.
+            web = {} if cfg.get("research_enabled", True) else None
+            first = {**cfg, "llm": {**cfg["llm"], "web": True}} if web is not None else cfg
             reply, asked, _ = await _pass(
                 session,
-                cfg,
+                first,
                 speak,
                 # Vision-off has no marker.
                 look="ask" if sighted else "",
                 partial=partial,
+                web=web,
             )
+            if web:
+                topic = f" | {web['topic']}" if web.get("topic") else ""
+                web_tag = f"[{web['kind'].upper()}: {web['query']}{topic}]"
+            if web and web.get("kind") == "research":
+                perf.mark("web_research")
+                reply = await _start_research(session, cfg, speak, partial, web["query"], topic=web["topic"])
+            elif web and web.get("kind") == "search":
+                perf.mark("web_search")
+                found = await research.lookup(web["query"], cfg)
+                # Results ride with memory; "strip" keeps it off the screen.
+                searched = {**cfg, "memory": "\n\n".join(filter(None, [remembered, found]))}
+                reply, _, _ = await _pass(session, searched, speak, look="strip", partial=partial)
         if asked and cfg.get("drawing_enabled") and drawing_route != "suppressed":
             # The model asked to look: draw, else point, else words.
             perf.mark("drawing_route_look")
@@ -3011,7 +3167,7 @@ async def answer(session: Session, prompt: str, prepared=None) -> None:
         # Preserve interrupted speech.
         text = partial["text"] or reply
         if text.strip():
-            await asyncio.to_thread(sessions.record, "assistant_said", **_said(cfg, text, True))
+            await asyncio.to_thread(sessions.record, "assistant_said", **_said(cfg, text, True, web_tag))
         # Clear the point despite cancellation.
         with suppress(Exception, asyncio.CancelledError):
             await asyncio.shield(_hide_point(session))
@@ -3019,9 +3175,9 @@ async def answer(session: Session, prompt: str, prepared=None) -> None:
         raise
 
     await asyncio.to_thread(
-        sessions.record, "assistant_said", **_said(cfg, reply, False)
+        sessions.record, "assistant_said", **_said(cfg, reply, False, web_tag)
     )
-    session.history.append({"role": "assistant", "content": reply})
+    session.history.append({"role": "assistant", "content": f"{web_tag} {reply}".strip()})
     del session.history[: max(0, len(session.history) - HISTORY_TURNS * 2)]
 
     if speak:
@@ -3372,6 +3528,19 @@ async def handle(session: Session, msg: dict) -> None:
             await writing.status(session, send, "idle")
             await send(ws, type="state", state="idle")
 
+    elif kind == "research_retry":
+        job = str(msg.get("id", ""))
+        state = _research_state.get(job)
+        if state and job not in _research_tasks and len(_research_tasks) < MAX_RESEARCH:
+            # Same id keeps the same bone.
+            _launch_research(job, state["question"], config.load())
+
+    elif kind == "research_dismiss":
+        job = str(msg.get("id", ""))
+        _research_state.pop(job, None)
+        if (task := _research_tasks.pop(job, None)) is not None:
+            task.cancel()
+
     elif kind == "new_conversation":
         # Reset both histories.
         await session.abort()
@@ -3413,6 +3582,10 @@ async def ws_endpoint(ws: WebSocket):
         session.history.clear()
         session.destination = None
     _active_sessions[id(session)] = session
+    # A reloaded shell gets its parked research bones back.
+    for state in list(_research_state.values()):
+        with suppress(WebSocketDisconnect, RuntimeError):
+            await send(ws, **state)
     if session.history:
         log.info("resumed %d message(s) from the open session", len(session.history))
     # Reminders stay independent.
@@ -3449,4 +3622,9 @@ def run() -> None:
     import uvicorn
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    # Harmless Kokoro warning; a filter, since phonemizer resets its level.
+    logging.getLogger("phonemizer").addFilter(lambda record: "words count mismatch" not in record.getMessage())
+    # ddgs logs each engine it tries.
+    logging.getLogger("primp").setLevel(logging.WARNING)
+    logging.getLogger("ddgs").setLevel(logging.WARNING)
     uvicorn.run(app, host=HOST, port=PORT, log_level="warning")

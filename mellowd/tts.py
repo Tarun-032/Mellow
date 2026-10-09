@@ -83,9 +83,9 @@ _PUNCTUATION = str.maketrans(
 )
 
 
-# The screen marker (llm.LOOK), if one ever survives main._pass's scan window.
+# Markers that slipped past main._pass.
 _MARKER = re.compile(
-    r"\[look\](?![0-9A-Za-z])|\[POINT:[^\]]*\]",
+    r"\[look\](?![0-9A-Za-z])|\[POINT:[^\]]*\]|\[\s*(?:RE)?SEARCH\s*:[^\]]*\]",
     re.IGNORECASE,
 )
 

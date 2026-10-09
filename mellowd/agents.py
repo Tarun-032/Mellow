@@ -388,9 +388,12 @@ def _examples(section: dict) -> str:
     from mellowd import llm
 
     screen = section.get("screen") or ""
-    if screen not in ("seen", "guide"):
+    if screen in ("seen", "guide"):
+        pairs = llm.ANCHOR_POINT if section.get("items") else llm.ANCHOR_SEEN
+    elif section.get("web"):
+        pairs = llm.ANCHOR_WEB
+    else:
         return ""
-    pairs = llm.ANCHOR_POINT if section.get("items") else llm.ANCHOR_SEEN
     lines = []
     for question, answer in pairs:
         lines.append(f"They said: {question}")

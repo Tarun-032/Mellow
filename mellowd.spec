@@ -24,11 +24,13 @@ datas += copy_metadata("faster-whisper")
 # Collect packages whose native/data dependencies load lazily.
 for package in (
     "ctranslate2",
+    "ddgs",
     "espeakng_loader",
     "kokoro_onnx",
     "language_tags",
     "onnx_asr",
     "phonemizer",
+    "primp",
     "pyaudiowpatch",
     "uiautomation",
     "winsdk",

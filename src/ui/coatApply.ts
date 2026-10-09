@@ -8,7 +8,7 @@ import { useEffect } from "react";
 import { listen } from "@tauri-apps/api/event";
 
 import { API } from "./fields";
-import { ROLES, type Coat, type Role, isCoat, mapPixel, nearestSource } from "./coat";
+import { DEFAULT_COAT, ROLES, type Coat, type Role, isCoat, mapPixel, nearestSource } from "./coat";
 import sheet from "../pet/sprites.json" with { type: "json" };
 import spritesUrl from "../pet/sprites.png";
 import writingUrl from "../pet/writing.png";
@@ -90,6 +90,17 @@ async function recolour(url: string, coat: Coat): Promise<string> {
   return URL.createObjectURL(blob);
 }
 
+/** The bone with its cream filled in another colour, outline kept. One blob per colour, kept for the session. */
+const tinted = new Map<string, Promise<string>>();
+export function tintedBone(fill: string): Promise<string> {
+  let url = tinted.get(fill);
+  if (!url) {
+    url = recolour(boneUrl, { ...DEFAULT_COAT, cream: fill });
+    tinted.set(fill, url);
+  }
+  return url;
+}
+
 /** Blob URLs currently in use, per element, so superseded ones get revoked. */
 const live = new WeakMap<HTMLElement, string[]>();
 /** Which applyCoat call owns an element: two can be in flight (StrictMode runs
@@ -153,13 +164,20 @@ export function roleAt(cell: number, x: number, y: number): Role | null {
 export function useCoat(): void {
   useEffect(() => {
     let alive = true;
+    let retry = 0;
     const paint = (coat: unknown) => {
       if (alive && isCoat(coat)) applyCoat(coat, document.documentElement).catch(() => {});
     };
-    fetch(`${API}/config`)
-      .then((r) => r.json())
-      .then((body) => paint(body?.settings?.coat))
-      .catch(() => {});
+    // The sidecar may still be starting (seconds, in the installed app): keep asking.
+    const load = () => {
+      fetch(`${API}/config`)
+        .then((r) => r.json())
+        .then((body) => paint(body?.settings?.coat))
+        .catch(() => {
+          if (alive) retry = window.setTimeout(load, 1000);
+        });
+    };
+    load();
     // guide-bubble is not in src-tauri/capabilities, so listen can reject there.
     // It still gets the saved coat from the fetch above.
     const stop = listen<Coat>("coat", (event) => paint(event.payload)).catch(
@@ -167,6 +185,7 @@ export function useCoat(): void {
     );
     return () => {
       alive = false;
+      window.clearTimeout(retry);
       stop.then((off) => off()).catch(() => {});
     };
   }, []);

@@ -21,8 +21,21 @@ export type WritingStatus = {
   retry: boolean;
 };
 
+/** One background web search, from "working" to a report or a failure. */
+export type ResearchJob = {
+  type: "research";
+  id: string;
+  status: "working" | "done" | "failed";
+  question: string;
+  title?: string;
+  paragraphs?: string[];
+  sources?: { title: string; url: string }[];
+  message?: string;
+};
+
 type Incoming =
   | WritingStatus
+  | ResearchJob
   | { type: "guide"; waiting: boolean }
   | { type: "state"; state: PetState; interrupted?: boolean }
   | { type: "microphone"; state: MicrophoneState }
@@ -85,6 +98,7 @@ export function useSocket() {
   const [speak, setSpeak] = useState(true);
   // Fired reminder.
   const [reminder, setReminder] = useState("");
+  const [research, setResearch] = useState<ResearchJob[]>([]);
   // Current point target.
   const [point, setPoint] = useState<Point | null>(null);
   const activePoint = useRef<Point | null>(null);
@@ -194,6 +208,8 @@ export function useSocket() {
       sock.onopen = () => {
         setConnected(true);
         setMicrophone("warming");
+        // The daemon replays every job it still holds.
+        setResearch([]);
       };
 
       sock.onmessage = async (e) => {
@@ -238,6 +254,11 @@ export function useSocket() {
             break;
           case "remind":
             setReminder(msg.text);
+            break;
+          case "research":
+            setResearch((jobs) => jobs.some((j) => j.id === msg.id)
+              ? jobs.map((j) => (j.id === msg.id ? msg : j))
+              : [...jobs, msg]);
             break;
           case "pong":
             console.log("[mellow] pong:", msg.echo);
@@ -382,6 +403,21 @@ export function useSocket() {
   /** Dismiss a reminder. */
   const dismissReminder = useCallback(() => setReminder(""), []);
 
+  /** Run a failed research job again, under the same bone. */
+  const retryResearch = useCallback((id: string) => {
+    if (ws.current?.readyState === WebSocket.OPEN) {
+      ws.current.send(JSON.stringify({ type: "research_retry", id }));
+    }
+  }, []);
+
+  /** Forget a research job; the daemon cancels it if it is still searching. */
+  const dismissResearch = useCallback((id: string) => {
+    setResearch((jobs) => jobs.filter((j) => j.id !== id));
+    if (ws.current?.readyState === WebSocket.OPEN) {
+      ws.current.send(JSON.stringify({ type: "research_dismiss", id }));
+    }
+  }, []);
+
   // Stable sender.
   const send = useCallback((msg: object) => {
     const transmit = (payload: object) => {
@@ -423,6 +459,9 @@ export function useSocket() {
     clear,
     dismissDialogue,
     dismissReminder,
+    research,
+    dismissResearch,
+    retryResearch,
     setDrawingAllowed,
     drawingPen,
   };

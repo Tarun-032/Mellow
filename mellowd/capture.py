@@ -88,16 +88,32 @@ GUIDE = r"""
 
 # Asking for the finger in so many words.
 ERRAND = r"""
-    \b(?:point|show|take|guide|lead|direct)\s+me\b
+    \bpoint\s+me\b
   | \bpoint\s+(?:to|at)\b
   | \bwhere(?:'?s\b|\s+(?:is|are|was|were|do|does|did|can|could|should|would|
       will|to|abouts)\b)
-  | \bhelp\s+me\s+(?:find|get|open|reach|see)\b
   | \bhow\s+(?:do|can|could|would|should)\s+i\s+(?:find|open|access|reach|
       see|view|get\s+to|switch\s+to|turn\s+(?:on|off))\b
-  | \bwhich\s+(?:one|button|tab|menu|icon|option|link|setting)\b
+  | \bwhich\s+(?:button|tab|menu|icon|option|link|setting)\b
   | \b(?:locate|navigate\s+to)\b
+"""
+
+# Errand words that also fit the real world: these point only beside a screen word.
+ERRAND_ANYWHERE = r"""
+    \b(?:show|take|guide|lead|direct)\s+me\b
+  | \bhelp\s+me\s+(?:find|get|open|reach|see)\b
+  | \bwhich\s+one\b
   | \b(?:find|open|get\s+to)\s+(?:the|my|a|an)\b
+  | \bwalk\s+me\s+through\b
+"""
+
+# Interface nouns, beyond CONTROL and SURFACE.
+INTERFACE = r"""
+    \b(?:pages?|tabs?|links?|chats?|profile|account|billing|usage|folders?|files?|
+       windows?|apps?|sites?|website|sidebar|dashboard|inbox|editor|terminal|browser|
+       extensions?|download|upload|log\s*in|login|sign\s*in|models?|repo|repository|
+       projects?|workspace|channels?|playlists?|tools?|features?|sections?|list|view|
+       mode|bar|pane|screen)\b
 """
 
 _F = re.VERBOSE | re.IGNORECASE
@@ -111,6 +127,13 @@ CONTROL_RE, ASK_RE, GUIDE_RE = (
     re.compile(GUIDE, _F),
 )
 ERRAND_RE = re.compile(ERRAND, _F)
+ERRAND_ANYWHERE_RE, INTERFACE_RE = re.compile(ERRAND_ANYWHERE, _F), re.compile(INTERFACE, _F)
+
+
+def on_screen(text: str) -> bool:
+    """Names something on a screen: a control, a part of an app, or "this"."""
+    return bool(CONTROL_RE.search(text) or INTERFACE_RE.search(text)
+                or SURFACE_RE.search(text) or DEICTIC_RE.search(text))
 
 
 def wants_screen(text: str) -> bool:
@@ -127,7 +150,7 @@ def wants_pointing(text: str) -> bool:
         return False
     if ERRAND_RE.search(text):
         return True
-    if re.search(r"\bwalk\s+me\s+through\b", text, _F):
+    if ERRAND_ANYWHERE_RE.search(text) and on_screen(text):
         return True
     if CONTROL_RE.search(text) and ASK_RE.search(text):
         return True
@@ -168,6 +191,16 @@ def wants_action(text: str) -> bool:
     if WHERE_RE.search(text) or ASKS_HOW.search(text):
         return False
     return bool(DO_RE.search(text))
+
+
+# A leading research verb is asked of Mellow, even with a text field focused.
+ASKS_RESEARCH = re.compile(
+    r"^\W*(?:[\w']+\W+){0,3}?(?:research|(?:look|dig)\s+into|find\s+out\s+about|deep\s+dive)\b", _F
+)
+
+
+def asks_research(text: str) -> bool:
+    return bool(ASKS_RESEARCH.search(text))
 
 
 def _intersection(a: dict, b: tuple[int, int, int, int]) -> int:

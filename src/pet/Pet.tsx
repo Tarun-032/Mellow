@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { emit, emitTo, listen } from "@tauri-apps/api/event";
 import { PomodoroPanel, ReminderPanel } from "./Panels";
+import { ResearchTray } from "./ResearchTray";
 import { MeetingPanel } from "../meetings/MeetingPanel";
 import { clock as meetingClock, useMeeting, viewMeeting } from "../meetings/useMeeting";
 import { GUIDE_DIALOGUE_KEY, type GuideDialogue } from "./guideDialogue";
@@ -100,6 +101,9 @@ export default function Pet() {
     clear,
     dismissDialogue,
     dismissReminder,
+    research,
+    dismissResearch,
+    retryResearch,
     setDrawingAllowed,
     drawingPen,
   } = useSocket();
@@ -575,6 +579,7 @@ export default function Pet() {
           )}
         </div>
       )}
+      {!hidden && <ResearchTray jobs={research} trayRef={motion.trayRef} onDismiss={dismissResearch} onRetry={retryResearch} />}
       <div
         className="pet-root"
         data-reaction={meetingActive ? "none" : motion.reaction ?? "none"}

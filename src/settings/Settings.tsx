@@ -57,6 +57,7 @@ type SettingsData = {
   ai_enabled: boolean;
   writing_enabled: boolean;
   drawing_enabled: boolean;
+  research_enabled?: boolean;
   /** Mellow's five-colour coat. */
   coat: Coat;
 };
@@ -125,6 +126,7 @@ type SettingsPage =
   | "tts"
   | "writing"
   | "guidance"
+  | "research"
   | "sessions"
   | "personalization"
   | "meetings"
@@ -132,7 +134,7 @@ type SettingsPage =
   | "advanced";
 
 /** Pages that save as you go, so they get no Save changes bar. */
-const SAVES_ITSELF = new Set<SettingsPage>(["meetings", "updates", "writing", "guidance", "sessions"]);
+const SAVES_ITSELF = new Set<SettingsPage>(["meetings", "updates", "writing", "guidance", "research", "sessions"]);
 
 const SETTINGS_PAGES: Array<{
   id: SettingsPage;
@@ -171,6 +173,7 @@ const SETTINGS_PAGES: Array<{
   },
   { id: "personalization", label: "Personalization", description: "About you, personality and memory" },
   { id: "guidance", label: "Screen guidance", description: "Draw while explaining" },
+  { id: "research", label: "Web research", description: "Reports from the web" },
   { id: "meetings", label: "Meetings", description: "Transcripts and meeting notes" },
   {
     id: "updates",
@@ -1341,6 +1344,41 @@ export default function Settings() {
                 <h3>Your engine and screen</h3>
                 <p>Your selected engine must support images. Each drawing request sends a screen image and makes one planning call, with at most one closer-look call if needed. Ordinary answers use no drawing calls.</p>
                 <p className="field-note">If Mellow cannot place a drawing reliably, it stops. Model placement accuracy varies; this feature does not click or operate apps.</p>
+              </div>
+            </section>
+          )}
+
+          {activePage === "research" && (
+            <section className="settings-page" aria-labelledby="research-heading">
+              <div className="page-heading">
+                <h2 id="research-heading">Web research</h2>
+                <p>Mellow searches the web for free and your engine writes the answer. No extra key needed.</p>
+              </div>
+              <div className="settings-group">
+                <label className="switch">
+                  <span className="switch__text">
+                    <b>Search the web</b>
+                    <small>Quick facts like weather, prices and scores are answered out loud. Ask Mellow to research or look into something, or about the news, and a coloured bone parks in the top-right corner until the report is ready.</small>
+                  </span>
+                  <input type="checkbox" role="switch" disabled={!form.ai_enabled}
+                    checked={form.research_enabled ?? true}
+                    onChange={(event) => saveSetting({ research_enabled: event.target.checked })} />
+                  <i className="switch__track" aria-hidden="true" />
+                </label>
+                {settingError && <p className="notice notice--error" role="alert">{settingError}</p>}
+                {!form.ai_enabled && <p className="field-note">Choose an engine first to search the web.</p>}
+              </div>
+              <div className="settings-group">
+                <h3>Try asking</h3>
+                <p>&ldquo;Research the best budget mechanical keyboards.&rdquo;</p>
+                <p>&ldquo;What&rsquo;s the latest news on the Mars mission?&rdquo;</p>
+                <p>&ldquo;Who won the game last night?&rdquo;</p>
+                <p className="field-note">Keep talking while a report is on its way. Click the bone to read it and its sources, and ask a follow-up: Mellow remembers what it found.</p>
+              </div>
+              <div className="settings-group">
+                <h3>What it sends</h3>
+                <p>Your question goes to free public search engines such as DuckDuckGo. The results go to the engine you chose, which writes the answer. Nothing on your screen is sent.</p>
+                <p className="field-note">Free search can be busy now and then. If it is, Mellow says so and the bone offers Try again.</p>
               </div>
             </section>
           )}
