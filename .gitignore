@@ -24,6 +24,9 @@ dist-ssr
 *.sln
 *.sw?
 
+# Local checks and test tools
+/checks/
+
 # Private planning and design references
 /docs/
 /CLAUDE.md
