@@ -10,6 +10,7 @@ from pathlib import Path
 def run() -> None:
     # Imports here are deliberate.
     import ctranslate2
+    from ddgs import DDGS  # web research; primp is native
     import espeakng_loader
     import faster_whisper
     import kokoro_onnx
