@@ -2,12 +2,15 @@
 from dataclasses import dataclass, replace
 import asyncio
 import json
+import logging
 import math
 import re
 import time
 
 from PIL import Image
 from mellowd import agents, capture, drawing, drawing_geometry, drawing_grid, llm, locator, perf, point
+
+log = logging.getLogger("mellowd.visual")
 
 MAX_BEATS = 8
 MAX_TEXT = 600
@@ -31,6 +34,13 @@ _BARE_REFERENCE = re.compile(
     r"\b(?:this|that|these|those|here)\b(?:\s+(?:mean|means|represent|represents|work|works|do|does|happen|happens))?"
     r"[?.!]*\s*$", re.I)
 _VANTAGE_QUESTION = re.compile(r"\b(?:what|why|how)\s+(?:am i|are we)\s+(?:looking at|seeing|viewing)\b", re.I)
+# Spatial or first-time-user phrasing is about the visible app: "the tools on the
+# left side", "I have never used VS Code before, explain how this works".
+_SCREEN_REFERENCE = re.compile(
+    r"\b(?:left|right|top|bottom|upper|lower)(?:[ -]hand)?[ -](?:side|corner|panel|bar|half|part)s?\b"
+    r"|\bon the (?:left|right|top|bottom)\b"
+    r"|\b(?:never|first time)\b.{0,24}\b(?:used|using|opened|tried|seen)\b"
+    r"|\bhow (?:does )?(?:this|it all) works?\b", re.I)
 
 _STEP_WORDS = dict(zip(('one two three four five six seven eight nine ten eleven twelve '
     'thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty').split(), range(1, 21)))
@@ -133,10 +143,12 @@ def request_kind(text, *, automatic=False, history=None):
         # Choose presentation locally, without a paid classifier or broadening
         # ordinary questions into screenshot requests.
         numbered_location = step_selection(text) is not None and bool(_EXPLANATION.search(text))
-        control_question = numbered_location or bool(capture.CONTROL_RE.search(text) and capture.ASK_RE.search(text))
+        # Speech-to-text slips ("When should I click to...") still ask where to click.
+        click_question = bool(re.search(r"\b(?:when|where|which|how)\b[^.?!]*\b(?:click|press|tap|select)\b", text, re.I))
+        control_question = numbered_location or click_question or bool(capture.CONTROL_RE.search(text) and capture.ASK_RE.search(text))
         if capture.wants_action(text) and not control_question:
             return "none"
-        if numbered_location or capture.wants_pointing(text):
+        if numbered_location or click_question or capture.wants_pointing(text):
             return "automatic"
         diagram = _VISUAL_NOUN.search(text)
         visible = re.search(r"\b(?:this|that|these|those|here|on (?:my|the) screen|in (?:this|the) (?:image|picture)|on (?:this|the) page)\b"
@@ -146,7 +158,7 @@ def request_kind(text, *, automatic=False, history=None):
         # Choose the visual planner once; it can answer plainly when marks add
         # nothing. This avoids first asking a text-only model to request a look.
         surface = (capture.SURFACE_RE.search(text) or capture.FIRST_RE.search(text)
-                   or _VANTAGE_QUESTION.search(text)
+                   or _VANTAGE_QUESTION.search(text) or _SCREEN_REFERENCE.search(text)
                    or capture.BARE_RE.search(text.strip())
                    or (_BARE_REFERENCE.search(text) and not re.search(r"\b(?:what|how) about\b",text,re.I))
                    or (visible and (_SURFACE_PARTS.search(text)
@@ -184,14 +196,13 @@ def rejection_reason(error):
         "invalid drawing plan fields": "fields",
         "invalid drawing arrays": "arrays",
         "invalid drawing status": "status",
-        "invalid drawing beat": "beat",
-        "clear has marks": "clear_with_marks",
         "invalid drawing text": "text",
         "invalid drawing label": "label",
         "invalid drawing points": "points",
         "invalid drawing kind or vertex count": "vertex_count",
         "drawing coordinates must be finite numbers": "coordinates",
         "drawing point is outside its image": "image_bounds",
+        "drawing point lies in image padding": "image_bounds",
         "drawing leaves its source monitor": "monitor_bounds",
         "drawing outside source window": "window_bounds",
         "drawing outside page content": "page_bounds",
@@ -200,16 +211,10 @@ def rejection_reason(error):
         "invalid construction fields": "construction_fields",
         "construction on a moving image": "construction_geometry",
         "unsupported drawing color": "color",
-        "unknown or unsuitable measured target": "measured_target",
-        "measured target needs visual agreement": "measured_points",
-        "measured target disagrees with visual box": "measured_agreement",
         "drawing selects a label instead of its control": "control_role",
-        "drawing selects an unverified navigation destination": "navigation_target",
-        "invalid diagram object ID": "diagram_id",
         "diagram object changed identity": "diagram_identity",
-        "drawing plan has no drawings": "empty_plan",
+        "drawing beat budget exhausted": "beat_budget",
         "drawing narration budget exhausted": "narration_budget",
-        "invalid pointing plan": "point_plan",
         "invalid closer-look region": "crop_region",
         "closer-look crop too small": "crop_size",
         "closer-look budget exhausted": "crop_budget",
@@ -356,8 +361,10 @@ regions, diagram parts, comparisons, or locations. Highlight is the DEFAULT for
 screen guidance, even a single obvious button, link or location: one quick region
 selection helps the person see exactly what you mean. Generic 'point me to' or
 'show me where' requests also use ready with a highlight. point: only when the
-person explicitly asks to JUST/ONLY POINT without drawing. plain: no useful visual location, a conceptual answer,
-or genuinely ambiguous targets; provide the complete useful answer without ink.
+person explicitly asks to JUST/ONLY POINT without drawing. plain: ONLY when nothing
+visible relates to the answer (a purely conceptual question) or targets are genuinely
+ambiguous. If you describe, explain or locate anything on this screen, mark each part
+as you talk about it: the person is looking at the screen and expects to be shown.
 Honor explicit requests to draw/highlight/trace when safe; do not replace an explicit
 drawing request with a point just because it has one target. Use a whole region
 highlight rather than trace every boundary when the aim is to show where to look.
@@ -383,22 +390,15 @@ zero to one thousand; y increases TOP to BOTTOM from zero to one thousand.
 For example, the top-right corner is {"x":1000,"y":0}. Do not use [y,x] order,
 pixel coordinates, or coordinates relative to the diagram itself. Locate each
 vertex once and reuse its exact x and y when connecting adjacent edges.
-Use measured E IDs for controls or OCR text, never invent IDs. Supply a two-point
-visual bounding box agreeing with that E's box: the host uses its measured bounds.
-E targets support rectangle/highlight/ellipse/arrow/label. Label text must be short.
-Every mark MUST include points, even when target is a measured E ID. For an E
-rectangle/highlight/ellipse/arrow, copy its measured box's two named {x,y} points into
-points; never return an empty array. For an E label, also supply those two box
-points so the host can verify which measured object you mean. For an E arrow the
-host constructs a short tail and puts its tip at the verified control's center;
-the points you return are still its verification BOX, not guessed arrow endpoints.
-An unmeasured
-label instead uses one point at its visible label position.
+Use measured E IDs for controls or OCR text whenever a measured row is what you
+mean; never invent IDs. The host draws an E mark at its exact measured bounds, so
+its points may be empty. E targets support rectangle/highlight/ellipse/arrow/label.
+For an E arrow the host draws a short arrow to the control's center. Label text
+must be short.
 The measured table includes source: uia measures accessible controls; ocr measures
-only the TEXT glyph bounds, not the enclosing button or panel. An E outline must
-agree with that measured box. To outline a whole visible control when only its OCR
-text is measured, use a V target with the control's observed visual bounds instead;
-do not enlarge an E box to enclose its parent. Never claim an OCR box is a hitbox.
+only the TEXT glyph bounds, not the enclosing button. To outline the whole button
+around OCR text, give that E target with the button's two corners as points; the
+host keeps your box when it encloses the text. Never claim an OCR box is a hitbox.
 For where-to-click or opening/access guidance, choose an enabled, visible
 interactive control. A request simply to show a visible readonly value or heading
 can mark that named object; never call it a button or claim that clicking it opens
@@ -409,12 +409,9 @@ person asks where to go, select the actual interactive control, not the heading
 or an OCR copy of the same word. The duplicate_labels table names these conflicts.
 Use a heading when the request specifically asks about a heading/title or article
 content. A V/anonymous box around the heading cannot bypass this role distinction.
-The navigation evidence maps measured E IDs to observed request-label agreement.
-No agreement does not prove absence, but it cannot justify renaming a measured
-object as an explicitly named requested destination. In a location request,
-prefer direct label/role evidence. If no visible control supports a destination,
-explain that limitation; do not use V or empty targets to bypass a conflicting
-measured label at the same location.
+navigation_evidence scores how well each E label matches the request's words. It
+is a hint, not proof: an icon or avatar button can open a destination it does not
+name (an account avatar opens the profile menu); then say it is the menu opener.
 An icon without a text label must be clearly identifiable in the screenshot; if
 its meaning is uncertain, state that uncertainty rather than inventing a function.
 The request scope is page_content unless the user explicitly asks to mark browser
@@ -425,9 +422,7 @@ The measured table's scope distinguishes page/app content from browser furniture
 Use V IDs (V1, V2...) for diagram objects, with directly observed image geometry:
 line/arrow two points, rectangle/highlight/ellipse top-left and bottom-right,
 polygon three to sixteen vertices, quadratic three points, cubic four, label one.
-For EVERY V or empty-target label, points contains exactly ONE {x,y} anchor,
-never two bounding-box corners. Sharing a V ID with an outline does not change
-this label rule. Only measured E labels use two box points for verification.
+A label uses exactly ONE {x,y} anchor; an E label may leave points empty.
 An object ID consistently denotes the SAME object across beats. Never guess hidden
 edges or use diagram coordinates to identify an ambiguous app control. Keep marks
 inside the visible source window, labels legible and away from the object.
@@ -441,6 +436,11 @@ Host-observed dynamic_regions are animated images. Their outer containers are
 stable, but inner vertices can move while you answer. Highlight the supplied whole
 container and explain the moving arrangement; do not trace its transient edges or
 claim that its current internal coordinates will remain fixed.
+Output that new lines keep pushing up (terminal or log output, build output, chat
+or activity feeds) moves while you speak. To explain what is happening in such a
+pane, what its output says or what a program is doing, highlight the whole output
+pane once in the first beat and explain it in words; later beats retain it and add
+no marks. Mark single lines only when the question is about those lines.
 Root has status,message,region,beats. ready: message empty, region empty, beats
 nonempty with at least one mark. point: message/region empty, exactly ONE replace
 beat with one rectangle/highlight/ellipse bounding the single target; optionally
@@ -459,7 +459,8 @@ class Beat:
     say: str
     marks: list
     reveal_from: int
-    verified_controls: tuple = ()
+    # Where the bone points when this beat's ink cannot be shown.
+    pointer: object = None
     observed_regions: tuple = ()
 
 
@@ -470,7 +471,8 @@ class Plan:
     region: list
     beats: list
     shot: object
-    verified_controls: tuple = ()
+    # Fixed reason codes for marks the host could not draw.
+    dropped: tuple = ()
 
 
 def text(value, limit, *, empty=False):
@@ -545,6 +547,11 @@ def _nondegenerate(kind, points):
             raise ValueError('degenerate drawing geometry')
 
 
+# Calibration errors meaning "pixels show no row structure", not "pixels disagree".
+_UNPROVEN_GRID = ('not visible as separate boxes', 'no unambiguous background', 'no complete rectangular',
+                  'too small to calibrate', 'clipped')
+
+
 def _construct(mark, points, label, shot, validator, targets, page_bounds, dynamic_regions):
     """Compile bounded, typed operations into the existing renderer contract."""
     kind = mark['kind']
@@ -565,14 +572,30 @@ def _construct(mark, points, label, shot, validator, targets, page_bounds, dynam
         result = [dict(kind='polygon', color=mark['color'],
                        points=[image_point(validator,p) for p in vertices]) for vertices in squares]
         return result, _bounds(anchors), anchors
-    a,b = anchors
+    a,b = [min(anchors[0][0],anchors[1][0]), min(anchors[0][1],anchors[1][1])], \
+          [max(anchors[0][0],anchors[1][0]), max(anchors[0][1],anchors[1][1])]
     region = (a[0], a[1], b[0]-a[0], b[1]-a[1])
     measured = [tuple(row.bounds) for row in targets.values()
                 if interactive(row) and a[0] <= row.bounds[0] < row.bounds[0]+row.bounds[2] <= b[0]
                 and a[1] <= row.bounds[1] < row.bounds[1]+row.bounds[3] <= b[1]]
-    calibrated = drawing_grid.calibrate(shot.pixels, shot.monitor, region,
-        count=mark['count'], first_index=mark['first_step'], capture_id=shot.frame.id,
-        measured_bounds=measured if len(measured) == mark['count'] else ())
+    try:
+        calibrated = drawing_grid.calibrate(shot.pixels, shot.monitor, region,
+            count=mark['count'], first_index=mark['first_step'], capture_id=shot.frame.id,
+            measured_bounds=measured if len(measured) == mark['count'] else ())
+    except ValueError as error:
+        # Host-owned message text only, never provider or screen text.
+        perf.visual_recorder()('grid_unverified', re.sub(r'\W+', '_', str(error))[:64])
+        # Pixels that CONTRADICT the model (another count, irregular cells, a
+        # longer row) still drop it: a shifted cell is worse than none. Pixels
+        # that show NO structure (custom-drawn sequencers such as FL Studio)
+        # fall back to the model's complete-row box split into equal cells.
+        if not any(part in str(error) for part in _UNPROVEN_GRID) or min(region[2], region[3]) < 4:
+            raise
+        width = region[2] / mark['count']
+        calibrated = drawing_grid.Calibration(shot.frame.id, region, tuple(
+            drawing_grid.Cell(mark['first_step']+i, (region[0]+i*width, region[1], width, region[3]))
+            for i in range(mark['count'])), 'estimated')
+        perf.visual_recorder()('grid_estimated', 'pixels')
     gx,gy,gw,gh = calibrated.region
     if not (lx <= gx < gx+gw <= lx+lw and ly <= gy < gy+gh <= ly+lh):
         raise ValueError('grid calibration leaves its source bounds')
@@ -719,31 +742,145 @@ def duplicate_labels(targets):
     return result
 
 
-def _measured_points(target, kind, points, validator, targets):
+_AREAS = ('rectangle', 'highlight', 'ellipse')
+
+
+def _iou(a, b):
+    ax,ay,aw,ah = a; bx,by,bw,bh = b
+    shared = max(0,min(ax+aw,bx+bw)-max(ax,bx))*max(0,min(ay+ah,by+bh)-max(ay,by))
+    return shared / max(1, aw*ah+bw*bh-shared)
+
+
+def _inside(x, y, box, margin=0):
+    bx,by,bw,bh = box
+    return bx-margin <= x <= bx+bw+margin and by-margin <= y <= by+bh+margin
+
+
+def _measured(target, kind, points, validator, targets, source_area):
+    """Resolve an E ID to (row, physical box), or (None, None) if it names nothing drawable.
+
+    The measured row is the evidence. Model points only catch an ID slip (the box
+    sits squarely on another measured row) or widen OCR glyphs to the button the
+    model outlined around them. Missing or disagreeing points never drop the mark.
+    """
     candidate = targets.get(target)
-    if candidate is None or candidate.bounds is None or kind not in ("rectangle", "highlight", "ellipse", "arrow", "label"):
-        raise ValueError("unknown or unsuitable measured target")
-    if not isinstance(points, list) or len(points) != 2:
-        raise ValueError("measured target needs visual agreement")
-    a,b = [validator.transform.point(p) for p in points]
+    if candidate is None or candidate.bounds is None or kind not in _AREAS + ('arrow', 'label'):
+        return None, None
+    try:
+        box = _bounds([validator.transform.point(p) for p in points]) if len(points) == 2 else None
+    except ValueError:
+        box = None
+    if box is None or min(box[2], box[3]) < 2:
+        return candidate, tuple(candidate.bounds)
+    cx, cy = box[0]+box[2]/2, box[1]+box[3]/2
     x,y,w,h = candidate.bounds
-    cx,cy=(a[0]+b[0])/2,(a[1]+b[1])/2
-    overlap=max(0,min(b[0],x+w)-max(a[0],x))*max(0,min(b[1],y+h)-max(a[1],y))
-    union=max(1,(b[0]-a[0])*(b[1]-a[1])+w*h-overlap)
-    if (not (x-2 <= cx <= x+w+2 and y-2 <= cy <= y+h+2)
-            or a[0]>=b[0] or a[1]>=b[1] or overlap/union < .2):
-        raise ValueError("measured target disagrees with visual box")
+    if not _inside(cx, cy, candidate.bounds, max(16, max(w,h)*.25)):
+        slips = [row for row in targets.values() if row.bounds is not None
+                 and _inside(cx, cy, row.bounds) and _iou(box, row.bounds) >= .5]
+        if slips:
+            candidate = max(slips, key=lambda row: _iou(box, row.bounds))
+    x,y,w,h = candidate.bounds
+    if (candidate.source == 'ocr' and box[0] <= x and box[1] <= y
+            and x+w <= box[0]+box[2] and y+h <= box[1]+box[3]
+            and box[2]*box[3] <= 40*max(1, w*h) and box[2]*box[3] <= .25*source_area):
+        return candidate, box
+    return candidate, tuple(candidate.bounds)
+
+
+def _box_points(frame, kind, box):
+    """Image points that draw this mark kind on a physical box."""
+    x,y,w,h = box
     if kind == 'arrow':
-        return candidate, _control_arrow(validator, candidate)
-    mapped = [image_point(validator,[x,y])]
-    if kind != "label":
-        mapped.append(image_point(validator,[x+w,y+h]))
-    return candidate,mapped
+        return _control_arrow(frame, box)
+    if kind == 'label':
+        return [image_point(frame,[x,y])]
+    return [image_point(frame,[x,y]), image_point(frame,[x+w,y+h])]
 
 
-def _control_arrow(frame, candidate):
-    """Measured box proof becomes a short indicator, never model-guessed tips."""
-    x,y,w,h = candidate.bounds
+def _snap(kind, physical, targets):
+    """The accessible control a location mark plainly selects, so ink lands exactly on it.
+
+    Tight agreement only (IoU >= .5 keeps sizes within 2x): a box over part of a
+    linked figure must never grow into the whole figure.
+    """
+    controls = [row for row in targets.values() if interactive(row)]
+    if kind == 'arrow':
+        under = [row for row in controls if _inside(*physical[-1], row.bounds)]
+        return min(under, key=lambda row: row.bounds[2]*row.bounds[3], default=None)
+    if kind not in _AREAS:
+        return None
+    box = _bounds(physical)
+    best = max(controls, key=lambda row: _iou(box, row.bounds), default=None)
+    return best if best is not None and _iou(box, best.bounds) >= .5 else None
+
+
+def _decoys(targets):
+    """Readonly copies of a control's label, mapped to that control when it is unique."""
+    out = {}
+    for group in duplicate_labels(targets):
+        control = targets[group['controls'][0]] if len(group['controls']) == 1 else None
+        for ident in group['noninteractive']:
+            out[ident] = control
+    return out
+
+
+def _decoy(target, kind, physical, targets, decoys):
+    """The repeated readonly label a location mark selects instead of its control."""
+    if target in decoys:
+        return target
+    if target.startswith('E') or kind not in _AREAS:
+        return None
+    x,y,w,h = box = _bounds(physical)
+    # A region may legitimately contain both the repeated label and its control.
+    if any(interactive(row) and x <= row.bounds[0] and y <= row.bounds[1]
+           and row.bounds[0]+row.bounds[2] <= x+w and row.bounds[1]+row.bounds[3] <= y+h
+           for row in targets.values()):
+        return None
+    return next((ident for ident in decoys if _iou(box, targets[ident].bounds) >= .25
+                 and _inside(x+w/2, y+h/2, targets[ident].bounds, 2)), None)
+
+
+def _click_request(prompt):
+    """Where to click/open/go, as opposed to where a displayed value is."""
+    return bool(re.search(r"\b(?:click|clicking|press|pressing|tap|buttons?|links?|menus?|open|access|launch)\b"
+                          r"|\b(?:go|switch) to\b", prompt, re.I))
+
+
+def _selects_readonly(kind, physical, targets):
+    """The readonly accessible label/value a location mark selects, when it selects no control."""
+    readonly = [row for row in targets.values()
+                if row.source == 'uia' and row.bounds is not None and not interactive(row)]
+    if kind == 'arrow':
+        tip = physical[-1]
+        if any(interactive(row) and _inside(*tip, row.bounds) for row in targets.values()):
+            return None
+        return next((row for row in readonly if _inside(*tip, row.bounds)), None)
+    if kind not in _AREAS:
+        return None
+    x,y,w,h = box = _bounds(physical)
+    # A region may legitimately contain a readonly heading and a real control.
+    if any(interactive(row) and x <= row.bounds[0] and y <= row.bounds[1]
+           and row.bounds[0]+row.bounds[2] <= x+w and row.bounds[1]+row.bounds[3] <= y+h
+           for row in targets.values()):
+        return None
+    return next((row for row in readonly if _iou(box, row.bounds) >= .25
+                 and _inside(x+w/2, y+h/2, row.bounds, 2)), None)
+
+
+def box_target(shot, box, caption=""):
+    """A physical box becomes an ordinary arriving-bone target."""
+    x,y,w,h = box
+    # A single anchor still needs a small area for later local re-verification.
+    if w < 8: x, w = x-(8-w)/2, 8
+    if h < 8: y, h = y-(8-h)/2, 8
+    mon = shot.monitor
+    return point.Target((x+w/2-mon["left"])/mon["width"], (y+h/2-mon["top"])/mon["height"],
+                        caption, "visual", 1.0, "", False, (x,y,w,h), mon)
+
+
+def _control_arrow(frame, box):
+    """A short indicator whose tip is the box center, never a model-guessed tip."""
+    x,y,w,h = box
     cx,cy=x+w/2,y+h/2
     t=frame.transform
     left,top=t.source_left+t.crop_left,t.source_top+t.crop_top
@@ -756,19 +893,6 @@ def _control_arrow(frame, candidate):
              for dx,dy in ((-1,-1),(1,-1),(-1,1),(1,1))]
     tail=max(choices,key=lambda p:math.hypot(p[0]-cx,p[1]-cy))
     return [image_point(frame,tail),image_point(frame,[cx,cy])]
-
-
-class ControlRoleError(ValueError):
-    def __init__(self, labels):
-        # Host-measured identities travel only inside this request. The logged
-        # error remains a fixed code, never a private label or provider text.
-        self.labels=frozenset(labels)
-        super().__init__("drawing selects a label instead of its control")
-
-
-class NavigationTargetError(ValueError):
-    def __init__(self):
-        super().__init__('drawing selects an unverified navigation destination')
 
 
 def navigation_only(prompt):
@@ -812,54 +936,32 @@ def named_navigation(prompt):
                for word in point.terms(prompt)[:48])
 
 
-def clickable_navigation(prompt):
-    """Locating a displayed value does not claim it is something to operate."""
-    return bool(re.search(
-        r"\b(?:click|clicking|press|pressing|tap|buttons?|links?|menus?|open|access|launch)\b"
-        r"|\b(?:go|switch) to\b|\b(?:start|create)\b.*\b(?:chat|conversation)\b",prompt,re.I))
+# A numbered row's name follows the LAST request verb, however the question opens:
+# "show me the kick steps...", "where should I click to select the kick step...".
+_REQUEST_VERB = re.compile(
+    r'\b(?:show|highlight|outline|circle|encircle|locate|find|point|select|click|press'
+    r'|tap|toggle|enable|where|is|are)\b(?:\s+(?:me|to|towards|at|on|where))*\s*(?:the\s+)?', re.I)
 
 
-def _grid_navigation_scores(mark, compiled, enclosure, validator, targets, prompt, agreement):
-    """Bind numbered navigation to the measured row, not a model's caption.
+def _row_contradicts(enclosure, targets, selection):
+    """A measured label beside this row names a different row than the request.
 
-    Calibration already proved cell geometry. This adds only the missing
-    identity agreement for numeric UIA children; all ordinary guards still run.
-    Ambiguous/multiple row clauses use the normal narration fallback.
+    A missing label proves nothing (FL Studio exposes none); only a visible
+    contradiction drops the cells.
     """
-    selection = step_selection(prompt)
-    if selection is None:
-        raise NavigationTargetError()
-    _, requested, _ = selection
-    caption = _row_name(mark['text'])
+    before, _, after = selection
+    lead = None
+    for lead in _REQUEST_VERB.finditer(before):
+        pass
+    suffix = re.match(r'^\s*(?:are\s+|is\s+)?(?:in|on|of|for)\s+(?:the\s+)?(.+?)[?.!]*\s*$', after, re.I)
+    named = _row_name(before[lead.end():] if lead else before) + (_row_name(suffix[1]) if suffix else ())
+    if all(word in point.STOP for word in named):
+        return False
     gx,gy,gw,gh = enclosure
-    bound_row = False
-    for row in targets.values():
-        if row.source != 'uia' or not row.visible or row.is_image or row.bounds is None:
-            continue
-        rx,ry,rw,rh = row.bounds
-        if (_requested_row(row.label, selection)
-                and (not caption or caption == _row_name(row.label))
-                and gx-200 <= rx+rw <= gx and gy <= ry+rh/2 <= gy+gh):
-            bound_row = True
-            break
-    if not bound_row:
-        raise NavigationTargetError()
-    if not set(mark['steps']) <= requested:
-        raise NavigationTargetError()
-    scores = dict(agreement)
-    cells = [value for value in compiled if value['kind'] == 'highlight']
-    for index, cell in zip(mark['steps'], cells):
-        corners = validator.scene([cell])['marks'][0]['points']
-        xs,ys = zip(*corners)
-        left,top,right,bottom = min(xs),min(ys),max(xs),max(ys)
-        for ident,row in targets.items():
-            if row.source != 'uia' or not row.visible or row.is_image or row.bounds is None:
-                continue
-            rx,ry,rw,rh = row.bounds
-            if (row.label.strip() == str(index) and left-2 <= rx and top-2 <= ry
-                    and rx+rw <= right+2 and ry+rh <= bottom+2):
-                scores[ident] = 1.0
-    return scores
+    beside = [row for row in targets.values() if row.source == 'uia' and row.bounds is not None
+              and row.visible and _row_name(row.label)
+              and gx-200 <= row.bounds[0]+row.bounds[2] <= gx and gy <= row.bounds[1]+row.bounds[3]/2 <= gy+gh]
+    return bool(beside) and not any(_requested_row(row.label, selection) for row in beside)
 
 
 def measured_step_plan(prompt, shot, targets, *, page_bounds=None, dynamic_regions=()):
@@ -872,12 +974,11 @@ def measured_step_plan(prompt, shot, targets, *, page_bounds=None, dynamic_regio
     if selection is None or not navigation_only(prompt) or pointer_only(prompt):
         return None
     before, _, after = selection
-    lead = re.match(
-        r'^\s*(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?'
-        r'(?:show(?:\s+me)?(?:\s+where)?|highlight|outline|circle|encircle|locate|find'
-        r'|point(?:\s+me)?\s+(?:to|towards|at)|where(?:\s+are|\s+is)?)\s+(?:the\s+)?',
-        before, re.I)
-    if lead is None:
+    lead = None
+    for lead in _REQUEST_VERB.finditer(before):
+        pass
+    # "What are kick steps 1 and 5?" asks for meaning: the planner explains it.
+    if lead is None or re.search(r"\b(?:what|why|how)\b", before[:lead.start()], re.I):
         return None
     # Mixed requests and questions about a cell's meaning still need narration
     # from the planner; the local path must not drop another requested target.
@@ -930,104 +1031,11 @@ def measured_step_plan(prompt, shot, targets, *, page_bounds=None, dynamic_regio
                        page_bounds=page_bounds,prompt=prompt,dynamic_regions=dynamic_regions)
         except ValueError:
             continue
+        # Local proof must be complete: a partly dropped grid is not a measured answer.
+        if plan.status != 'ready' or plan.dropped:
+            continue
         proven[(left,top,right,bottom)] = plan
     return next(iter(proven.values())) if len(proven)==1 else None
-
-
-def _navigation_guard(target, kind, physical, targets, prompt, agreement=None):
-    if not navigation_only(prompt) or kind == 'label':
-        return
-    candidate=targets.get(target)
-    agreement=agreement if agreement is not None else navigation_evidence(targets,prompt)
-    requires_identity=named_navigation(prompt)
-    requires_click=clickable_navigation(prompt)
-    if candidate is not None:
-        # Readonly UIA proves this is a label/image rather than an enabled
-        # control. OCR alone cannot prove either role, so it remains visual evidence.
-        if candidate.source == 'uia' and not interactive(candidate) and requires_click:
-            raise NavigationTargetError()
-        # An explicit destination cannot be proved by relabelling an unrelated
-        # measured object. Generic unnamed/spatial/icon guidance remains visual;
-        # this is an identity guard, not a model semantic classifier.
-        if agreement[target] == 0 and requires_identity:
-            raise NavigationTargetError()
-        return
-    if kind not in ('rectangle','highlight','ellipse','arrow'):
-        return
-    xs,ys=zip(*physical)
-    x,y,w,h=min(xs),min(ys),max(xs)-min(xs),max(ys)-min(ys)
-    for ident,row in targets.items():
-        unrelated=(interactive(row) and requires_identity and agreement[ident] == 0)
-        if row.source != 'uia' or (interactive(row) and not unrelated) or row.bounds is None:
-            continue
-        if not interactive(row) and not requires_click and agreement[ident] > 0:
-            # A visible Usage value or another readonly named location may be
-            # shown. It is not click evidence for opening a Usage destination.
-            continue
-        rx,ry,rw,rh=row.bounds
-        if kind == 'arrow':
-            selects=rx <= physical[-1][0] <= rx+rw and ry <= physical[-1][1] <= ry+rh
-        else:
-            shared=max(0,min(x+w,rx+rw)-max(x,rx))*max(0,min(y+h,ry+rh)-max(y,ry))
-            selects=(shared/max(1,w*h+rw*rh-shared) >= .25
-                     and rx-2 <= x+w/2 <= rx+rw+2 and ry-2 <= y+h/2 <= ry+rh+2)
-        if not selects:
-            continue
-        if kind == 'arrow' and not unrelated and any((interactive(control)
-                or (not requires_click and agreement[key] > 0))
-                and control.bounds[0] <= physical[-1][0] <= control.bounds[0]+control.bounds[2]
-                and control.bounds[1] <= physical[-1][1] <= control.bounds[1]+control.bounds[3]
-                for key,control in targets.items()):
-            # A tip over a real child button or a directly named readonly value
-            # selects that child, not its overlapping readonly parent panel.
-            continue
-        # A larger navigation region can legitimately contain a heading and
-        # a real button. Reject only selection of the readonly object itself.
-        if kind != 'arrow' and any(interactive(control) and (not unrelated or agreement[key] > 0)
-                and x <= control.bounds[0]
-                and y <= control.bounds[1] and control.bounds[0]+control.bounds[2] <= x+w
-                and control.bounds[1]+control.bounds[3] <= y+h for key,control in targets.items()):
-            continue
-        raise NavigationTargetError()
-
-
-def _role_guard(target, kind, physical, targets, prompt):
-    if not control_guidance(prompt):
-        return
-    decoys = {ident:point.squash(group["label"]) for group in duplicate_labels(targets)
-              for ident in group["noninteractive"]}
-    if target in decoys:
-        raise ControlRoleError([decoys[target]])
-    # Visual/anonymous geometry cannot evade an independently measured role
-    # conflict by enclosing the same repeated heading without selecting its E ID.
-    if not target.startswith("E") and kind in ("rectangle", "highlight", "ellipse"):
-        xs,ys=zip(*physical)
-        bounds=(min(xs),min(ys),max(xs)-min(xs),max(ys)-min(ys))
-        x,y,w,h=bounds
-        for ident in decoys:
-            dx,dy,dw,dh=targets[ident].bounds
-            shared=max(0,min(x+w,dx+dw)-max(x,dx))*max(0,min(y+h,dy+dh)-max(y,dy))
-            union=max(1,w*h+dw*dh-shared)
-            if not (shared/union >= .25 and dx-2 <= x+w/2 <= dx+dw+2
-                    and dy-2 <= y+h/2 <= dy+dh+2):
-                continue
-            # A panel/region can legitimately contain both the repeated label
-            # and the control. It is not a box selecting only the wrong heading.
-            if any(interactive(row) and x <= row.bounds[0]
-                   and y <= row.bounds[1] and row.bounds[0]+row.bounds[2] <= x+w
-                   and row.bounds[1]+row.bounds[3] <= y+h for row in targets.values()):
-                continue
-            raise ControlRoleError([decoys[ident]])
-
-
-def verified_control(plan, beat=None):
-    """One independently agreed UIA control; never rejected visual coordinates."""
-    rows = beat.verified_controls if beat is not None else plan.verified_controls
-    selected = []
-    for row in rows:
-        if interactive(row) and not any(point._same_place(row,prior) for prior in selected):
-            selected.append(row)
-    return selected[0] if len(selected) == 1 else None
 
 
 def _plan_json(raw):
@@ -1051,156 +1059,294 @@ def _plan_json(raw):
     return value
 
 
+class PlanStream:
+    """Read a plan while it streams: the root `status` once written, and every
+    COMPLETE beat object so far.
+
+    feed() takes the text so far and scans only what is new, string- and
+    escape-aware and independent of key order. It never parses a partial value
+    and never raises; a stream that restarts (shrinks) is marked broken.
+    """
+
+    def __init__(self):
+        self.pos = self.depth = 0
+        self.in_string = self.escape = self.in_beats = self.broken = False
+        self.string_start = 0
+        self.key = self.awaiting = self.status = self.beat_start = None
+        self.beats: list[str] = []
+
+    def feed(self, text):
+        if self.broken or len(text) < self.pos:
+            self.broken = True
+            return
+        for i in range(self.pos, len(text)):
+            ch = text[i]
+            if self.in_string:
+                if self.escape:
+                    self.escape = False
+                elif ch == "\\":
+                    self.escape = True
+                elif ch == '"':
+                    self.in_string = False
+                    if self.depth == 1:
+                        value = text[self.string_start + 1:i]
+                        if self.awaiting is None:
+                            self.key = value
+                        else:
+                            if self.awaiting == "status":
+                                self.status = value
+                            self.awaiting = None
+                continue
+            if ch == '"':
+                self.in_string, self.string_start = True, i
+            elif ch == ":" and self.depth == 1:
+                self.awaiting = self.key
+            elif ch == "," and self.depth == 1:
+                self.awaiting = None
+            elif ch in "{[":
+                if self.depth == 1 and ch == "[" and self.awaiting == "beats":
+                    self.in_beats = True
+                elif self.in_beats and self.depth == 2 and ch == "{":
+                    self.beat_start = i
+                if self.depth == 1:
+                    self.awaiting = None
+                self.depth += 1
+            elif ch in "}]":
+                self.depth -= 1
+                if self.in_beats and self.depth == 2 and ch == "}" and self.beat_start is not None:
+                    self.beats.append(text[self.beat_start:i + 1])
+                    self.beat_start = None
+                elif self.in_beats and self.depth == 1 and ch == "]":
+                    self.in_beats = False
+        self.pos = len(text)
+
+
+MAX_NEW_MARKS = 8  # host tolerance per beat; the prompt still asks for at most four
+_CONSTRUCTIONS = ('square_on_edge', 'triangle_squares', 'grid_cells')
+
+
+def _point_values(raw):
+    if not isinstance(raw, list) or len(raw) > 16:
+        raise ValueError("invalid drawing points")
+    points = []
+    for p in raw:
+        keys(p, ["x", "y"])
+        points.append([drawing.number(p["x"]), drawing.number(p["y"])])
+    return points
+
+
+def _tolerate(kind, points):
+    """Repair unambiguous point-count and corner-order slips instead of rejecting them."""
+    if kind == "label" and len(points) == 2:
+        return points[:1]
+    if kind in _AREAS and len(points) >= 2:
+        xs, ys = zip(*points)
+        return [[min(xs), min(ys)], [max(xs), max(ys)]]
+    return points
+
+
 def parse(raw, shot, targets, *, page_bounds=None, prompt="", dynamic_regions=()):
+    """Validate a plan mark by mark: snap, repair or drop marks, never the answer.
+
+    A plan with no drawable mark points the bone at each beat's best location;
+    only a plan without any location becomes words. Malformed JSON, fields or
+    narration still fail the whole plan.
+    """
     prompt = step_prompt(prompt)
     value = _plan_json(raw)
     status = value["status"]
-    message = text(value["message"], MAX_NARRATION if status == "plain" else 400, empty=True)
     region, incoming = value["region"], value["beats"]
     if not isinstance(region, list) or not isinstance(incoming, list):
         raise ValueError("invalid drawing arrays")
-    if status == "unavailable" and message and not region and not incoming:
-        return Plan(status, message, [], [], shot)
-    if status == "plain" and message and not region and not incoming:
-        return Plan(status, message, [], [], shot)
-    if status == "refine" and not message and not incoming and len(region) == 4:
-        l, t, r, b = map(drawing.number, region)
-        if 0 <= l < r <= 1000 and 0 <= t < b <= 1000 and min(r-l, b-t) >= 40:
-            return Plan(status, "", [l,t,r,b], [], shot)
+    if status in ("plain", "unavailable") and value["message"]:
+        return Plan(status, text(value["message"], MAX_NARRATION if status == "plain" else 400), [], [], shot)
+    if status == "refine" and not incoming:
+        if len(region) == 4:
+            l, t, r, b = map(drawing.number, region)
+            if 0 <= l < r <= 1000 and 0 <= t < b <= 1000 and min(r-l, b-t) >= 40:
+                return Plan(status, "", [l,t,r,b], [], shot)
         raise ValueError("invalid closer-look region")
-    if status not in ("ready", "point") or message or region or not 1 <= len(incoming) <= MAX_BEATS:
+    if not incoming:
         raise ValueError("invalid drawing status")
-    if status == "point" and len(incoming) != 1:
-        raise ValueError("invalid pointing plan")
-    active, observed_active, beats, identities, verified = [], [], [], {}, []
-    has_marks = False
-    narration = 0
     # Validate old captured geometry even after the model has taken >12 seconds;
     # playback MUST renew this identity only after a clean source comparison.
     validator = replace(shot.frame, captured=time.monotonic())
-    navigation_scores=navigation_evidence(targets,prompt) if navigation_only(prompt) else {}
-    for beat in incoming:
+    wx,wy,ww,wh = shot.window
+    # Snapping serves "where is / where do I click" requests only. Explanations
+    # keep the region the model chose (a diagram part, not its linked figure).
+    guidance = control_guidance(prompt)
+    decoys = _decoys(targets) if guidance else {}
+    # "Where do I click" must land on something clickable, never a readonly label.
+    click = navigation_only(prompt) and _click_request(prompt)
+    selection = step_selection(prompt)
+    identities = {}
+
+    def resolve(mark):
+        """Compiled marks, regions to keep observing and a bone location; raises to drop."""
+        construction = _mark_fields(mark)
+        kind = mark["kind"]
+        target = text(mark["target"], 12, empty=True)
+        # Some compatibility models populate a shape's descriptive text.
+        # Validate its bounds, then discard it: only label marks render text.
+        label = text(mark["text"], drawing.MAX_LABEL, empty=kind != "label")
+        try:
+            points = _tolerate(kind, _point_values(mark["points"]))
+        except ValueError:
+            if not target.startswith("E"):
+                raise
+            points = []          # the measured ID alone locates an E mark
+        candidate = None
+        if target.startswith("E"):
+            candidate, box = _measured(target, kind, points, validator, targets, ww*wh)
+            if candidate is None:
+                target = ""      # an unsuitable E use is still visible geometry
+            else:
+                points = _box_points(validator, kind, box)
+        elif target and not re.fullmatch(r"V[1-9][0-9]{0,2}", target):
+            target = ""
+        if kind == "arrow" and len(points) == 1:
+            points = _control_arrow(validator, (*validator.transform.point(points[0]), 0, 0))
+        cleaned = dict(kind=kind, points=points, color=mark["color"])
+        if kind == "label":
+            cleaned["text"] = label
+        observed, identity = [], None
+        if construction:
+            if kind == "grid_cells" and selection and not set(mark["steps"]) <= selection[1]:
+                raise ValueError("grid steps differ from the request")
+            compiled, enclosure, identity = _construct(mark, points, label, shot, validator,
+                                                       targets, page_bounds, dynamic_regions)
+            if kind == "grid_cells" and selection and _row_contradicts(enclosure, targets, selection):
+                raise ValueError("grid row label contradicts the request")
+            observed.append(enclosure)
+            if kind == "grid_cells":
+                gx,gy,gw,gh = enclosure
+                # A row can be renamed/reordered while its repeated cells
+                # still look identical. Watch independently measured nearby
+                # row labels/controls too, when that evidence is available.
+                observed += [tuple(row.bounds) for row in targets.values()
+                             if row.bounds is not None and row.visible
+                             and gx-200 <= row.bounds[0]+row.bounds[2] <= gx
+                             and gy <= row.bounds[1]+row.bounds[3]/2 <= gy+gh]
+        else:
+            if kind != "label":
+                physical = validator.scene([cleaned])["marks"][0]["points"]
+                control = None
+                decoy = _decoy(target, kind, physical, targets, decoys) if decoys else None
+                if decoy is not None:
+                    # A repeated heading is not the control it names: use the control.
+                    control = decoys[decoy]
+                    if control is None:
+                        raise ValueError("drawing selects a label instead of its control")
+                elif guidance and (candidate is None or not interactive(candidate)):
+                    control = _snap(kind, physical, targets)
+                if control is not None and control is not candidate:
+                    candidate = control
+                    cleaned = dict(cleaned, points=_box_points(validator, kind, tuple(control.bounds)))
+                    perf.visual_recorder()("mark_snapped", kind)
+                elif click and (candidate is None or not interactive(candidate)) and _selects_readonly(
+                        kind, validator.scene([cleaned])["marks"][0]["points"], targets) is not None:
+                    raise ValueError("drawing selects a label instead of its control")
+            compiled = [cleaned]
+        for item in compiled:
+            physical = validator.scene([item])["marks"][0]["points"]
+            _nondegenerate(item["kind"], physical)
+            if any(not wx <= x <= wx+ww or not wy <= y <= wy+wh for x,y in physical):
+                raise ValueError("drawing outside source window")
+            if page_bounds is not None:
+                px,py,pw,ph = page_bounds
+                xs,ys = zip(*physical)
+                if max(xs)<px or min(xs)>px+pw or max(ys)<py or min(ys)>py+ph:
+                    raise ValueError("drawing outside page content")
+        if target.startswith("V"):
+            # The same object may have a label/outline, but cannot jump to a
+            # disjoint region in another beat under a reused ID.
+            xs,ys = zip(*(identity or physical))
+            bounds = (min(xs)-40,min(ys)-40,max(xs)+40,max(ys)+40)
+            prior = identities.get(target)
+            if prior and (bounds[0]>prior[2] or prior[0]>bounds[2] or bounds[1]>prior[3] or prior[1]>bounds[3]):
+                raise ValueError("diagram object changed identity")
+            identities.setdefault(target, bounds)
+        if candidate is not None and kind == "arrow":
+            # The visible shaft is smaller than the measured object. Freshness
+            # observes the whole object, including while the arrow is retained.
+            observed.append(tuple(candidate.bounds))
+        place = None
+        if not construction and kind != "label":
+            place = candidate if candidate is not None else box_target(
+                shot, (*physical[-1], 0, 0) if kind == "arrow" else _bounds(physical))
+        return compiled, observed, place
+
+    def location(mark):
+        """Where a mark the host could not draw can still point the bone, if anywhere."""
+        try:
+            if mark["kind"] in _CONSTRUCTIONS or mark["kind"] == "label":
+                return None
+            row = targets.get(mark["target"])
+            if row is not None and row.bounds is not None:
+                return None if click and row.source == "uia" and not interactive(row) else row
+            physical = [validator.transform.point(p) for p in _point_values(mark["points"])]
+            x,y,w,h = box = (*physical[-1], 0, 0) if mark["kind"] == "arrow" else _bounds(physical)
+        except (KeyError, TypeError, ValueError):
+            return None
+        # A page question never points at browser furniture outside the page.
+        inside = _inside(x+w/2, y+h/2, page_bounds or shot.window)
+        return box_target(shot, box) if inside and _inside(x+w/2, y+h/2, shot.window) else None
+
+    active, observed_active, beats, dropped = [], [], [], []
+    narration = 0
+    for beat in incoming[:MAX_BEATS]:
         keys(beat, ["say", "operation", "marks"])
         say = text(beat["say"], MAX_TEXT)
         narration += len(say) + bool(beats)
         if narration > MAX_NARRATION:
-            raise ValueError("drawing narration budget exhausted")
-        operation, marks = beat["operation"], beat["marks"]
-        if operation not in ("replace", "retain", "clear") or not isinstance(marks, list) or len(marks) > 4:
-            raise ValueError("invalid drawing beat")
-        if operation == "clear" and marks: raise ValueError("clear has marks")
+            # Stop at the budget rather than reject the plan: with a streamed
+            # plan the earlier beats may already be on screen and speaking.
+            dropped.append("narration_budget")
+            break
+        marks = beat["marks"] if isinstance(beat["marks"], list) else []
+        operation = beat["operation"] if beat["operation"] in ("replace", "retain", "clear") else "retain"
+        if operation == "clear" and marks:
+            operation = "replace"
         old = list(active) if operation == "retain" else []
-        observed = list(observed_active) if operation == 'retain' else []
-        resolved, beat_controls = [], []
+        observed = list(observed_active) if operation == "retain" else []
+        resolved, drawn, fallback = [], None, None
         for mark in marks:
-            construction = _mark_fields(mark)
-            kind = mark["kind"]
-            target = text(mark["target"], 12, empty=True)
-            label = text(mark["text"], drawing.MAX_LABEL, empty=kind != "label")
-            # Some compatibility models populate a shape's descriptive text.
-            # Validate its bounds, then discard it: only label marks render text.
-            incoming_points = mark["points"]
-            if not isinstance(incoming_points, list) or len(incoming_points) > 16:
-                raise ValueError("invalid drawing points")
-            points = []
-            for p in incoming_points:
-                keys(p, ["x", "y"])
-                points.append([drawing.number(p["x"]), drawing.number(p["y"])])
-            candidate = None
-            if target.startswith("E"):
-                candidate,points = _measured_points(target,kind,points,validator,targets)
-            elif target and not re.fullmatch(r"V[1-9][0-9]{0,2}", target):
-                raise ValueError("invalid diagram object ID")
-            cleaned = dict(kind=kind, points=points, color=mark["color"])
-            if kind == "label": cleaned["text"] = label
-            if construction:
-                compiled, enclosure, identity_points = _construct(mark,points,label,shot,validator,
-                    targets,page_bounds,dynamic_regions)
-                if enclosure not in observed:
-                    observed.append(enclosure)
-                if kind == 'grid_cells':
-                    gx,gy,gw,gh = enclosure
-                    # A row can be renamed/reordered while its repeated cells
-                    # still look identical. Watch independently measured nearby
-                    # row labels/controls too, when that evidence is available.
-                    for row in targets.values():
-                        if row.bounds is None or not row.visible:
-                            continue
-                        rx,ry,rw,rh = row.bounds
-                        if (gx-200 <= rx+rw <= gx and gy <= ry+rh/2 <= gy+gh
-                                and tuple(row.bounds) not in observed):
-                            observed.append(tuple(row.bounds))
-            else:
-                compiled = [cleaned]
-                identity_points = None
-            mark_navigation_scores = navigation_scores
-            if kind == 'grid_cells' and navigation_only(prompt):
-                mark_navigation_scores = _grid_navigation_scores(mark,compiled,enclosure,validator,
-                    targets,prompt,navigation_scores)
-            if len(resolved)+len(compiled) > 4:
-                raise ValueError('constructed drawing geometry exceeds its mark budget' if construction
-                                 else 'invalid drawing beat')
-            for cleaned in compiled:
-                physical = validator.scene([cleaned])["marks"][0]
-                _nondegenerate(cleaned['kind'], physical['points'])
-                wx,wy,ww,wh = shot.window
-                if any(not wx <= x <= wx+ww or not wy <= y <= wy+wh for x,y in physical["points"]):
-                    raise ValueError("drawing outside source window")
-                if page_bounds is not None:
-                    px,py,pw,ph = page_bounds
-                    xs,ys=zip(*physical['points'])
-                    if max(xs)<px or min(xs)>px+pw or max(ys)<py or min(ys)>py+ph:
-                        raise ValueError("drawing outside page content")
-                _role_guard(target,cleaned['kind'],physical["points"],targets,prompt)
-                _navigation_guard(target,cleaned['kind'],physical["points"],targets,prompt,mark_navigation_scores)
-                resolved.append(cleaned)
-            if candidate is not None and control_guidance(prompt) and interactive(candidate):
-                beat_controls.append(candidate)
-                verified.append(candidate)
-            if candidate is not None and kind == 'arrow' and tuple(candidate.bounds) not in observed:
-                # The visible arrow shaft is smaller than the independently
-                # verified object. Freshness must observe that complete object,
-                # including while this arrow is retained through later beats.
-                observed.append(tuple(candidate.bounds))
-            if target.startswith("V"):
-                # The same object may have a label/outline, but cannot jump to a
-                # disjoint region in another beat under a reused ID.
-                xs,ys=zip(*(identity_points or physical["points"]))
-                bounds=(min(xs)-40,min(ys)-40,max(xs)+40,max(ys)+40)
-                prior=identities.get(target)
-                if prior and (bounds[0]>prior[2] or prior[0]>bounds[2] or bounds[1]>prior[3] or prior[1]>bounds[3]):
-                    raise ValueError("diagram object changed identity")
-                identities.setdefault(target,bounds)
+            try:
+                compiled, regions, place = resolve(mark)
+                if (len(resolved)+len(compiled) > MAX_NEW_MARKS
+                        or len(old)+len(resolved)+len(compiled) > drawing.MAX_MARKS):
+                    raise ValueError("drawing beat budget exhausted")
+            except ValueError as error:
+                reason = rejection_reason(error)
+                dropped.append(reason)
+                perf.visual_recorder()("mark_dropped", reason)
+                if fallback is None and reason != "control_role":
+                    fallback = location(mark)
+                continue
+            resolved += compiled
+            observed += [region for region in regions if region not in observed]
+            drawn = drawn or place
         active = old + resolved
         observed_active = observed
-        if active: validator.scene(active)
-        if status == "point" and (operation != "replace" or
-                sum(mark["kind"] in ("rectangle", "highlight", "ellipse") for mark in resolved) != 1 or
-                sum(mark["kind"] == "label" for mark in resolved) > 1 or
-                any(mark["kind"] not in ("rectangle", "highlight", "ellipse", "label") for mark in resolved)):
-            raise ValueError("invalid pointing plan")
-        has_marks |= bool(active)
-        beats.append(Beat(say, list(active), len(old), tuple(beat_controls), tuple(observed)))
-    if not has_marks: raise ValueError("drawing plan has no drawings")
-    return Plan(status, "", [], beats, shot, tuple(verified))
-
-
-def point_target(plan):
-    """The already-validated point box becomes an existing bone target, without ink."""
-    if plan.status != "point" or len(plan.beats) != 1:
-        raise ValueError("invalid pointing plan")
-    measured=verified_control(plan)
-    if measured is not None:
-        return measured
-    marks = plan.beats[0].marks
-    shape = next(mark for mark in marks if mark["kind"] != "label")
-    a,b = [plan.shot.frame.transform.point(p) for p in shape["points"]]
-    mon = plan.shot.monitor
-    caption = next((mark["text"] for mark in marks if mark["kind"] == "label"), "")
-    return point.Target(((a[0]+b[0])/2-mon["left"])/mon["width"],
-                        ((a[1]+b[1])/2-mon["top"])/mon["height"],
-                        caption, "visual", 1.0, "", False,
-                        (a[0],a[1],b[0]-a[0],b[1]-a[1]), mon)
+        if active:
+            validator.scene(active)
+        beats.append(Beat(say, list(active), len(old), drawn or fallback, tuple(observed)))
+    dropped = tuple(dropped)
+    if any(beat.marks for beat in beats):
+        return Plan("ready", "", [], beats, shot, dropped)
+    if any(beat.pointer for beat in beats):
+        return Plan("point", "", [], beats, shot, dropped)
+    message = " ".join(beat.say for beat in beats)
+    notice = ""
+    if "grid_calibration" in dropped:
+        notice = "I couldn't verify those numbered cells, so I'll explain without marking them. "
+    elif "construction_geometry" in dropped:
+        notice = "I couldn't fit that construction reliably, so I'll explain without drawing it. "
+    elif dropped and control_guidance(prompt):
+        notice = "I couldn't mark that on screen. "
+    if len(notice + message) > MAX_NARRATION:
+        notice = ""
+    return Plan("plain", notice + message, [], [], shot, dropped)
 
 
 def conversation_context(history, prompt):
@@ -1236,132 +1382,6 @@ def conversation_context(history, prompt):
     return list(reversed(rows))
 
 
-def spoken_fallback(raw, shot, dynamic_regions=(), *, targets=None, prompt="", page_bounds=None):
-    """Keep a validated explanation when only its drawing geometry is invalid.
-
-    Never repair with another paid call. A known moving image can receive one
-    host-owned enclosure; otherwise the same answer is delivered without ink.
-    Provider coordinates, code or fields are not executed or redisplayed.
-    """
-    value = _plan_json(raw)
-    if (value['status'] not in ('ready', 'point') or value['message'] or value['region']
-            or not isinstance(value['beats'], list) or not 1 <= len(value['beats']) <= MAX_BEATS):
-        raise ValueError('invalid drawing status')
-    sentences, controls = [], []
-    for beat in value['beats']:
-        keys(beat, ['say', 'operation', 'marks'])
-        if (beat['operation'] not in ('replace', 'retain', 'clear')
-                or not isinstance(beat['marks'], list) or len(beat['marks']) > 4):
-            raise ValueError('invalid drawing beat')
-        for mark in beat['marks']:
-            _mark_fields(mark)
-            if targets and control_guidance(prompt) and beat['operation'] != 'clear':
-                # Another malformed stroke cannot erase an independently valid
-                # E control. Validate this mark through the SAME agreement,
-                # source, role and scene guards; never salvage its rejected box.
-                single=dict(status='ready',message='',region=[],beats=[
-                    dict(say=beat['say'],operation='replace',marks=[mark])])
-                try:
-                    proof=parse(json.dumps(single),shot,targets,page_bounds=page_bounds,prompt=prompt)
-                except ValueError:
-                    continue
-                control=verified_control(proof)
-                if control is not None:
-                    controls.append(control)
-        sentences.append(text(beat['say'], MAX_TEXT))
-    message = text(' '.join(sentences), MAX_NARRATION)
-    fallback=Plan('plain',message,[],[],shot,tuple(controls))
-    control=verified_control(fallback)
-    if control is not None:
-        x,y,w,h=control.bounds
-        enclosure=dict(kind='highlight',color='mint',points=[
-            image_point(shot.frame,[x,y]),image_point(shot.frame,[x+w,y+h])])
-        replace(shot.frame,captured=time.monotonic()).scene([enclosure])
-        # Full narration survives. This host-built point uses measured bounds;
-        # it never uses the geometry of the stroke that failed validation.
-        return replace(fallback,status='point',message='',
-                       beats=[Beat(message,[enclosure],0,(control,))])
-    regions = dynamic_boxes(shot, dynamic_regions)
-    if len(regions) == 1:
-        x,y,w,h = regions[0]
-        enclosure = dict(kind='highlight',color='mint',points=[
-            image_point(shot.frame,[x,y]),image_point(shot.frame,[x+w,y+h])])
-        replace(shot.frame,captured=time.monotonic()).scene([enclosure])
-        return Plan('ready','',[],[Beat(say,[enclosure],int(i > 0)) for i,say in enumerate(sentences)],shot)
-    return fallback
-
-
-def control_role_fallback(error, raw, shot, targets, prompt, *, page_bounds=None):
-    """A repeated heading is corrected only by strong independent control evidence."""
-    # Validate the entire prose/field contract, but never repeat the mistaken
-    # heading's location or claim that it is a button.
-    spoken_fallback(raw,shot)
-    clarification=Plan('unavailable',
-        "That label appears both on a control and in the page content. Tell me which area you mean.",
-        [],[],shot)
-    if (not isinstance(error,ControlRoleError) or len(error.labels) != 1 or
-            re.search(r"\b(?:explain|why|understand|describe|compare)\b|\bwalk me through\b"
-                      r"|\bwhat (?:does|do|is|are)\b|\bhow\b.*\b(?:work|use)\b",prompt,re.I)):
-        return clarification
-    controls=[row for row in targets.values() if interactive(row)]
-    selected=point.confident_match(controls)
-    if selected is None or point.squash(selected.label) not in error.labels:
-        return clarification
-    x,y,w,h=selected.bounds
-    enclosure=dict(kind='highlight',color='mint',points=[
-        image_point(shot.frame,[x,y]),image_point(shot.frame,[x+w,y+h])])
-    replace(shot.frame,captured=time.monotonic()).scene([enclosure])
-    if page_bounds is not None:
-        px,py,pw,ph=page_bounds
-        if not (px <= x < x+w <= px+pw and py <= y < y+h <= py+ph):
-            return clarification
-    say=locator.pointer_reply(selected)
-    return Plan('ready','',[],[Beat(say,[enclosure],0,(selected,))],shot,(selected,))
-
-
-def navigation_fallback(raw, shot, targets, prompt, *, page_bounds=None):
-    """Keep proven visible steps without repeating a guessed hidden destination."""
-    value=_plan_json(raw)
-    # A navigation identity error is not permission to salvage malformed JSON,
-    # invalid geometry or unfinished narration. Validate all of those first.
-    parse(raw,shot,targets,page_bounds=page_bounds)
-    kept=[]
-    seen=set()
-    agreement=navigation_evidence(targets,prompt)
-    for beat in value['beats']:
-        for mark in beat['marks']:
-            candidate=targets.get(mark['target'])
-            if (mark['kind']=='label' or candidate is None or mark['target'] in seen
-                    or (named_navigation(prompt) and agreement[mark['target']] <= 0)
-                    or (clickable_navigation(prompt) and not interactive(candidate))):
-                continue
-            isolated=dict(status='ready',message='',region=[],beats=[
-                dict(say=beat['say'],operation='replace',marks=[mark])])
-            try:
-                parse(json.dumps(isolated),shot,targets,page_bounds=page_bounds,prompt=prompt)
-            except ValueError:
-                continue
-            # This whole plan already failed destination validation. Its prose
-            # may be answering a previous task, even around an otherwise valid
-            # mark. Keep only independently measured requested locations and
-            # describe those with their known labels; never salvage an unrelated
-            # V diagram or a no-ink continuation as navigation guidance.
-            seen.add(mark['target'])
-            kept.append(dict(say=locator.pointer_reply(candidate),operation='retain' if kept else 'replace',marks=[mark]))
-    message="I can't see a verified control for the other requested destination on this screen. Show me the relevant menu or page so I can locate it."
-    if not kept:
-        return Plan('unavailable',"I can't verify that destination from the visible controls on this screen. Show me the relevant menu or page so I can locate it.",[],[],shot)
-    kept.append(dict(say=message,operation='retain',marks=[]))
-    if len(kept) > MAX_BEATS:
-        kept=kept[:MAX_BEATS-1]+kept[-1:]
-    while sum(len(row['say']) for row in kept)+len(kept)-1 > MAX_NARRATION:
-        del kept[-2]
-    # Operations and their retained marks are rebuilt from the safe subset.
-    # Rejected marks cannot survive implicitly through an old retain beat.
-    safe=dict(status='ready',message='',region=[],beats=kept)
-    return parse(json.dumps(safe),shot,targets,page_bounds=page_bounds,prompt=prompt)
-
-
 def dynamic_boxes(shot, regions):
     """Only bounded, host-observed physical image containers, clipped to this crop."""
     result = []
@@ -1386,64 +1406,116 @@ def dynamic_boxes(shot, regions):
     return result
 
 
-def stabilize(plan, dynamic_regions):
-    """An observed animation gets a stable container selection, never moving-edge ink.
+def _mostly_inside(points, region):
+    """At least half the mark's box is inside the region (a point: within 2 px)."""
+    x, y, w, h = region
+    xs, ys = [a for a, _ in points], [b for _, b in points]
+    left, top, right, bottom = min(xs), min(ys), max(xs), max(ys)
+    area = (right - left) * (bottom - top)
+    if area <= 0:
+        return all(x - 2 <= a <= x + w + 2 and y - 2 <= b <= y + h + 2 for a, b in points)
+    overlap = max(0, min(right, x + w) - max(left, x)) * max(0, min(bottom, y + h) - max(top, y))
+    return overlap >= area * .5
 
-    This also works when local animation evidence arrives during the model call.
-    Static geometry outside those host-observed containers stays unchanged.
-    """
-    regions = dynamic_boxes(plan.shot, dynamic_regions)
-    if not regions or not plan.beats:
+
+def _widened(shot, mark, regions):
+    """A mark inside a moving region becomes its highlight; returns (mark, key or None)."""
+    physical = [shot.frame.transform.point(p) for p in mark["points"]]
+    index = next((i for i, region in enumerate(regions) if _mostly_inside(physical, region)), None)
+    if index is None:
+        return mark, None
+    x, y, w, h = regions[index]
+    if mark["kind"] == "label":
+        return dict(mark, points=[image_point(shot.frame, [x, y])]), ("label", index, mark["text"])
+    # One colour, so the same area stays put across sentences.
+    return dict(kind="highlight", color="mint", points=[
+        image_point(shot.frame, [x, y]), image_point(shot.frame, [x + w, y + h])]), ("region", index)
+
+
+def widen(shot, marks, dynamic_regions, reveal_from=0, shown=()):
+    """Marks inside moving regions become one highlight each; one already
+    `shown` is carried, not redrawn. Returns (marks, reveal_from, regions)."""
+    regions = dynamic_boxes(shot, dynamic_regions)
+    carried, new, seen = [], [], []
+    for index, mark in enumerate(marks):
+        adjusted, key = _widened(shot, mark, regions)
+        if key is not None:
+            if key in seen:
+                continue
+            seen.append(key)
+        again = key is not None and key[0] == "region" and any(_iou(regions[key[1]], box) >= .8 for box in shown)
+        (carried if index < reveal_from or again else new).append(adjusted)
+    return carried + new, len(carried), [regions[key[1]] for key in seen if key[0] == "region"]
+
+
+def outside(regions, dynamic_regions):
+    """Watched boxes not inside a moving area; that area is watched whole."""
+    return tuple(r for r in regions if not any(
+        _mostly_inside([(r[0], r[1]), (r[0] + r[2], r[1] + r[3])], area) for area in dynamic_regions))
+
+
+def stabilize(plan, dynamic_regions):
+    """Marks on content that moves by itself become one whole-area highlight."""
+    if not dynamic_boxes(plan.shot, dynamic_regions) or not plan.beats:
         return plan
-    beats = []
+    beats, shown, previous = [], [], []
     for beat in plan.beats:
-        marks, seen, old_count = [], set(), 0
-        for index, mark in enumerate(beat.marks):
-            physical = [plan.shot.frame.transform.point(p) for p in mark["points"]]
-            region_index = next((i for i,(x,y,w,h) in enumerate(regions)
-                if all(x-2 <= a <= x+w+2 and y-2 <= b <= y+h+2 for a,b in physical)), None)
-            adjusted = mark
-            if region_index is not None:
-                x,y,w,h = regions[region_index]
-                if mark["kind"] == "label":
-                    adjusted = dict(mark, points=[image_point(plan.shot.frame,[x,y])])
-                    key = ("label", region_index, mark["text"])
-                else:
-                    adjusted = dict(kind="highlight", color=mark["color"], points=[
-                        image_point(plan.shot.frame,[x,y]),image_point(plan.shot.frame,[x+w,y+h])])
-                    key = ("region", region_index)
-                if key in seen:
-                    continue
-                seen.add(key)
-            marks.append(adjusted)
-            if index < beat.reveal_from:
-                old_count += 1
+        marks, reveal_from, regions = widen(plan.shot, beat.marks, dynamic_regions, beat.reveal_from, shown)
+        if reveal_from == len(marks) and any(mark not in marks for mark in previous):
+            # Nothing new to draw, but an earlier mark must go: redraw.
+            marks, reveal_from, regions = widen(plan.shot, beat.marks, dynamic_regions, beat.reveal_from)
+        shown, previous = regions, marks
         # The adapted scene is still subject to every ordinary geometry/budget guard.
         if marks:
             replace(plan.shot.frame,captured=time.monotonic()).scene(marks)
-        beats.append(Beat(beat.say, marks, old_count, beat.verified_controls, beat.observed_regions))
+        beats.append(replace(beat, marks=marks, reveal_from=reveal_from))
     return replace(plan, beats=beats)
 
 
-def crop(shot, region):
+# Claude reads images at up to 1568 px and OpenAI/Gemini downscale large
+# screenshots too; a bigger upload only arrives later. Measured on saved
+# screens with Gemini flash-lite: same marked regions, first token sooner.
+PLAN_EDGE = 1568
+
+
+def planner_system(cfg, precise=False):
+    """The planner's system string. Agent mode composes it exactly as warm-up
+    does, or the prepared worker's signature never matches the request."""
+    template = "{persona}\n\n" + SYSTEM + (PRECISION_SYSTEM if precise else "")
+    if cfg["llm"]["mode"] == "agent":
+        return agents._with_persona(template, cfg)
+    return template.replace("{persona}", llm.persona(cfg))
+
+
+# The ordinary drawing worker is prepared at hotkey press, like the locator's.
+agents.register_profile("drawing", "{persona}\n\n" + SYSTEM, SCHEMA)
+
+
+def crop(shot, region, edge=capture.MAX_EDGE):
     t=shot.frame.transform
     a=t.point(region[:2]); b=t.point(region[2:])
     mon=shot.monitor
     l=max(0,math.floor(a[0]-mon["left"])); top=max(0,math.floor(a[1]-mon["top"]))
     r=min(mon["width"],math.ceil(b[0]-mon["left"])); bottom=min(mon["height"],math.ceil(b[1]-mon["top"]))
     if min(r-l,bottom-top)<48: raise ValueError("closer-look crop too small")
-    data,width,height=capture.encode(Image.fromarray(shot.pixels[top:bottom,l:r]), capture.MAX_EDGE)
+    data,width,height=capture.encode(Image.fromarray(shot.pixels[top:bottom,l:r]), edge)
     frame=replace(shot.frame, transform=drawing.Transform(mon["left"],mon["top"],l,top,r-l,bottom-top,
                   width,height,width/(r-l),height/(bottom-top)))
     return shot._replace(data=data,width=width,height=height,frame=frame)
 
 
-async def generate(prompt, shot, cfg, candidates, *, page_bounds=None, history=None, dynamic_regions=None):
-    """One planning call, at most one requested crop; never a repair loop."""
+async def generate(prompt, shot, cfg, candidates, *, page_bounds=None, history=None, dynamic_regions=None,
+                   on_plan=None):
+    """One planning call, at most one requested crop; never a repair loop.
+
+    `on_plan`, when given, receives each validated `ready` prefix of the plan
+    while it is still streaming, so its first beats can be shown and spoken
+    before the model has finished writing the rest.
+    """
     with perf.span("drawing_plan"):
         try:
             plan = await _generate(prompt, shot, cfg, candidates, page_bounds=page_bounds,
-                                   history=history, dynamic_regions=dynamic_regions)
+                                   history=history, dynamic_regions=dynamic_regions, on_plan=on_plan)
         except (ValueError, TimeoutError) as error:
             perf.mark("drawing_plan_rejected." + rejection_reason(error))
             raise
@@ -1451,7 +1523,44 @@ async def generate(prompt, shot, cfg, candidates, *, page_bounds=None, history=N
         return plan
 
 
-async def _generate(prompt, shot, cfg, candidates, *, page_bounds=None, history=None, dynamic_regions=None):
+def _streamed_plans(on_plan, shot, targets, page, prompt, dynamic_regions):
+    """An on_text hook handing on_plan each validated prefix of a streaming plan.
+
+    Every time another beat object completes, the closed beats are parsed by
+    the same per-mark `parse` the full plan uses (deterministic, so the full
+    plan's first beats match). Only a `ready` prefix is handed on; a refine,
+    plain or unavailable reply waits for the end as before. Failures here end
+    streaming quietly; the full reply is still parsed afterwards.
+    """
+    if on_plan is None:
+        return None
+    reader = PlanStream()
+
+    def on_text(text):
+        handed = len(reader.beats)
+        try:
+            reader.feed(text)
+            # Until status is read (a model may write it last) a beat could
+            # still belong to a refine/plain reply, so nothing is handed on.
+            if reader.broken or len(reader.beats) == handed or reader.status not in ("ready", "point"):
+                return
+            prefix = parse('{"status":"ready","message":"","region":[],"beats":[' + ",".join(reader.beats) + "]}",
+                           shot, targets, page_bounds=page, prompt=prompt, dynamic_regions=dynamic_regions)
+        except ValueError:
+            reader.broken = True
+            return
+        except Exception:
+            log.exception("streamed plan reader failed; waiting for the full plan")
+            reader.broken = True
+            return
+        if prefix.status == "ready":
+            on_plan(prefix)
+
+    return on_text
+
+
+async def _generate(prompt, shot, cfg, candidates, *, page_bounds=None, history=None, dynamic_regions=None,
+                    on_plan=None):
     context = conversation_context(history, prompt)
     prompt = step_prompt(prompt)
     # Upload only the foreground source window. Keep the full local fingerprint
@@ -1470,10 +1579,11 @@ async def _generate(prompt, shot, cfg, candidates, *, page_bounds=None, history=
     a=image_point(shot.frame,[max(wx,shot.monitor["left"]),max(wy,shot.monitor["top"])])
     b=image_point(shot.frame,[min(wx+ww,shot.monitor["left"]+shot.monitor["width"]),
                               min(wy+wh,shot.monitor["top"]+shot.monitor["height"])])
-    shot=await asyncio.to_thread(crop,shot,[*a,*b])
+    edge = PLAN_EDGE
+    shot=await asyncio.to_thread(crop,shot,[*a,*b],edge)
     precise = precision_requested(prompt)
     contract = PRECISION_SCHEMA if precise else SCHEMA
-    system = llm.persona(cfg) + "\n\n" + SYSTEM + (PRECISION_SYSTEM if precise else '')
+    system = planner_system(cfg, precise)
     for attempt in range(2):
         targets=evidence(shot,candidates,browser_ui=browser_ui,navigation=navigation_only(prompt),prompt=prompt)
         if attempt == 0:
@@ -1501,50 +1611,23 @@ async def _generate(prompt, shot, cfg, candidates, *, page_bounds=None, history=
                              duplicate_labels=duplicate_labels(targets),
                              navigation_evidence=navigation_evidence(targets,prompt) if navigation_only(prompt) else {},
                              contract=contract),ensure_ascii=False)
+        on_text = _streamed_plans(on_plan, shot, targets, page, prompt, dynamic_regions)
         with perf.purpose("drawing_refinement" if attempt else "drawing"):
             async with asyncio.timeout(TIMEOUT):
                 if cfg["llm"]["mode"] == "agent":
                     raw=await agents.complete_text(user,cfg,system,shot.data,schema=contract,
-                                                  purpose="drawing",max_chars=MAX_OUTPUT,timeout_seconds=TIMEOUT)
+                                                  purpose="drawing",max_chars=MAX_OUTPUT,timeout_seconds=TIMEOUT,
+                                                  on_text=on_text)
                 else:
                     raw=await llm.complete_text(user,cfg,system,shot.data,max_tokens=4096,
-                                               schema=contract,max_chars=MAX_OUTPUT)
-        try:
-            plan=parse(raw,shot,targets,page_bounds=page,prompt=prompt,dynamic_regions=dynamic_regions)
-            if plan.status == 'point' and not pointer_only(prompt):
-                # Presentation defaults are deterministic, not left to a model
-                # occasionally choosing the old bone-only single-target style.
-                plan=replace(plan,status='ready')
-        except ValueError as error:
-            perf.visual_recorder()("geometry_fallback", rejection_reason(error))
-            # Geometry failure must not throw away a useful answer. Syntax,
-            # unknown fields, text budgets and invalid statuses still fail.
-            if rejection_reason(error) not in {
-                    'vertex_count','points','image_bounds','monitor_bounds','window_bounds',
-                    'page_bounds','box_order','measured_target','measured_points',
-                    'measured_agreement','diagram_id','diagram_identity','clear_with_marks',
-                    'empty_plan','control_role','navigation_target','degenerate_geometry',
-                    'construction_geometry','grid_calibration'}:
-                raise
-            if isinstance(error,ControlRoleError):
-                plan=control_role_fallback(error,raw,shot,targets,prompt,page_bounds=page)
-                perf.mark('visual_control_role_corrected' if plan.status == 'ready' else 'visual_control_role_ambiguous')
-            elif isinstance(error,NavigationTargetError):
-                plan=navigation_fallback(raw,shot,targets,prompt,page_bounds=page)
-                perf.mark('visual_navigation_partial' if plan.status == 'ready' else 'visual_navigation_unverified')
-            else:
-                failed_construction = rejection_reason(error) in ('construction_geometry','grid_calibration')
-                plan=spoken_fallback(raw,shot,() if failed_construction else dynamic_regions,
-                                     targets=targets,prompt=prompt,page_bounds=page)
-                if failed_construction and plan.status == 'plain':
-                    notice = ("I couldn't verify those numbered cells, so I'll explain without marking them. "
-                              if rejection_reason(error) == 'grid_calibration' else
-                              "I couldn't fit that construction reliably, so I'll explain without drawing it. ")
-                    if len(notice+plan.message) <= MAX_NARRATION:
-                        plan=replace(plan,message=notice+plan.message)
-            perf.mark('visual_geometry_fallback')
+                                               schema=contract,max_chars=MAX_OUTPUT,on_text=on_text)
+        # Geometry problems are resolved mark by mark inside parse: snapped,
+        # repaired, dropped, or turned into pointing. Only malformed output raises.
+        plan=parse(raw,shot,targets,page_bounds=page,prompt=prompt,dynamic_regions=dynamic_regions)
+        if plan.dropped:
+            perf.mark('visual_marks_dropped')
         if plan.status != "refine": return stabilize(plan,dynamic_regions)
         if attempt: raise ValueError("closer-look budget exhausted")
-        shot=await asyncio.to_thread(crop,shot,plan.region)
+        shot=await asyncio.to_thread(crop,shot,plan.region,edge)
         perf.mark("drawing_crop_requested")
     raise ValueError("drawing budget exhausted")

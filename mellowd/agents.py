@@ -164,6 +164,9 @@ class AgentRequest:
     purpose: str
     timeout_seconds: float | None
     cold: Invocation | None = None
+    # Claude --json-schema turns stream the structured object as tool-input
+    # fragments; this sees the object-so-far. The final result stays authoritative.
+    on_partial: object = None
 
     @property
     def effort(self) -> str:
@@ -1170,6 +1173,7 @@ class _ClaudeWorker:
         accepted = finished = False
         input_sent = None
         first_event = first_text = None
+        partial, started_message = "", False
         deadline = started + request.timeout_seconds if request.timeout_seconds else None
         perf.mark(f"agent.{request.purpose}.worker_checkout")
         try:
@@ -1205,6 +1209,32 @@ class _ClaudeWorker:
                 if first_event is None:
                     first_event = time.perf_counter()
                     perf.mark(f"agent.{request.purpose}.first_event")
+                inner = (event.get("event") or {}) if event.get("type") == "stream_event" else {}
+                if inner.get("type") == "message_start" and not started_message:
+                    # The provider is answering: separates CLI overhead from model time.
+                    started_message = True
+                    perf.mark(f"agent.{request.purpose}.message_start")
+                elif (inner.get("type") == "content_block_start"
+                        and (inner.get("content_block") or {}).get("type") == "tool_use"):
+                    partial = ""   # a retried StructuredOutput call starts over
+                elif inner.get("type") == "content_block_delta":
+                    delta = inner.get("delta") or {}
+                    if delta.get("type") == "input_json_delta" and delta.get("partial_json"):
+                        if not partial:
+                            perf.mark(f"agent.{request.purpose}.first_json")
+                        partial += delta["partial_json"]
+                        if request.on_partial is not None:
+                            # The structured object so far. A consumer error must
+                            # never break the turn; the result stays authoritative.
+                            try:
+                                request.on_partial(partial)
+                            except Exception:
+                                log.exception("partial structured output consumer failed")
+                if event.get("type") == "result" and (event.get("num_turns") or 1) > 1:
+                    # The CLI re-prompted for a missing StructuredOutput call.
+                    perf.mark(f"agent.{request.purpose}.structured_retry")
+                    log.info("claude %s took %s turns (api %sms)", request.purpose,
+                             event.get("num_turns"), event.get("duration_api_ms"))
                 for chunk in _parse_family(line, state):
                     if chunk and first_text is None:
                         first_text = time.perf_counter()
@@ -1243,8 +1273,10 @@ class _ClaudeWorker:
             # A turn the consumer walked away from leaves its remaining events
             # queued, and the next turn would read them as its own. Only a turn
             # that reached its result event leaves the conversation reusable.
+            # Its cleanup must not delay the caller (a look-routed answer moves
+            # straight on to the drawing planner).
             if accepted and not finished and self.proc is not None:
-                await self.close()
+                self.abandon()
             perf.record_agent(
                 provider="claude",
                 purpose=request.purpose,
@@ -1261,16 +1293,31 @@ class _ClaudeWorker:
             )
 
     async def close(self) -> None:
-        await _terminate(self.proc)
+        proc, self.proc = self.proc, None
+        await self._release(proc)
+
+    def abandon(self) -> None:
+        """Kill now and finish cleanup in the background: nobody waits on it.
+
+        The process is gone from `alive` immediately, so a replacement is
+        prepared without the caller paying for the old one's exit and rmtree.
+        """
+        proc, self.proc = self.proc, None
+        if proc is not None and proc.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+        asyncio.create_task(self._release(proc))
+
+    async def _release(self, proc) -> None:
+        await _terminate(proc)
         for task in (self.err_task, self.output_task):
             if task is not None:
                 task.cancel()
                 with contextlib.suppress(Exception, asyncio.CancelledError):
                     await task
-        self.proc = None
         if self.directory is not None:
-            await asyncio.to_thread(shutil.rmtree, self.directory, ignore_errors=True)
-            self.directory = None
+            directory, self.directory = self.directory, None
+            await asyncio.to_thread(shutil.rmtree, directory, ignore_errors=True)
 
 
 class _CodexServer:
@@ -1636,6 +1683,8 @@ class AgentRuntimeManager:
         self.signature: tuple | None = None
         self.section: dict | None = None
         self.claude: dict[tuple, _ClaudeWorker] = {}
+        # Signatures prepared at warm-up; only these are respawned as spares.
+        self.profiles: set[tuple] = set()
         self.inflight: set[_ClaudeWorker] = set()
         self.codex: _CodexServer | None = None
         self.lock = asyncio.Lock()
@@ -1682,6 +1731,7 @@ class AgentRuntimeManager:
                         req = self._template_request(
                             purpose, _with_persona(system, cfg), schema
                         )
+                        self.profiles.add(req.signature)
                         worker = _ClaudeWorker(req)
                         await worker.start(req)
                         self.claude[req.signature] = worker
@@ -1774,7 +1824,16 @@ class AgentRuntimeManager:
                     yield chunk
             finally:
                 self.inflight.discard(worker)
-                if self.active and not worker.alive:
+                if request.purpose == "drawing":
+                    # Every drawing starts from a fresh conversation: no earlier
+                    # screenshots to re-read and no token-budget retirement in
+                    # the middle of a turn. A spare is prepared in the background.
+                    if self.claude.get(request.signature) is worker:
+                        del self.claude[request.signature]
+                    worker.abandon()
+                    if self.active and request.signature in self.profiles:
+                        asyncio.create_task(self._replace_claude(request))
+                elif self.active and not worker.alive:
                     asyncio.create_task(self._replace_claude(request))
             return
         except WarmUnavailable as exc:
@@ -1809,6 +1868,7 @@ class AgentRuntimeManager:
         self.active = False
         workers = list({*self.claude.values(), *self.inflight})
         self.claude = {}
+        self.profiles = set()
         self.inflight.clear()
         codex, self.codex = self.codex, None
         self.signature = None
@@ -2106,11 +2166,14 @@ async def complete_text(
     purpose: str = "utility",
     max_chars: int | None = None,
     timeout_seconds: float | None = None,
+    on_text=None,
 ) -> str:
     """An isolated notes call, never a normal pet conversation.
 
     `temperature` is accepted for parity with the API backend and ignored: a
-    signed-in CLI exposes no such knob.
+    signed-in CLI exposes no such knob. `on_text` sees the reply so far as it
+    streams: Claude's structured object as its fields are written, Codex's text
+    deltas. The returned text is still the complete, authoritative reply.
     """
     section = cfg["llm"]
     request = _request(
@@ -2123,8 +2186,11 @@ async def complete_text(
         purpose=purpose,
         timeout_seconds=timeout_seconds,
     )
+    claude_partial = on_text is not None and section["provider"] == "claude" and schema is not None
+    if claude_partial:
+        request.on_partial = on_text
     if max_chars is not None:
-        return await _bounded(request, max_chars)
+        return await _bounded(request, max_chars, None if claude_partial else on_text)
     return "".join([part async for part in _dispatch(request)]).strip()
 
 

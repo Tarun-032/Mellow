@@ -132,10 +132,24 @@ class SentenceBuffer:
         return [rest] if rest else []
 
 
+FIRST_CLAUSE = 80  # synthesis time grows with length; the first clip gates audio
+
+
+def _first_clause(sentence):
+    """A long opening sentence split at its first clause boundary, so audio starts sooner."""
+    if len(sentence) > FIRST_CLAUSE:
+        for match in re.finditer(r"[,;:—–]\s+", sentence):
+            if 25 <= match.start() <= FIRST_CLAUSE + 40:
+                return [sentence[:match.start() + 1].strip(), sentence[match.end():]]
+    return [sentence]
+
+
 def _beat_chunks(text):
     """Natural spoken sentences, with bounded word breaks for long beats."""
     buffer = SentenceBuffer()
-    for sentence in [*buffer.feed(text), *buffer.flush()]:
+    sentences = [*buffer.feed(text), *buffer.flush()]
+    sentences[:1] = _first_clause(sentences[0]) if sentences else []
+    for sentence in sentences:
         while len(sentence) > MAX_CHARS:
             cut = sentence.rfind(" ", 0, MAX_CHARS + 1)
             if cut < 1:

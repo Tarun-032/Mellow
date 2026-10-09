@@ -47,6 +47,7 @@ type Incoming =
   | { type: "pong"; echo: string }
   | { type: "capture"; phase: "begin" | "end"; capture_id: string }
   | { type: "drawing"; scene: AnnotationScene | null; preserve_pen?: boolean }
+  | { type: "drawing_prepare"; monitor: { left: number; top: number } | null }
   | { type: "drawing_finish" }
   | { type: "drawing_keepalive"; presentation_id: string }
   | { type: "point"; nx: number | null; ny?: number; label?: string; monitor?: Monitor; presentation_id?: string }
@@ -274,6 +275,14 @@ export function useSocket() {
                 sock.send(JSON.stringify({ type: "capture_ready", capture_id: msg.capture_id, ok: false }));
               }
             });
+            break;
+          case "drawing_prepare":
+            // Build the monitor's overlay while the answer is planned, so the
+            // first drawing does not wait for WebView2 to start.
+            if (aiEnabledRef.current && drawingAllowed.current && msg.monitor) {
+              void invoke("annotation_prepare", { left: msg.monitor.left, top: msg.monitor.top })
+                .catch((error) => console.error("[mellow] could not prepare drawing overlay", error));
+            }
             break;
           case "drawing": {
             clearDrawing(Boolean(msg.scene || msg.preserve_pen));

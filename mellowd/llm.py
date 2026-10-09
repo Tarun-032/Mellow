@@ -4,7 +4,8 @@ import asyncio
 import json
 import logging
 import re
-from contextlib import aclosing
+import time
+from contextlib import aclosing, suppress
 from typing import AsyncIterator
 from urllib.parse import urlparse
 
@@ -1150,15 +1151,41 @@ async def chat(
             yield chunk
 
 
+_WARMED: dict[str, float] = {}
+
+
+async def warm_connection(cfg: dict) -> None:
+    """Open the provider connection while the question is still being spoken.
+
+    The pooled client drops sockets idle for 60s, so a turn after a pause would
+    otherwise pay DNS and TLS before its first token. A cheap authenticated GET
+    of the model list fills the same pool. Failures are ignored.
+    """
+    section = cfg["llm"]
+    base = str(section.get("base_url") or "").rstrip("/")
+    if section.get("mode") != "cloud" or section.get("provider") == "anthropic" or not base.startswith("https://"):
+        return
+    now = time.monotonic()
+    if now - _WARMED.get(base, -1e9) < 50:
+        return
+    _WARMED[base] = now
+    headers = {"Authorization": f"Bearer {section['api_key']}"} if section.get("api_key") else {}
+    with suppress(Exception):
+        async with transport.client() as client:
+            await client.get(f"{base}/models", headers=headers, timeout=5.0)
+
+
 async def complete_text(prompt: str, cfg: dict, system: str, image: bytes | None = None,
                         temperature: float = 0.2, max_tokens: int = 4096,
                         usage: dict | None = None, schema: dict | None = None,
-                        max_chars: int | None = None) -> str:
+                        max_chars: int | None = None, on_text=None) -> str:
     """A text-only completion with no persona, anchoring or tool execution.
 
     0.2 suits classifying and note-taking, where the same input should give the
     same answer. Prose written for a person needs room: at 0.2 a request to
     draft an email came back as the user's own sentence in tidier English.
+    `on_text` sees the reply so far after every chunk; the return value is
+    still the complete reply.
     """
     section = {**cfg["llm"], "raw": True, "anchor": False, "system_prompt": system,
                "max_tokens": max_tokens, "temperature": temperature}
@@ -1175,6 +1202,8 @@ async def complete_text(prompt: str, cfg: dict, system: str, image: bytes | None
             result += part
             if max_chars is not None and len(result) > max_chars:
                 raise ValueError("completion exceeded its output budget")
+            if on_text is not None:
+                on_text(result)
         return result.strip()
 
 

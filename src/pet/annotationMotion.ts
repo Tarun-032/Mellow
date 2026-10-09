@@ -16,7 +16,9 @@ export function strokeSequence(strokes: Stroke[], origin: XY): StrokeStep[] {
   let at = origin, clock = 0;
   const steps = strokes.map((stroke, index) => {
     const distance = Math.hypot(stroke.start[0] - at[0], stroke.start[1] - at[1]);
-    const travel = distance < 1 ? 0 : Math.min(index === 0 ? 850 : 500, Math.max(180, distance / 1.6));
+    // Speech waits for the first arrival, so the opening flight stays brisk.
+    const travel = distance < 1 ? 0 : index === 0
+      ? Math.min(550, Math.max(180, distance / 2.4)) : Math.min(500, Math.max(180, distance / 1.6));
     const draw = DRAW_PACE * (stroke.length === 0 ? 0 : stroke.gesture === "arrow"
       ? Math.min(320, Math.max(180, stroke.length / 1.8)) : stroke.gesture === "area"
       ? Math.min(480, Math.max(260, stroke.length / 2))

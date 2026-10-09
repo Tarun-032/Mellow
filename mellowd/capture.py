@@ -281,6 +281,20 @@ def cursor_position() -> tuple[int, int] | None:
     return None
 
 
+def idle_seconds() -> float:
+    """Seconds since the last keyboard or mouse input, in any app."""
+    class LastInput(ctypes.Structure):
+        _fields_ = [("size", ctypes.c_uint), ("time", ctypes.c_uint)]
+
+    try:
+        info = LastInput(ctypes.sizeof(LastInput), 0)
+        if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(info)):
+            return 0.0
+        return ((ctypes.windll.kernel32.GetTickCount() - info.time) & 0xFFFFFFFF) / 1000
+    except (AttributeError, OSError):
+        return 0.0
+
+
 def window_on_monitor(monitor: dict) -> tuple[int, str, str]:
     """Topmost real application window on ``monitor``, excluding Mellow."""
     try:

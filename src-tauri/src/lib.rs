@@ -707,6 +707,7 @@ pub fn run() {
             cursor::guide_set_quiet,
             cursor::guide_set_reduced_motion,
             capture_prepare,
+            annotations::annotation_prepare,
             annotations::annotation_present,
             annotations::annotation_clear,
             annotations::annotation_snapshot,
@@ -751,6 +752,8 @@ pub fn run() {
                 .skip_taskbar(true)
                 .shadow(false)
                 .focusable(false)
+                // Otherwise show() activates and steals focus from the source app.
+                .focused(false)
                 .visible(false)
                 .build()?;
                 guide.set_ignore_cursor_events(true)?;
@@ -771,6 +774,7 @@ pub fn run() {
                 .skip_taskbar(true)
                 .shadow(false)
                 .focusable(false)
+                .focused(false)
                 .visible(false)
                 .build()?;
                 guide_bubble.set_ignore_cursor_events(true)?;

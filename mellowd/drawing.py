@@ -121,39 +121,6 @@ def _reversed_edges(before, after):
     return changed
 
 
-def _layout_replaced(edges):
-    """Detect coherent local layout changes, even on mostly empty screens.
-
-    Four-sample tiles join the nearby edges of one changed object. Narrow
-    status text/caret changes stay small; a relocated block/dialog does not.
-    """
-    height, width = edges.shape
-    padded = np.pad(edges, ((0, (-height) % 4), (0, (-width) % 4)))
-    tiles = padded.reshape(padded.shape[0] // 4, 4, padded.shape[1] // 4, 4).any(axis=(1, 3))
-    seen = set()
-    for y, x in zip(*np.nonzero(tiles)):
-        first = (int(y), int(x))
-        if first in seen:
-            continue
-        seen.add(first)
-        pending, cells = [first], []
-        while pending:
-            row, column = pending.pop()
-            cells.append((row, column))
-            for dy in (-1, 0, 1):
-                for dx in (-1, 0, 1):
-                    neighbor = (row + dy, column + dx)
-                    if (neighbor not in seen and 0 <= neighbor[0] < tiles.shape[0]
-                            and 0 <= neighbor[1] < tiles.shape[1] and tiles[neighbor]):
-                        seen.add(neighbor)
-                        pending.append(neighbor)
-        top, bottom = min(y for y, _ in cells) * 4, (max(y for y, _ in cells) + 1) * 4
-        left, right = min(x for _, x in cells) * 4, (max(x for _, x in cells) + 1) * 4
-        if right - left >= 32 and bottom - top >= 32 and edges[top:bottom, left:right].sum() >= 80:
-            return True
-    return False
-
-
 def _region(rect, monitor, shape):
     """A measured physical rectangle clipped to a small local observation."""
     try:
@@ -305,20 +272,74 @@ class Frame:
             return ()
         # A local animation cannot excuse scroll/navigation of the page around
         # it, even when the candidate images happen to retain similar colors.
-        if any(self.content_changed(p, animations=approved) for p in samples[-8:]):
+        if any(self.content_changed(p, targets=approved) for p in samples[-8:]):
             return ()
         return tuple(approved)
 
-    def content_changed(self, pixels, *, targets=(), cursor=None, animations=()):
-        """Compare CLEAN underlying source pixels, never an overlay screenshot.
+    def live_regions(self, samples, *, unattended=False):
+        """Physical rects of areas that changed by themselves (terminal output,
+        a video). `unattended`: one change is enough. See docs/decisions.md."""
+        baseline = self.content_fingerprint
+        if baseline is None:
+            return ()
+        frames = [baseline, *(np.asarray(s, dtype=np.int16) for s in samples if np.shape(s) == baseline.shape)]
+        if len(frames) < 3:
+            return ()
+        rows, columns = baseline.shape
+        pad = ((0, (-rows) % 8), (0, (-columns) % 8))
 
-        Input activity alone is not a change. Small hover fills, a blinking
-        caret, status text and incidental tooltips can repaint without moving
-        the objects being explained. Substantial source repaint or displaced
-        edges retires the plan; marked targets get a tighter structural check.
-        Callers debounce pixel changes and check source HWND/bounds separately.
-        This gate has no authority to click or to infer an action succeeded.
-        """
+        def tiles(before, after):
+            changed = np.pad(np.abs(after - before) > 18, pad)
+            return changed.reshape(changed.shape[0] // 8, 8, changed.shape[1] // 8, 8).sum(axis=(1, 3)) >= 2
+
+        counts = sum(tiles(a, b).astype(np.int8) for a, b in zip(frames, frames[1:]))
+        seeds, live = counts >= (1 if unattended else 2), counts >= 1
+        # Exact changed pixels, so an area ends where its content does.
+        changed_pixels = np.any([np.abs(b - a) > 18 for a, b in zip(frames, frames[1:])], axis=0)
+        mon = self.monitor
+        source = _region(self.window or (mon["left"], mon["top"], mon["width"], mon["height"]), mon, (rows, columns))
+        if source is None:
+            return ()
+        sy, sx = source
+        inside = np.zeros_like(live)
+        inside[sy.start // 8:-(-sy.stop // 8), sx.start // 8:-(-sx.stop // 8)] = True
+        live &= inside
+        seeds &= inside
+        scale_x, scale_y = mon["width"] / columns, mon["height"] / rows
+        regions, seen = [], np.zeros_like(live)
+        for start in zip(*np.nonzero(seeds)):
+            if seen[start]:
+                continue
+            seen[start] = True
+            pending, cells = [start], []
+            while pending:
+                y, x = pending.pop()
+                cells.append((y, x))
+                # Touching tiles only, so a tab title beside the pane stays separate.
+                for ny in range(max(0, y - 1), min(live.shape[0], y + 2)):
+                    for nx in range(max(0, x - 1), min(live.shape[1], x + 2)):
+                        if live[ny, nx] and not seen[ny, nx]:
+                            seen[ny, nx] = True
+                            pending.append((ny, nx))
+            if len(cells) < 6:
+                continue   # a caret or spinner
+            area = np.zeros(changed_pixels.shape, dtype=bool)
+            for y, x in cells:
+                area[y * 8:y * 8 + 8, x * 8:x * 8 + 8] = True
+            ys, xs = np.nonzero(area & changed_pixels)
+            # Margin: an edge flush with changing content would keep changing.
+            top, bottom = max(sy.start, int(ys.min()) - 2), min(sy.stop, int(ys.max()) + 3)
+            left, right = max(sx.start, int(xs.min()) - 2), min(sx.stop, int(xs.max()) + 3)
+            box = (round(mon["left"] + left * scale_x), round(mon["top"] + top * scale_y),
+                   round((right - left) * scale_x), round((bottom - top) * scale_y))
+            if not any(x <= box[0] and y <= box[1] and box[0] + box[2] <= x + w and box[1] + box[3] <= y + h
+                       for x, y, w, h in regions):
+                regions.append(box)
+        return tuple(regions)
+
+    def content_changed(self, pixels, *, targets=()):
+        """Is every marked target still where it was (clean pixels, per target)?
+        Returns "moved", "gone", "unverifiable" or False. See docs/decisions.md."""
         baseline = self.content_fingerprint
         if baseline is None:
             # Older manually constructed frames retain their smaller signature.
@@ -327,100 +348,73 @@ class Frame:
             current = np.asarray(Image.fromarray(pixels).convert("L").resize(
                 (baseline.shape[1], baseline.shape[0])), dtype=np.int16)
         except (AttributeError, TypeError, ValueError):
-            return True
+            return "unreadable"
         if baseline.shape != current.shape:
-            return True
+            return "unreadable"
         rows, columns = current.shape
         mon = self.monitor
-
-        def region(rect):
-            return _region(rect, mon, (rows, columns))
-
-        source = region(self.window or (mon["left"], mon["top"], mon["width"], mon["height"]))
+        source = _region(self.window or (mon["left"], mon["top"], mon["width"], mon["height"]), mon, (rows, columns))
         if source is None:
-            return True
-        mask = np.zeros(current.shape, dtype=bool)
-        mask[source] = True
-        count = int(mask.sum())
+            return "source"
+        if not targets:
+            return False
+        window = np.zeros(current.shape, dtype=bool)
+        window[source] = True
         raw = np.abs(current - baseline) > 18
         old_edges, new_edges = _edges(baseline), _edges(current)
-        moved_edges = (old_edges & ~_nearby(new_edges)) | (new_edges & ~_nearby(old_edges))
-
-        # Only temporally observed, measured image canvases receive a motion
-        # allowance. Their palette and boundary must still match, and a mark
-        # must enclose the full canvas; a moving triangle edge is not stable.
-        motion = np.zeros(current.shape, dtype=bool)
-        containers = []
-        for rect in list(animations)[:16]:
-            animated = region(rect)
-            if animated is None or baseline[animated].size > count * .20:
-                return True
-            if not _animation_stable(baseline, current, animated):
-                return True
-            # The boundary/palette check above observes the full canvas. Do
-            # not reapply the static edge rule to moving shapes touching its
-            # edge (the Wikipedia rearrangement animation does exactly that).
-            motion[animated] = True
-            containers.append(animated)
-        if motion.sum() > count * .25:
-            return True
-        raw &= ~motion
-        moved_edges &= ~motion
-
-        # Cursor-local cosmetic repaint is bounded; structural evidence and
-        # every target remain visible to their separate checks below.
-        raw_mask = mask.copy()
-        if cursor is not None:
-            try:
-                x, y = map(number, cursor)
-                hover = region((x - 48, y - 32, 96, 64))
-            except (TypeError, ValueError):
-                hover = None
-            if hover is not None and not moved_edges[hover].any():
-                raw_mask[hover] = False
-
-        if (raw & raw_mask).sum() > max(32, count * .05):
-            return True
-        # Small new text (browser status/tooltip) is incidental away from a
-        # grounded target. A source layout change produces many displaced edges.
-        if (moved_edges & mask).sum() > max(900, count * .008):
-            return True
-        if _layout_replaced(moved_edges & mask):
-            return True
-
-        # No mark bounding box is hidden. A fill-only hover on a button keeps
-        # its edge/text layout; a moved control or changed value does not.
         reversed_edges = _reversed_edges(baseline, current)
-        for rect in targets:
-            target = region(rect)
-            if target is None:
-                continue
-            target_mask = mask[target]
-            ty, tx = target
-            for ay, ax in containers:
-                overlap = (tx.start < ax.stop and tx.stop > ax.start
-                           and ty.start < ay.stop and ty.stop > ay.start)
-                encloses = (tx.start <= ax.start and tx.stop >= ax.stop
-                            and ty.start <= ay.start and ty.stop >= ay.stop)
-                if overlap and not encloses:
-                    return True
-            target_raw = raw[target] & target_mask
-            area = int(target_mask.sum())
-            if not area or target_raw.sum() < 4:
-                continue
-            old, new = old_edges[target], new_edges[target]
-            observable = target_mask & ~motion[target]
-            edge_change = (old ^ new) & observable
-            edge_count = int((old & target_mask).sum())
-            if edge_change.sum() >= max(6, min(32, edge_count * .12)):
+        # Structure gone from where it was; new lines appearing are not movement.
+        lost = old_edges & ~_nearby(new_edges)
+
+        def differs(area):
+            """Did the content change, beyond a hover fill?"""
+            changed = raw & area
+            if changed.sum() < 4:
+                return False
+            edge_count = int((old_edges & area).sum())
+            if ((old_edges ^ new_edges) & area).sum() >= max(6, min(32, edge_count * .12)):
                 return True
-            if (reversed_edges[target] & observable).sum() >= max(4, min(16, edge_count * .03)):
+            if (reversed_edges & area).sum() >= max(4, min(16, edge_count * .03)):
                 return True
             # A nearly flat target can change state without acquiring an edge.
-            # Small area changes are tolerated globally, but not a substantial
-            # replacement of a specifically grounded object.
-            if edge_count < 4 and target_raw.sum() > max(16, area * .5):
-                return True
+            return edge_count < 4 and changed.sum() > max(16, area.sum() * .5)
+
+        for rect in targets:
+            target = _region(rect, mon, (rows, columns))
+            if target is None:
+                continue
+            inner = np.zeros(current.shape, dtype=bool)
+            inner[target] = True
+            inner &= window
+            if not inner.any() or not differs(inner):
+                continue
+            ty, tx = target
+            # Flat where it had structure: the thing vanished.
+            core = inner.copy()
+            if ty.stop - ty.start > 4 and tx.stop - tx.start > 4:
+                core[:ty.start + 2] = core[ty.stop - 2:] = False
+                core[:, :tx.start + 2] = core[:, tx.stop - 2:] = False
+            had = int((old_edges & core).sum())
+            if had >= 6 and (new_edges & core).sum() < had * .1 and current[core].std() < 6:
+                return "gone"
+
+            def band(outside, inside):
+                ring = np.zeros(current.shape, dtype=bool)
+                ring[max(0, ty.start - outside):ty.stop + outside, max(0, tx.start - outside):tx.stop + outside] = True
+                ring[ty.start + inside:max(ty.start + inside, ty.stop - inside),
+                     tx.start + inside:max(tx.start + inside, tx.stop - inside)] = False
+                return ring & window
+
+            # The ring around the target, widened until it has structure.
+            for ring in (band(2, 0), band(4, 0), band(8, 0), band(16, 0), band(16, 2)):
+                structure = int((old_edges & ring).sum())
+                if structure >= 12:
+                    break
+            else:
+                return "unverifiable"
+            if ((lost & ring).sum() >= max(6, structure * .12)
+                    or (reversed_edges & ring).sum() >= max(4, structure * .03)):
+                return "moved"
         return False
 
     def unchanged(self, pixels, scene, occlusions=(), scale=1):
