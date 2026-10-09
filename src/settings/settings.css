@@ -1469,6 +1469,17 @@ input[type="range"] {
   outline-offset: 3px;
 }
 
+/* A switch that cannot change should not look like it can. */
+.switch:has(input:disabled) {
+  opacity: 0.5;
+  filter: grayscale(1);
+  cursor: not-allowed;
+}
+
+.switch input:disabled {
+  cursor: not-allowed;
+}
+
 /* Section titles inside a panel. The empty-state h3s have their own rule. */
 .settings-group > h3 {
   color: var(--settings-text);
@@ -1510,4 +1521,41 @@ input[type="range"] {
 .steps span {
   display: block;
   margin-top: 2px;
+}
+
+/* Abilities: one card per feature, the details folded away. */
+.settings-group > .feature-title {
+  font-size: 16px;
+  font-weight: 650;
+}
+
+.feature-more {
+  padding-top: 14px;
+  border-top: 1px solid var(--settings-border);
+}
+
+.feature-more summary {
+  width: fit-content;
+  color: var(--settings-accent);
+  font-size: 13px;
+  font-weight: 620;
+  cursor: pointer;
+}
+
+.feature-more__body {
+  display: grid;
+  gap: 12px;
+  margin-top: 14px;
+}
+
+.feature-more__body h4,
+.feature-more__body p {
+  margin: 0;
+}
+
+.feature-more__body h4 {
+  margin-top: 6px;
+  color: var(--settings-text);
+  font-size: 13.5px;
+  font-weight: 620;
 }

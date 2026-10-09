@@ -124,9 +124,7 @@ type SettingsPage =
   | "engine"
   | "stt"
   | "tts"
-  | "writing"
-  | "guidance"
-  | "research"
+  | "abilities"
   | "sessions"
   | "personalization"
   | "meetings"
@@ -134,7 +132,7 @@ type SettingsPage =
   | "advanced";
 
 /** Pages that save as you go, so they get no Save changes bar. */
-const SAVES_ITSELF = new Set<SettingsPage>(["meetings", "updates", "writing", "guidance", "research", "sessions"]);
+const SAVES_ITSELF = new Set<SettingsPage>(["meetings", "updates", "abilities", "sessions"]);
 
 const SETTINGS_PAGES: Array<{
   id: SettingsPage;
@@ -162,9 +160,9 @@ const SETTINGS_PAGES: Array<{
     description: "Voice and playback",
   },
   {
-    id: "writing",
-    label: "Screen-aware writing",
-    description: "Speak into any text field",
+    id: "abilities",
+    label: "Abilities",
+    description: "Screen guidance, web research and writing",
   },
   {
     id: "sessions",
@@ -172,8 +170,6 @@ const SETTINGS_PAGES: Array<{
     description: "Saved conversations",
   },
   { id: "personalization", label: "Personalization", description: "About you, personality and memory" },
-  { id: "guidance", label: "Screen guidance", description: "Draw while explaining" },
-  { id: "research", label: "Web research", description: "Reports from the web" },
   { id: "meetings", label: "Meetings", description: "Transcripts and meeting notes" },
   {
     id: "updates",
@@ -1232,94 +1228,22 @@ export default function Settings() {
             </section>
           )}
 
-          {activePage === "writing" && (
-            <section className="settings-page" aria-labelledby="writing-heading">
+          {activePage === "abilities" && (
+            <section className="settings-page" aria-labelledby="abilities-heading">
               <div className="page-heading">
-                <h2 id="writing-heading">Speak into any text field</h2>
-                <p>Talk instead of typing, in any app.</p>
+                <h2 id="abilities-heading">What Mellow can do</h2>
+                <p>Turn each one on or off. Changes save right away.</p>
               </div>
-
-              {!form.ai_enabled ? (
+              {!form.ai_enabled && (
                 <div className="empty-state">
-                  <h3>This needs an engine</h3>
-                  <p>Choose how Mellow thinks first, then come back and turn this on.</p>
-                </div>
-              ) : (
-                <div className="settings-group">
-                  <label className="switch">
-                    <span className="switch__text">
-                      <b>Screen-aware writing</b>
-                      <small>
-                        Put your cursor in a text box, hold the shortcut, and Mellow writes
-                        in the field.
-                      </small>
-                    </span>
-                    <input
-                      type="checkbox"
-                      role="switch"
-                      checked={form.writing_enabled ?? false}
-                      onChange={(event) => saveSetting({ writing_enabled: event.target.checked })}
-                    />
-                    <i className="switch__track" aria-hidden="true" />
-                  </label>
-                  {settingError && <p className="notice notice--error" role="alert">{settingError}</p>}
+                  <h3>These need an engine</h3>
+                  <p>Choose how Mellow thinks first, then come back and turn them on.</p>
                 </div>
               )}
+              {settingError && <p className="notice notice--error" role="alert">{settingError}</p>}
 
               <div className="settings-group">
-                <h3>How it works</h3>
-                <ol className="steps">
-                  <li>
-                    <b>Click into the field you want to write in</b>
-                    <span>A chat box, a document, an email, even a terminal prompt.</span>
-                  </li>
-                  <li>
-                    <b>Hold Ctrl + Shift + Space and say what you want</b>
-                    <span>
-                      Dictate it word for word, or ask for a draft like &ldquo;reply saying
-                      I&rsquo;ll be twenty minutes late&rdquo;.
-                    </span>
-                  </li>
-                  <li>
-                    <b>Let go, and it appears</b>
-                    <span>
-                      Mellow types it into that same field. Ask again to revise the draft while
-                      you have not touched it.
-                    </span>
-                  </li>
-                </ol>
-              </div>
-
-              <div className="settings-group">
-                <h3>What it will never do</h3>
-                <ul className="limits">
-                  <li>
-                    <b>Press Enter.</b> Nothing sends and nothing runs until you do it yourself.
-                  </li>
-                  <li>
-                    <b>Move your cursor or click anything.</b> It only writes into the field you
-                    already picked.
-                  </li>
-                  <li>
-                    <b>Guess.</b> If it cannot confirm the text landed, you get a draft to copy
-                    instead of a silent mess.
-                  </li>
-                </ul>
-                <p className="field-note">
-                  Drafting from what is on screen sends that field&rsquo;s context to the provider
-                  you chose under Engine. Terminal and editor prompts get a single line.
-                </p>
-              </div>
-            </section>
-          )}
-
-          {activePage === "guidance" && (
-            <section className="settings-page" aria-labelledby="guidance-heading">
-              <div className="page-heading">
-                <h2 id="guidance-heading">Draw while explaining</h2>
-                <p>The bone traces temporary marks as Mellow explains, with short captions beside it.</p>
-              </div>
-              <div className="settings-group">
+                <h3 className="feature-title">Screen guidance</h3>
                 <label className="switch">
                   <span className="switch__text">
                     <b>Screen drawings · Experimental</b>
@@ -1330,31 +1254,24 @@ export default function Settings() {
                     onChange={(event) => saveSetting({ drawing_enabled: event.target.checked })} />
                   <i className="switch__track" aria-hidden="true" />
                 </label>
-                {settingError && <p className="notice notice--error" role="alert">{settingError}</p>}
-                {!form.ai_enabled && <p className="field-note">Choose an engine first to use screen drawings.</p>}
+                <details className="feature-more">
+                  <summary>How it works</summary>
+                  <div className="feature-more__body">
+                    <p>The bone traces temporary marks as Mellow explains, with short captions beside it.</p>
+                    <h4>Try asking</h4>
+                    <p>&ldquo;Circle the save button.&rdquo;</p>
+                    <p>&ldquo;Explain this chart.&rdquo;</p>
+                    <p>&ldquo;Draw along the triangle&rsquo;s edges and explain them.&rdquo;</p>
+                    <p className="field-note">Keep the app still while Mellow explains. Click, scroll, type or switch apps to clear the marks. They do not block your mouse or keyboard.</p>
+                    <h4>Your engine and screen</h4>
+                    <p>Your selected engine must support images. Each drawing request sends a screen image and makes one planning call, with at most one closer-look call if needed. Ordinary answers use no drawing calls.</p>
+                    <p className="field-note">If Mellow cannot place a drawing reliably, it stops. Model placement accuracy varies; this feature does not click or operate apps.</p>
+                  </div>
+                </details>
               </div>
-              <div className="settings-group">
-                <h3>Try asking</h3>
-                <p>&ldquo;Circle the save button.&rdquo;</p>
-                <p>&ldquo;Explain this chart.&rdquo;</p>
-                <p>&ldquo;Draw along the triangle&rsquo;s edges and explain them.&rdquo;</p>
-                <p className="field-note">Keep the app still while Mellow explains. Click, scroll, type or switch apps to clear the marks. They do not block your mouse or keyboard.</p>
-              </div>
-              <div className="settings-group">
-                <h3>Your engine and screen</h3>
-                <p>Your selected engine must support images. Each drawing request sends a screen image and makes one planning call, with at most one closer-look call if needed. Ordinary answers use no drawing calls.</p>
-                <p className="field-note">If Mellow cannot place a drawing reliably, it stops. Model placement accuracy varies; this feature does not click or operate apps.</p>
-              </div>
-            </section>
-          )}
 
-          {activePage === "research" && (
-            <section className="settings-page" aria-labelledby="research-heading">
-              <div className="page-heading">
-                <h2 id="research-heading">Web research</h2>
-                <p>Mellow searches the web for free and your engine writes the answer. No extra key needed.</p>
-              </div>
               <div className="settings-group">
+                <h3 className="feature-title">Web research</h3>
                 <label className="switch">
                   <span className="switch__text">
                     <b>Search the web</b>
@@ -1365,20 +1282,84 @@ export default function Settings() {
                     onChange={(event) => saveSetting({ research_enabled: event.target.checked })} />
                   <i className="switch__track" aria-hidden="true" />
                 </label>
-                {settingError && <p className="notice notice--error" role="alert">{settingError}</p>}
-                {!form.ai_enabled && <p className="field-note">Choose an engine first to search the web.</p>}
+                <details className="feature-more">
+                  <summary>How it works</summary>
+                  <div className="feature-more__body">
+                    <p>Mellow searches the web for free and your engine writes the answer. No extra key needed.</p>
+                    <h4>Try asking</h4>
+                    <p>&ldquo;Research the best budget mechanical keyboards.&rdquo;</p>
+                    <p>&ldquo;What&rsquo;s the latest news on the Mars mission?&rdquo;</p>
+                    <p>&ldquo;Who won the game last night?&rdquo;</p>
+                    <p className="field-note">Keep talking while a report is on its way. Click the bone to read it and its sources, and ask a follow-up: Mellow remembers what it found.</p>
+                    <h4>What it sends</h4>
+                    <p>Your question goes to free public search engines such as DuckDuckGo. The results go to the engine you chose, which writes the answer. Nothing on your screen is sent.</p>
+                    <p className="field-note">Free search can be busy now and then. If it is, Mellow says so and the bone offers Try again.</p>
+                  </div>
+                </details>
               </div>
+
               <div className="settings-group">
-                <h3>Try asking</h3>
-                <p>&ldquo;Research the best budget mechanical keyboards.&rdquo;</p>
-                <p>&ldquo;What&rsquo;s the latest news on the Mars mission?&rdquo;</p>
-                <p>&ldquo;Who won the game last night?&rdquo;</p>
-                <p className="field-note">Keep talking while a report is on its way. Click the bone to read it and its sources, and ask a follow-up: Mellow remembers what it found.</p>
-              </div>
-              <div className="settings-group">
-                <h3>What it sends</h3>
-                <p>Your question goes to free public search engines such as DuckDuckGo. The results go to the engine you chose, which writes the answer. Nothing on your screen is sent.</p>
-                <p className="field-note">Free search can be busy now and then. If it is, Mellow says so and the bone offers Try again.</p>
+                <h3 className="feature-title">Screen-aware writing</h3>
+                <label className="switch">
+                  <span className="switch__text">
+                    <b>Speak into any text field</b>
+                    <small>
+                      Put your cursor in a text box, hold the shortcut, and Mellow writes
+                      in the field.
+                    </small>
+                  </span>
+                  <input
+                    type="checkbox"
+                    role="switch"
+                    disabled={!form.ai_enabled}
+                    checked={form.writing_enabled ?? false}
+                    onChange={(event) => saveSetting({ writing_enabled: event.target.checked })}
+                  />
+                  <i className="switch__track" aria-hidden="true" />
+                </label>
+                <details className="feature-more">
+                  <summary>How it works</summary>
+                  <div className="feature-more__body">
+                    <ol className="steps">
+                      <li>
+                        <b>Click into the field you want to write in</b>
+                        <span>A chat box, a document, an email, even a terminal prompt.</span>
+                      </li>
+                      <li>
+                        <b>Hold Ctrl + Shift + Space and say what you want</b>
+                        <span>
+                          Dictate it word for word, or ask for a draft like &ldquo;reply saying
+                          I&rsquo;ll be twenty minutes late&rdquo;.
+                        </span>
+                      </li>
+                      <li>
+                        <b>Let go, and it appears</b>
+                        <span>
+                          Mellow types it into that same field. Ask again to revise the draft while
+                          you have not touched it.
+                        </span>
+                      </li>
+                    </ol>
+                    <h4>What it will never do</h4>
+                    <ul className="limits">
+                      <li>
+                        <b>Press Enter.</b> Nothing sends and nothing runs until you do it yourself.
+                      </li>
+                      <li>
+                        <b>Move your cursor or click anything.</b> It only writes into the field you
+                        already picked.
+                      </li>
+                      <li>
+                        <b>Guess.</b> If it cannot confirm the text landed, you get a draft to copy
+                        instead of a silent mess.
+                      </li>
+                    </ul>
+                    <p className="field-note">
+                      Drafting from what is on screen sends that field&rsquo;s context to the provider
+                      you chose under Engine. Terminal and editor prompts get a single line.
+                    </p>
+                  </div>
+                </details>
               </div>
             </section>
           )}
