@@ -2349,8 +2349,11 @@ async def _visual_answer(session, prompt, cfg, speak, partial):
                                                  shot.hwnd, read.accessible, read.ocr_rows)
         else:
             shot, app, _ = await _unseen_shot(session, None)
-            if shot is None or shot.frame is None or not shot.hwnd or shot.window is None:
+            if shot is None or shot.frame is None:
                 return await _deliver(session, "I couldn't capture the screen safely, so I can't draw on it.", speak, partial)
+            if not shot.hwnd or shot.window is None:
+                # No app window to draw on (a bare desktop): the caller points instead.
+                return None
             await send(session.ws, type="drawing_prepare", monitor=shot.monitor)
             candidates = await asyncio.to_thread(point.candidates, prompt, shot.pixels, shot.monitor, None, shot.hwnd)
             samples = []
@@ -2924,7 +2927,8 @@ async def answer(session: Session, prompt: str, prepared=None) -> None:
         if draw_requested:
             reply = await _visual_answer(session, prompt, {**cfg, "memory": remembered}, speak, partial)
             # Normal history/logging and final speech cleanup still apply.
-            asked = False
+            # None: nothing to draw on, so answer as if drawings were off.
+            asked = reply is None
         elif doing:
             reply, did = await _act(session, cfg, speak, partial, prompt)
         if did:
@@ -2964,11 +2968,11 @@ async def answer(session: Session, prompt: str, prepared=None) -> None:
                 # Results ride with memory; "strip" keeps it off the screen.
                 searched = {**cfg, "memory": "\n\n".join(filter(None, [remembered, found]))}
                 reply, _, _ = await _pass(session, searched, speak, look="strip", partial=partial)
-        if asked and cfg.get("drawing_enabled") and drawing_route != "suppressed":
+        if asked and not draw_requested and cfg.get("drawing_enabled") and drawing_route != "suppressed":
             # The model asked to look: draw, else point, else words.
             perf.mark("drawing_route_look")
             reply = await _visual_answer(session, prompt, cfg, speak, partial)
-            asked = False
+            asked = reply is None
         if asked:
             # Show screen processing.
             await send(ws, type="state", state="looking")
